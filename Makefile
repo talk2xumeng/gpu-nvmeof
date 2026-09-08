@@ -149,12 +149,13 @@ run-latency-noker: $(BIN)/latency_baseline
 
 # 扫 KV block 粒度:16/32/64/128 token @70272 B
 sweep-block: $(BIN)/latency_baseline
-	@for tok in 16 32 64 128; do \
+	@for tok in 8 16 32 64 128; do \
 		b=$$(( tok * 70272 )); \
 		b=$$(( (b + 4095) / 4096 * 4096 )); \
 		echo "=== $$tok token = $$b bytes ==="; \
 		sudo $(LAT) -g $(GPU_ID) -b $$b -r 500 2>/dev/null | \
-		  grep -E "总计|控制面|数据传输"; \
+		  sed -n '/优化空间/,$$p'; \
+		echo; \
 	done
 
 clean:
