@@ -42,11 +42,11 @@ BIN        := bin
 
 # ------------------------------------------------------------------
 
-export PKG_CONFIG_PATH := $(SPDK_DIR)/build/lib/pkgconfig:$(DPDK_LIB)/pkgconfig
+PKGCONF := PKG_CONFIG_PATH=$(SPDK_DIR)/build/lib/pkgconfig:$(DPDK_LIB)/pkgconfig pkg-config
 
-SPDK_CFLAGS := $(shell pkg-config --cflags spdk_nvme spdk_env_dpdk 2>/dev/null)
-SPDK_LIBS   := $(shell pkg-config --libs   spdk_nvme spdk_env_dpdk 2>/dev/null)
-SYS_LIBS    := $(shell pkg-config --libs   spdk_syslibs 2>/dev/null)
+SPDK_CFLAGS := $(shell $(PKGCONF) --cflags spdk_nvme spdk_env_dpdk 2>/dev/null)
+SPDK_LIBS   := $(shell $(PKGCONF) --libs   spdk_nvme spdk_env_dpdk 2>/dev/null)
+SYS_LIBS    := $(shell $(PKGCONF) --libs   spdk_syslibs 2>/dev/null)
 
 CFLAGS     := -O2 -g -Wall -Wno-unused-parameter -Wno-format-truncation
 CFLAGS     += -I$(SRC) $(SPDK_CFLAGS)
@@ -59,10 +59,10 @@ ifeq ($(BACKEND),cuda)
     GPUCFLAGS := -O2 -I$(SRC)
 else
     CFLAGS   += -DUSE_MACA -I$(MACA_DIR)/include
-    GPU_LIBS := -L$(MACA_DIR)/lib -lmcruntime
+    GPU_LIBS := -L$(MACA_DIR)/lib -lmcruntime -lmccompiler
     GPU_LIB_PATH := $(MACA_DIR)/lib
     GPUCC    := $(MXCC)
-    GPUCFLAGS := -O2 -DUSE_MACA -I$(MACA_DIR)/include -I$(SRC)
+    GPUCFLAGS := -O2 -fPIC -x maca -DUSE_MACA -I$(MACA_DIR)/include -I$(SRC)
 endif
 
 RDMA_LIBS  := -libverbs -lrdmacm
