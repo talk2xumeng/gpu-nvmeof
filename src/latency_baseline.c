@@ -108,6 +108,10 @@ struct sample {
 
 static struct sample *g_samples;
 
+/* 标定值:kernel launch+sync 固定开销,以及消费 kernel 的总耗时 */
+static double g_launch_overhead;
+static double g_consume_cost;
+
 /* ================================================================== */
 /* MR 管理(与 gds_nvmeof 相同的延迟注册策略)                          */
 /* ================================================================== */
@@ -327,18 +331,47 @@ run_baseline(void)
 	       g_cfg.block_sz / 1024, g_cfg.rounds,
 	       use_kernel ? "开" : "关");
 
-	/* 先标定空 kernel 的 launch+sync 开销 */
+	/*
+	 * 标定两个基准值。这一步很重要 —— 没有它,消费 kernel 那一格
+	 * 里"真正在算"和"launch 开销"分不开,会把不可省的计算时间
+	 * 误算成控制面开销。
+	 */
 	if (use_kernel) {
-		double t0, t1, sum = 0;
+		double t0, t1, sum;
 		int i;
 
-		for (i = 0; i < 100; i++) {
+		/* ① 空 kernel 的 launch+sync。前 20 次丢掉 —— 首次调用要
+		 *    加载 module,几毫秒,会把平均值彻底带偏。 */
+		for (i = 0; i < 20; i++) {
+			gpu_launch_empty();
+		}
+		sum = 0;
+		for (i = 0; i < 200; i++) {
 			t0 = now_us();
 			gpu_launch_empty();
 			t1 = now_us();
 			sum += t1 - t0;
 		}
-		printf("[基线] 空 kernel launch+sync: %.1f us\n", sum / 100);
+		g_launch_overhead = sum / 200;
+		printf("[标定] 空 kernel launch+sync : %6.1f us\n",
+		       g_launch_overhead);
+
+		/* ② 消费 kernel 在数据已就位时的耗时。减去 ① 就是它
+		 *    纯粹的计算时间,这部分 GPU-initiated 省不掉。 */
+		for (i = 0; i < 10; i++) {
+			gpu_launch_consume(payload, g_cfg.block_sz, NULL);
+		}
+		sum = 0;
+		for (i = 0; i < 100; i++) {
+			t0 = now_us();
+			gpu_launch_consume(payload, g_cfg.block_sz, NULL);
+			t1 = now_us();
+			sum += t1 - t0;
+		}
+		g_consume_cost = sum / 100;
+		printf("[标定] 消费 kernel 总耗时     : %6.1f us\n", g_consume_cost);
+		printf("[标定]   其中计算部分         : %6.1f us  <- 不可省\n",
+		       g_consume_cost - g_launch_overhead);
 	}
 
 	for (r = 0; r < g_cfg.warmup + g_cfg.rounds; r++) {
@@ -419,25 +452,68 @@ run_baseline(void)
 
 #undef REPORT_COL
 
-	/* 优化空间 */
+	/* 优化空间 —— 关键是把"不可省的计算"从控制面里剔出去 */
 	{
-		double ctrl = 0, xfer = 0;
+		double k_exit = 0, submit = 0, xfer = 0, k_start = 0, total = 0;
+		double compute, savable;
 		uint32_t i;
 
 		for (i = 0; i < g_cfg.rounds; i++) {
-			ctrl += g_samples[i].kernel_exit +
-				g_samples[i].submit +
-				g_samples[i].kernel_start;
-			xfer += g_samples[i].transfer;
+			k_exit  += g_samples[i].kernel_exit;
+			submit  += g_samples[i].submit;
+			xfer    += g_samples[i].transfer;
+			k_start += g_samples[i].kernel_start;
+			total   += g_samples[i].total;
 		}
-		ctrl /= g_cfg.rounds;
-		xfer /= g_cfg.rounds;
+		k_exit  /= g_cfg.rounds;
+		submit  /= g_cfg.rounds;
+		xfer    /= g_cfg.rounds;
+		k_start /= g_cfg.rounds;
+		total   /= g_cfg.rounds;
 
-		printf("\n  控制面开销 : %.1f us (%.1f%%)\n",
-		       ctrl, 100.0 * ctrl / (ctrl + xfer));
-		printf("  数据传输   : %.1f us (%.1f%%)  <- 物理下限\n",
-		       xfer, 100.0 * xfer / (ctrl + xfer));
-		printf("\n  GPU-initiated 的优化空间就是上面那 %.1f us。\n", ctrl);
+		printf("\n===== 优化空间分析 =====\n");
+
+		if (use_kernel) {
+			/* 消费 kernel 里真正在算的部分,谁也省不掉 */
+			compute = g_consume_cost - g_launch_overhead;
+			if (compute < 0) {
+				compute = 0;
+			}
+
+			/*
+			 * GPU-initiated 能省的:
+			 *   - 计算 kernel 退出后 CPU 才能感知(≈ 一次 launch+sync)
+			 *   - I/O 提交(kernel 内直发,不用回 host)
+			 *   - 消费 kernel 的启动(数据到了直接接着算,不用重启 kernel)
+			 * 省不掉的:网络传输 + 消费 kernel 的实际计算
+			 */
+			savable = k_exit + submit + (k_start - compute);
+			if (savable < 0) {
+				savable = 0;
+			}
+
+			printf("  不可省:\n");
+			printf("    网络传输          %6.1f us\n", xfer);
+			printf("    消费kernel计算    %6.1f us\n", compute);
+			printf("  可省(GPU-initiated):\n");
+			printf("    计算kernel退出    %6.1f us\n", k_exit);
+			printf("    I/O 提交          %6.1f us\n", submit);
+			printf("    消费kernel启动    %6.1f us\n",
+			       k_start - compute);
+			printf("  ---------------------------------\n");
+			printf("    总计              %6.1f us\n", total);
+			printf("    可省              %6.1f us  (%.1f%%)\n",
+			       savable, 100.0 * savable / total);
+			printf("\n  注意:消费 kernel 那 %.1f us 的计算时间是真实工作量,\n",
+			       compute);
+			printf("       不是控制面开销,GPU-initiated 省不掉。\n");
+		} else {
+			printf("  提交              %6.1f us  <- 可省\n", submit);
+			printf("  网络传输          %6.1f us  <- 物理下限\n", xfer);
+			printf("  总计              %6.1f us\n", total);
+			printf("\n  这是纯 I/O 路径。与开 kernel 的结果相减,\n");
+			printf("  差值即 kernel launch/exit 的往返开销。\n");
+		}
 	}
 
 	free(col);
@@ -454,20 +530,35 @@ static int
 gpu_setup(size_t len)
 {
 	int fd = -1, rc;
+	size_t reg_len;
+
+	/*
+	 * SPDK 的内存映射表以 2 MiB 为粒度管理,注册长度必须是整数倍,
+	 * 否则 spdk_mem_register 返回 -EINVAL。
+	 *
+	 * KV block 尺寸(比如 64 token × 70272 B = 4.5 MiB)通常不是
+	 * 2 MiB 的整数倍,所以分配时向上取整。多出来的部分不参与 I/O,
+	 * 只是让注册能过。
+	 */
+	reg_len = (len + 0x1FFFFF) & ~(size_t)0x1FFFFF;
 
 	GPU_CHECK(gpu_set_device(g_cfg.gpu_id));
-	GPU_CHECK(gpu_mem_alloc(&g_ctx.gpu_buf, len));
-	g_ctx.buf_len = len;
+	GPU_CHECK(gpu_mem_alloc(&g_ctx.gpu_buf, reg_len));
+	g_ctx.buf_len = reg_len;
 
-	printf("[GPU] dev=%d buf=%p len=%zu\n",
-	       g_cfg.gpu_id, g_ctx.gpu_buf, len);
+	printf("[GPU] dev=%d buf=%p len=%zu (I/O 用 %zu)\n",
+	       g_cfg.gpu_id, g_ctx.gpu_buf, reg_len, len);
 
-	GPU_CHECK(gpu_mem_get_dmabuf_fd(&fd, g_ctx.gpu_buf, len));
+	GPU_CHECK(gpu_mem_get_dmabuf_fd(&fd, g_ctx.gpu_buf, reg_len));
 	g_ctx.dmabuf_fd = fd;
 
-	rc = spdk_mem_register(g_ctx.gpu_buf, len);
+	rc = spdk_mem_register(g_ctx.gpu_buf, reg_len);
 	if (rc != 0) {
-		fprintf(stderr, "spdk_mem_register 失败: %d\n", rc);
+		fprintf(stderr,
+			"spdk_mem_register 失败: %d\n"
+			"  va=%p len=%zu\n"
+			"  地址和长度都要按 2 MiB 对齐\n",
+			rc, g_ctx.gpu_buf, reg_len);
 		return -1;
 	}
 	return 0;

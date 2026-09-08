@@ -39,20 +39,45 @@ k_compute(unsigned int *scratch, int iters)
  * 拷贝引擎和 SM 的一致性路径不同,memcpy_dtoh 能读对不代表 SM 也能 ——
  * L2 里可能还有陈旧数据。所以让 kernel 自己算 checksum 比在 host
  * 侧比对更严格。
+ *
+ * 实现上要够快,否则测出来的是 kernel 自己的低效而不是 launch 开销。
+ * 早期版本用逐字节访问 + per-thread atomicAdd,只跑到 30 GB/s,
+ * 比网络还慢,把延迟分解彻底带偏了。现在改成:
+ *   - uint4 向量化访问,一次 16 字节
+ *   - block 内先做 shared memory 归约,只有每 block 一次 atomicAdd
+ *   - grid 开大,让 SM 填满
  */
 __global__ void
-k_consume(const unsigned char *buf, size_t len, unsigned long long *out)
+k_consume(const uint4 *buf, size_t nvec, unsigned long long *out)
 {
-	size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-	size_t stride = gridDim.x * blockDim.x;
+	__shared__ unsigned long long smem[256];
+
+	size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	size_t stride = (size_t)gridDim.x * blockDim.x;
 	unsigned long long sum = 0;
+	unsigned int tid = threadIdx.x;
+	unsigned int s;
 	size_t i;
 
-	for (i = idx; i < len; i += stride) {
-		sum += buf[i];
+	for (i = idx; i < nvec; i += stride) {
+		uint4 v = buf[i];
+
+		sum += v.x + v.y + v.z + v.w;
 	}
 
-	atomicAdd(out, sum);
+	smem[tid] = sum;
+	__syncthreads();
+
+	for (s = blockDim.x / 2; s > 0; s >>= 1) {
+		if (tid < s) {
+			smem[tid] += smem[tid + s];
+		}
+		__syncthreads();
+	}
+
+	if (tid == 0) {
+		atomicAdd(out, smem[0]);
+	}
 }
 
 /* 空 kernel,用来单独测 launch + sync 的固定开销 */
@@ -116,6 +141,8 @@ gpu_launch_consume(const void *buf, size_t len, unsigned long long *checksum)
 {
 	static unsigned long long *d_out;
 	unsigned long long zero = 0;
+	size_t nvec = len / sizeof(uint4);
+	int blocks;
 
 	if (!d_out) {
 		if (mcMalloc((void **)&d_out, sizeof(*d_out)) != mcSuccess) {
@@ -124,7 +151,17 @@ gpu_launch_consume(const void *buf, size_t len, unsigned long long *checksum)
 	}
 	mcMemcpy(d_out, &zero, sizeof(zero), mcMemcpyHostToDevice);
 
-	k_consume<<<64, 256>>>((const unsigned char *)buf, len, d_out);
+	/* grid 开够大让 SM 填满,但每线程至少处理几个向量,
+	 * 否则归约的开销盖过读取本身 */
+	blocks = (int)((nvec + 255) / 256);
+	if (blocks > 2048) {
+		blocks = 2048;
+	}
+	if (blocks < 1) {
+		blocks = 1;
+	}
+
+	k_consume<<<blocks, 256>>>((const uint4 *)buf, nvec, d_out);
 	if (mcGetLastError() != mcSuccess) {
 		return -1;
 	}
