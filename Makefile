@@ -30,6 +30,7 @@ MXCC       ?= $(MACA_DIR)/mxgpu_llvm/bin/mxcc
 TARGET_IP  ?= 172.16.3.3
 NQN        ?= nqn.2024-01.io.test:cnode1
 GPU_ID     ?= 4
+NIC        ?= mlx5_1
 BS         ?= 1048576
 QD         ?= 32
 COUNT      ?= 20000
@@ -42,6 +43,9 @@ BIN        := bin
 
 # ------------------------------------------------------------------
 
+# 注意:必须把路径内联进 shell 调用,不能用 export。
+# export 只影响 recipe 里的子进程,而 $(shell) 是 make 解析阶段执行的,
+# 那时导出还没生效,pkg-config 拿不到路径。
 PKGCONF := PKG_CONFIG_PATH=$(SPDK_DIR)/build/lib/pkgconfig:$(DPDK_LIB)/pkgconfig pkg-config
 
 SPDK_CFLAGS := $(shell $(PKGCONF) --cflags spdk_nvme spdk_env_dpdk 2>/dev/null)
@@ -59,9 +63,14 @@ ifeq ($(BACKEND),cuda)
     GPUCFLAGS := -O2 -I$(SRC)
 else
     CFLAGS   += -DUSE_MACA -I$(MACA_DIR)/include
+    # libmccompiler 提供 __mcPushCallConfiguration 等三尖括号 launch
+    # 展开后需要的运行时符号
     GPU_LIBS := -L$(MACA_DIR)/lib -lmcruntime -lmccompiler
     GPU_LIB_PATH := $(MACA_DIR)/lib
     GPUCC    := $(MXCC)
+    # -x maca 是关键:mxcc 靠 .maca 后缀或 -x maca 才进 GPU 编译模式,
+    # 否则 .cpp 被当普通 C++,blockIdx/threadIdx 之类都不认识。
+    # -fPIC 必需:Ubuntu 的 gcc 默认生成 PIE,mxcc 的 .o 不是位置无关的话链接会失败
     GPUCFLAGS := -O2 -fPIC -x maca -DUSE_MACA -I$(MACA_DIR)/include -I$(SRC)
 endif
 
@@ -69,7 +78,8 @@ RDMA_LIBS  := -libverbs -lrdmacm
 EXTRA_LIBS := -lssl -lcrypto -lpthread -lrt -lnuma -ldl -luuid -lm
 LDFLAGS    := $(SPDK_LIBS) $(SYS_LIBS) $(GPU_LIBS) $(RDMA_LIBS) $(EXTRA_LIBS)
 
-.PHONY: all probe clean check ldconfig gpucheck \
+.PHONY: all probe clean check ldconfig gpucheck run-launch-probe \
+        run-mmio-probe run-mmio-probe-w \
         run-verify run-bw run-host run-latency run-latency-noker sweep-block help
 
 all: $(BIN)/gds_nvmeof $(BIN)/latency_baseline
@@ -100,7 +110,17 @@ $(BIN)/dmabuf_probe: $(SRC)/dmabuf_probe.c | $(BIN)
 	$(CC) -O2 -Wall -o $@ $< -libverbs -ldl
 	@echo "OK: $@"
 
-probe: $(BIN)/dmabuf_probe
+# 纯 GPU 程序,不依赖 SPDK,mxcc 一步编完
+$(BIN)/launch_probe: $(SRC)/launch_probe.cpp | $(BIN)
+	$(GPUCC) $(GPUCFLAGS) -o $@ $<
+	@echo "OK: $@"
+
+# GPU 访问网卡队列/门铃的探测。需要 mlx5dv,不依赖 SPDK。
+$(BIN)/mmio_probe: $(SRC)/mmio_probe.cpp | $(BIN)
+	$(GPUCC) $(GPUCFLAGS) -o $@ $< -libverbs -lmlx5
+	@echo "OK: $@"
+
+probe: $(BIN)/dmabuf_probe $(BIN)/launch_probe $(BIN)/mmio_probe
 
 # ---- 环境 ----
 
@@ -141,6 +161,17 @@ run-bw: $(BIN)/gds_nvmeof
 run-host: $(BIN)/gds_nvmeof
 	sudo $(GDS) -H -b $(BS) -q $(QD) -c $(COUNT)
 
+run-launch-probe: $(BIN)/launch_probe
+	./$(BIN)/launch_probe $(GPU_ID) 1000
+
+# 只映射不写门铃,安全
+run-mmio-probe: $(BIN)/mmio_probe
+	sudo ./$(BIN)/mmio_probe $(NIC) $(GPU_ID)
+
+# 加 -w 真的从 kernel 写门铃(QP 在 RESET 态,不会发包)
+run-mmio-probe-w: $(BIN)/mmio_probe
+	sudo ./$(BIN)/mmio_probe $(NIC) $(GPU_ID) -w
+
 run-latency: $(BIN)/latency_baseline
 	sudo $(LAT) -g $(GPU_ID) -b $(KVBLOCK) -r $(ROUNDS)
 
@@ -149,13 +180,12 @@ run-latency-noker: $(BIN)/latency_baseline
 
 # 扫 KV block 粒度:16/32/64/128 token @70272 B
 sweep-block: $(BIN)/latency_baseline
-	@for tok in 8 16 32 64 128; do \
+	@for tok in 16 32 64 128; do \
 		b=$$(( tok * 70272 )); \
 		b=$$(( (b + 4095) / 4096 * 4096 )); \
 		echo "=== $$tok token = $$b bytes ==="; \
 		sudo $(LAT) -g $(GPU_ID) -b $$b -r 500 2>/dev/null | \
-		  sed -n '/优化空间/,$$p'; \
-		echo; \
+		  grep -E "总计|控制面|数据传输"; \
 	done
 
 clean:
