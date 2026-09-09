@@ -57,6 +57,8 @@ struct config {
 	uint32_t	rounds;		/* 测量轮数 */
 	uint32_t	warmup;
 	int		kernel_iters;	/* 计算 kernel 的工作量,0 = 不跑 kernel */
+	bool		random_lba;	/* 随机 LBA,对齐 fio 的 randread */
+	bool		do_write;	/* 写方向 */
 	bool		use_host_mem;
 };
 
@@ -310,6 +312,7 @@ run_baseline(void)
 	void *scratch = NULL, *result = NULL;
 	void *payload;
 	uint32_t r;
+	int rc_submit;
 	double *col;
 	bool use_kernel = (g_cfg.kernel_iters > 0) && !g_cfg.use_host_mem;
 
@@ -327,9 +330,11 @@ run_baseline(void)
 
 	g_samples = calloc(g_cfg.rounds, sizeof(*g_samples));
 
-	printf("\n[基线] QD=1, bs=%u KiB, rounds=%u, kernel=%s\n",
+	printf("\n[基线] %s QD=1, bs=%u KiB, rounds=%u, kernel=%s, LBA=%s\n",
+	       g_cfg.do_write ? "WRITE" : "READ",
 	       g_cfg.block_sz / 1024, g_cfg.rounds,
-	       use_kernel ? "开" : "关");
+	       use_kernel ? "开" : "关",
+	       g_cfg.random_lba ? "随机" : "顺序");
 
 	/*
 	 * 标定两个基准值。这一步很重要 —— 没有它,消费 kernel 那一格
@@ -387,11 +392,31 @@ run_baseline(void)
 		}
 		t1 = now_us();
 
-		/* ② 提交读 */
-		lba = ((uint64_t)r * lba_count) % (max_lba - lba_count);
+		/*
+		 * ② 提交读
+		 *
+		 * 顺序 LBA 会被盘的预读和 DRAM 缓存命中,测出来的延迟里
+		 * 不含闪存访问时间 —— 和 fio 的 randread 不可比。
+		 * -R 打开随机模式对齐。
+		 */
+		if (g_cfg.random_lba) {
+			lba = ((uint64_t)rand() << 20 | (uint64_t)rand()) %
+			      (max_lba - lba_count);
+			lba -= lba % lba_count;
+		} else {
+			lba = ((uint64_t)r * lba_count) % (max_lba - lba_count);
+		}
 		g_io_done = g_io_error = 0;
-		if (spdk_nvme_ns_cmd_read(g_ns, g_qpair, payload, lba,
-					  lba_count, io_cb, NULL, 0) != 0) {
+		if (g_cfg.do_write) {
+			rc_submit = spdk_nvme_ns_cmd_write(g_ns, g_qpair,
+					payload, lba, lba_count,
+					io_cb, NULL, 0);
+		} else {
+			rc_submit = spdk_nvme_ns_cmd_read(g_ns, g_qpair,
+					payload, lba, lba_count,
+					io_cb, NULL, 0);
+		}
+		if (rc_submit != 0) {
 			fprintf(stderr, "提交失败 @round %u\n", r);
 			return -1;
 		}
@@ -576,6 +601,8 @@ usage(const char *p)
 	printf("  -r <n>      测量轮数,默认 2000\n");
 	printf("  -k <iters>  计算 kernel 工作量,0 = 不跑 kernel\n");
 	printf("  -H          对照组:主机内存\n");
+	printf("  -R          随机 LBA(对齐 fio 的 randread)\n");
+	printf("  -w          写方向(会覆盖 target 数据,确认后端可写)\n");
 	printf("\n典型用法:\n");
 	printf("  # 完整基线\n");
 	printf("  %s -a 172.16.3.3 -n nqn.xxx -g 4\n", p);
@@ -593,7 +620,7 @@ main(int argc, char **argv)
 	struct spdk_nvme_transport_id trid = {};
 	int op, rc = 0;
 
-	while ((op = getopt(argc, argv, "a:s:n:g:b:r:k:Hh")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:b:r:k:HRwh")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_cfg.traddr, sizeof(g_cfg.traddr), "%s", optarg); break;
 		case 's': snprintf(g_cfg.trsvcid, sizeof(g_cfg.trsvcid), "%s", optarg); break;
@@ -603,6 +630,8 @@ main(int argc, char **argv)
 		case 'r': g_cfg.rounds = (uint32_t)atoi(optarg); break;
 		case 'k': g_cfg.kernel_iters = atoi(optarg); break;
 		case 'H': g_cfg.use_host_mem = true; break;
+		case 'R': g_cfg.random_lba = true; break;
+		case 'w': g_cfg.do_write = true; break;
 		default:  usage(argv[0]); return 1;
 		}
 	}
