@@ -734,6 +734,7 @@ main(int argc, char **argv)
 	 * 而我们还需要内核态 mlx5_ib 来做 RDMA。 */
 	spdk_env_opts_init(&opts);
 	opts.name    = "gds_nvmeof";
+	opts.opts_size = sizeof(opts);
 	opts.no_pci  = true;
 
 	if (spdk_env_init(&opts) < 0) {

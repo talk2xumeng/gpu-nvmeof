@@ -59,6 +59,7 @@ struct config {
 	int		kernel_iters;	/* 计算 kernel 的工作量,0 = 不跑 kernel */
 	bool		random_lba;	/* 随机 LBA,对齐 fio 的 randread */
 	bool		do_write;	/* 写方向 */
+	uint64_t	lba_limit;	/* 随机 LBA 上限,0=整盘 */
 	bool		use_host_mem;
 };
 
@@ -400,8 +401,18 @@ run_baseline(void)
 		 * -R 打开随机模式对齐。
 		 */
 		if (g_cfg.random_lba) {
-			lba = ((uint64_t)rand() << 20 | (uint64_t)rand()) %
-			      (max_lba - lba_count);
+			/*
+			 * 限制在写过的区域内。整盘随机会大量落到未写入的
+			 * LBA —— NVMe 对这些直接返回零不查 NAND,测出来
+			 * 是 17 us 而不是真实的 74 us,分布呈双峰。
+			 */
+			uint64_t span = g_cfg.lba_limit ?
+					g_cfg.lba_limit : (max_lba - lba_count);
+
+			if (span > max_lba - lba_count) {
+				span = max_lba - lba_count;
+			}
+			lba = ((uint64_t)rand() << 20 | (uint64_t)rand()) % span;
 			lba -= lba % lba_count;
 		} else {
 			lba = ((uint64_t)r * lba_count) % (max_lba - lba_count);
@@ -603,6 +614,7 @@ usage(const char *p)
 	printf("  -H          对照组:主机内存\n");
 	printf("  -R          随机 LBA(对齐 fio 的 randread)\n");
 	printf("  -w          写方向(会覆盖 target 数据,确认后端可写)\n");
+	printf("  -L <lba>    随机 LBA 上限,限制在已写过的区域内\n");
 	printf("\n典型用法:\n");
 	printf("  # 完整基线\n");
 	printf("  %s -a 172.16.3.3 -n nqn.xxx -g 4\n", p);
@@ -620,7 +632,7 @@ main(int argc, char **argv)
 	struct spdk_nvme_transport_id trid = {};
 	int op, rc = 0;
 
-	while ((op = getopt(argc, argv, "a:s:n:g:b:r:k:HRwh")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:b:r:k:L:HRwh")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_cfg.traddr, sizeof(g_cfg.traddr), "%s", optarg); break;
 		case 's': snprintf(g_cfg.trsvcid, sizeof(g_cfg.trsvcid), "%s", optarg); break;
@@ -632,6 +644,7 @@ main(int argc, char **argv)
 		case 'H': g_cfg.use_host_mem = true; break;
 		case 'R': g_cfg.random_lba = true; break;
 		case 'w': g_cfg.do_write = true; break;
+		case 'L': g_cfg.lba_limit = strtoull(optarg, NULL, 0); break;
 		default:  usage(argv[0]); return 1;
 		}
 	}
