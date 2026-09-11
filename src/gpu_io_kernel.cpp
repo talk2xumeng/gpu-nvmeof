@@ -20,33 +20,10 @@
 
 #include <mcr/mc_runtime.h>
 #include <stdio.h>
+#include "gpu_io_ctx.h"
 
 #define USE_MACA_DEVICE 1
 #include "wqe_build.h"
-
-struct gpu_io_ctx {
-	volatile uint8_t	*sq_buf;
-	volatile uint32_t	*qp_dbrec;	/* [0]=RQ [1]=SQ */
-	volatile uint64_t	*bf_reg;	/* UAR,MMIO */
-	volatile uint8_t	*cq_buf;
-	volatile uint32_t	*cq_dbrec;
-	uint32_t		sq_wqe_cnt;
-	uint32_t		sq_stride;
-	uint32_t		cq_cnt;
-	uint32_t		cqe_size;
-	uint32_t		qpn;
-	volatile uint8_t	*capsule;
-	uint32_t		capsule_lkey;
-	uint64_t		capsule_addr;
-	uint64_t		data_addr;
-	uint32_t		data_rkey;
-	uint32_t		nsid;
-	uint32_t		sector_size;
-	uint32_t		io_bytes;
-	uint16_t		sq_pi;
-	uint32_t		cq_ci;
-	uint8_t			cq_phase;
-};
 
 /*
  * 一次 I/O 产生两个 CQE:我们那条 SEND 的发送完成,以及 target 回的

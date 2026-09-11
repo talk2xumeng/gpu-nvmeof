@@ -109,11 +109,12 @@ $(BIN)/%.o: $(SRC)/%.cpp | $(BIN)
 
 # WQE/CQE 的字节布局全在 wqe_build.h 里,改它必须重编 —— 否则只动
 # header 时 make 认为 .o 还是新的,你会拿着旧二进制查一晚上。
-$(BIN)/gpu_io_kernel.o: $(SRC)/wqe_build.h
+$(BIN)/gpu_io_kernel.o: $(SRC)/wqe_build.h $(SRC)/gpu_io_ctx.h
 
 # GPU-initiated 原型。host 侧直接用了 mlx5dv 拿 SQ/CQ/UAR,要显式
 # 链 -lmlx5;kernel 那个 .o 是 C++ 编出来的,要 -lstdc++。
-$(BIN)/gpu_initiated: $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o | $(BIN)
+$(BIN)/gpu_initiated: $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o \
+                      $(SRC)/gpu_io_ctx.h | $(BIN)
 	@if [ -z "$(SPDK_LIBS)" ]; then \
 		echo "错误: pkg-config 找不到 SPDK,检查 SPDK_DIR=$(SPDK_DIR)"; exit 1; fi
 	$(CC) $(CFLAGS) -o $@ $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o \

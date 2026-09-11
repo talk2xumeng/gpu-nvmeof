@@ -18,30 +18,7 @@
 #include <infiniband/mlx5dv.h>
 #include <endian.h>
 
-/* 与 gpu_io_kernel.cpp 中的定义保持一致 */
-struct gpu_io_ctx {
-	volatile uint8_t	*sq_buf;
-	volatile uint32_t	*qp_dbrec;
-	volatile uint64_t	*bf_reg;
-	volatile uint8_t	*cq_buf;
-	volatile uint32_t	*cq_dbrec;
-	uint32_t		sq_wqe_cnt;
-	uint32_t		sq_stride;
-	uint32_t		cq_cnt;
-	uint32_t		cqe_size;
-	uint32_t		qpn;
-	volatile uint8_t	*capsule;
-	uint32_t		capsule_lkey;
-	uint64_t		capsule_addr;
-	uint64_t		data_addr;
-	uint32_t		data_rkey;
-	uint32_t		nsid;
-	uint32_t		sector_size;
-	uint32_t		io_bytes;
-	uint16_t		sq_pi;
-	uint32_t		cq_ci;
-	uint8_t			cq_phase;
-};
+#include "gpu_io_ctx.h"
 
 extern int gpu_io_run(struct gpu_io_ctx *, unsigned int, unsigned long long,
 		      unsigned long long *, int *, unsigned int *);
