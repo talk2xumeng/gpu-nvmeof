@@ -33,6 +33,7 @@ struct gpu_io_ctx {
 	uint32_t		nsid;
 	uint32_t		sector_size;
 	uint32_t		io_bytes;
+	uint8_t			nvme_opc;	/* 0x02=READ 0x01=WRITE */
 	uint16_t		sq_pi;	/* 接管时从 dbrec 读出的 SQ 生产者索引 */
 	uint32_t		cq_ci;	/* 同上,CQ 消费者索引 */
 	uint8_t			cq_phase;

@@ -51,6 +51,8 @@ static volatile int		g_io_done, g_io_err;
 static char			g_traddr[64], g_nqn[224];
 static char			g_trsvcid[16] = "4420";
 static int			g_gpu_id = 4;
+static int			g_write;	/* -W: 比对写命令 */
+static int			g_bf_inline;	/* -B: 门铃走 BlueFlame 内联 */
 
 /* ================================================================== */
 /* SPDK hooks(和 gds_nvmeof 相同的延迟注册策略)                       */
@@ -239,14 +241,16 @@ main(int argc, char **argv)
 	uint64_t db_val;
 	int op;
 
-	while ((op = getopt(argc, argv, "a:s:n:g:")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:WB")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
 		case 'n': snprintf(g_nqn, sizeof(g_nqn), "%s", optarg); break;
 		case 'g': g_gpu_id = atoi(optarg); break;
+		case 'W': g_write = 1; break;
+		case 'B': g_bf_inline = 1; break;
 		default:
-			printf("用法: %s -a <ip> -n <nqn> [-g gpu]\n", argv[0]);
+			printf("用法: %s -a <ip> -n <nqn> [-g gpu] [-W 比对写命令]\n", argv[0]);
 			return 1;
 		}
 	}
@@ -341,8 +345,12 @@ main(int argc, char **argv)
 	pi_before = (uint16_t)(wqe_hto_be32(((volatile uint32_t *)dv_qp.dbrec)[1]) & 0xffff);
 
 	g_io_done = g_io_err = 0;
-	if (spdk_nvme_ns_cmd_read(g_ns, g_qpair, g_gpu_buf, 0, lba_count,
-				  io_cb, NULL, 0) != 0) {
+	printf("\n[命令] %s\n", g_write ? "WRITE (opc 0x01)" : "READ (opc 0x02)");
+	if ((g_write ?
+	     spdk_nvme_ns_cmd_write(g_ns, g_qpair, g_gpu_buf, 0, lba_count,
+				    io_cb, NULL, 0) :
+	     spdk_nvme_ns_cmd_read(g_ns, g_qpair, g_gpu_buf, 0, lba_count,
+				   io_cb, NULL, 0)) != 0) {
 		fprintf(stderr, "提交失败\n");
 		return 1;
 	}
@@ -403,7 +411,9 @@ main(int argc, char **argv)
 
 			hexdump("\n  SPDK 的 NVMe 胶囊", spdk_cap, 64);
 
-			nvme_build_rw_sqe(&ours, NVME_OPC_READ, 0,
+			nvme_build_rw_sqe(&ours,
+					  g_write ? NVME_OPC_WRITE
+						  : NVME_OPC_READ, 0,
 					  spdk_nvme_ns_get_id(g_ns), 0,
 					  lba_count,
 					  (uint64_t)g_gpu_buf,
@@ -411,6 +421,154 @@ main(int argc, char **argv)
 					  4096);
 			hexdump("  我们构造的胶囊", &ours, 64);
 			compare("NVMe 命令胶囊", spdk_cap, &ours, 64, exp, 2);
+		}
+	}
+
+	/* ==============================================================
+	 * host 侧手工提交:用 wqe_build.h 自己写 WQE + 敲门铃,全程 CPU。
+	 *
+	 * 二分用。GPU 路径失败而这里成功 -> 问题是 GPU 特有的;
+	 * 这里也失败 -> 问题在提交路径本身,和 GPU 无关。
+	 *
+	 * 胶囊沿用 SPDK 那块 hugepage(地址/lkey 从它的 WQE 里读出来),
+	 * 所以连"胶囊在 HBM"这个变量也一并排除掉了。
+	 * ============================================================== */
+	{
+		struct mlx5_wqe_data_seg *sd =
+			(struct mlx5_wqe_data_seg *)(spdk_wqe + 16);
+		uint64_t cap_addr = wqe_hto_be64(sd->addr);
+		uint32_t cap_lkey = wqe_hto_be32(sd->lkey);
+		volatile uint32_t *dbrec = (volatile uint32_t *)dv_qp.dbrec;
+		volatile uint64_t *bf = (volatile uint64_t *)dv_qp.bf.reg;
+		uint16_t pi = pi_after;
+		uint32_t my_slot = pi & (dv_qp.sq.wqe_cnt - 1);
+		void *my_wqe = (void *)((uintptr_t)dv_qp.sq.buf +
+					(size_t)my_slot * dv_qp.sq.stride);
+		uint32_t cq_ci, k;
+		uint8_t phase;
+		uint64_t db;
+		int got = 0;
+
+		cq_ci = wqe_hto_be32(((volatile uint32_t *)dv_cq.dbrec)[0]) &
+			0xffffff;
+		phase = (uint8_t)((cq_ci / dv_cq.cqe_cnt) & 1);
+
+		printf("\n===== host 侧手工提交 =====\n");
+		printf("  slot=%u pi=%u cq_ci=%u phase=%u\n",
+		       my_slot, pi, cq_ci, phase);
+
+		/* -W 时把源显存填成已知 pattern,跑完回读比对。
+		 * 光看"收到响应胶囊"不算数 —— 写命令的 RESP_SEND 成功
+		 * 不代表数据落盘了,gpu_initiated 上就吃过这个亏。 */
+		if (g_write) {
+			gpu_memset(g_gpu_buf, 0x5a, 4096);
+			gpu_synchronize();	/* mcMemset 异步,必须等 */
+		}
+
+		/* 胶囊:照抄 SPDK 的那块,只把 cid 换掉避免撞车 */
+		nvme_build_rw_sqe((struct nvme_sqe *)cap_addr,
+				  g_write ? NVME_OPC_WRITE : NVME_OPC_READ,
+				  0x7777,
+				  spdk_nvme_ns_get_id(g_ns), 0, lba_count,
+				  (uint64_t)g_gpu_buf,
+				  g_gpu_mr ? g_gpu_mr->rkey : 0, 4096);
+
+		db = mlx5_build_send_wqe(my_wqe, pi, qp->qp_num,
+					 cap_addr, cap_lkey, 64);
+
+		__sync_synchronize();
+		dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
+		__sync_synchronize();
+
+		if (g_bf_inline) {
+			/*
+			 * BlueFlame 内联:把整个 WQE(ds=2 -> 32 字节)直接
+			 * 写进 BF 寄存器,而不是只写 8 字节让网卡回 SQ 取。
+			 *
+			 * bf.size=256 说明这块网卡支持内联。rdma-core 在
+			 * WQE 够小时走 MLX5_DB_METHOD_BF,而且每次提交后
+			 * bf->offset 在 0 和 bf.size 之间轮转。我们一直只
+			 * 写 8 字节 —— 如果网卡实际按内联解析,读到的就是
+			 * 残缺 WQE。
+			 */
+			volatile uint64_t *bfp = bf;
+			const uint64_t *src = (const uint64_t *)my_wqe;
+			unsigned w;
+
+			for (w = 0; w < 4; w++) {	/* 32 字节 = 4 个 u64 */
+				bfp[w] = src[w];
+			}
+			printf("  门铃: BlueFlame 内联 32 字节\n");
+		} else {
+			*bf = db;
+			printf("  门铃: 8 字节 0x%016llx\n",
+			       (unsigned long long)db);
+		}
+		__sync_synchronize();
+
+		for (k = 0; k < 200000000u; k++) {
+			uint32_t idx = cq_ci & (dv_cq.cqe_cnt - 1);
+			uint8_t *c8 = (uint8_t *)dv_cq.buf +
+				      (size_t)idx * dv_cq.cqe_size;
+			uint8_t oo = c8[dv_cq.cqe_size - 1];
+			uint8_t opc = oo >> 4;
+
+			if ((oo & 1) != (phase & 1) || opc == 15) {
+				continue;
+			}
+			printf("  CQE[%u] opcode=%u", idx, opc);
+			if (opc == 13 || opc == 14) {
+				printf("  syndrome=0x%02x vendor=0x%02x",
+				       c8[55], c8[54]);
+			}
+			printf("\n");
+			cq_ci++;
+			if ((cq_ci & (dv_cq.cqe_cnt - 1)) == 0) {
+				phase ^= 1;
+			}
+			((volatile uint32_t *)dv_cq.dbrec)[0] =
+				wqe_hto_be32(cq_ci & 0xffffff);
+			if (opc == 2) {
+				got = 1;
+				break;
+			}
+			if (opc == 13 || opc == 14) {
+				break;
+			}
+		}
+		printf("  结论: %s\n", got ? "成功收到响应胶囊" :
+		       "失败(超时或错误 CQE)");
+
+		/* 写命令必须回读确认,否则"成功"可能是假的 */
+		if (g_write && got) {
+			void *rb = spdk_dma_zmalloc(4096, 4096, NULL);
+			unsigned char *p8 = rb;
+			unsigned match = 0, q;
+
+			if (rb) {
+				g_io_done = g_io_err = 0;
+				if (spdk_nvme_ns_cmd_read(g_ns, g_qpair, rb, 0,
+							  lba_count, io_cb,
+							  NULL, 0) == 0) {
+					while (!g_io_done) {
+						spdk_nvme_qpair_process_completions(g_qpair, 0);
+					}
+					for (q = 0; q < 4096; q++) {
+						if (p8[q] == 0x5a) {
+							match++;
+						}
+					}
+				}
+				printf("  回读 LBA 0: %u/4096 = 0x5a  前8字节 ",
+				       match);
+				for (q = 0; q < 8; q++) {
+					printf("%02x ", p8[q]);
+				}
+				printf(" %s\n", match == 4096 ?
+				       "<- 数据真的落盘了" :
+				       "<- *** 响应成功但数据没落盘 ***");
+				spdk_dma_free(rb);
+			}
 		}
 	}
 

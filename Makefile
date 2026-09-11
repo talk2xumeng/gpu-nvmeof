@@ -82,10 +82,10 @@ RDMA_LIBS  := -libverbs -lrdmacm
 EXTRA_LIBS := -lssl -lcrypto -lpthread -lrt -lnuma -ldl -luuid -lm
 LDFLAGS    := $(SPDK_LIBS) $(SYS_LIBS) $(GPU_LIBS) $(RDMA_LIBS) $(EXTRA_LIBS)
 
-.PHONY: all probe clean check ldconfig gpucheck run-launch-probe \
+.PHONY: all probe clean check ldconfig gpucheck run-launch-probe run-wqe-verify \
         run-mmio-probe run-mmio-probe-w \
         run-verify run-bw run-host run-latency run-latency-noker sweep-block \
-        run-gpu-initiated run-wqe-verify help
+        run-gpu-initiated help
 
 all: $(BIN)/gds_nvmeof $(BIN)/latency_baseline $(BIN)/gpu_initiated \
      $(BIN)/wqe_verify
@@ -122,8 +122,11 @@ $(BIN)/gpu_initiated: $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o \
 	      $(LDFLAGS) -lmlx5 -lstdc++
 	@echo "OK: $@"
 
+# 纯 host 侧:WQE/胶囊布局比对 + host 手工提交。不链 GPU kernel。
 $(BIN)/wqe_verify: $(SRC)/wqe_verify.c $(SRC)/wqe_build.h \
                    $(SRC)/gpu_backend.h | $(BIN)
+	@if [ -z "$(SPDK_LIBS)" ]; then \
+		echo "错误: pkg-config 找不到 SPDK,检查 SPDK_DIR=$(SPDK_DIR)"; exit 1; fi
 	$(CC) $(CFLAGS) -o $@ $(SRC)/wqe_verify.c $(LDFLAGS) -lmlx5 -lstdc++
 	@echo "OK: $@"
 

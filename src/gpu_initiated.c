@@ -1,11 +1,29 @@
 /*
  * gpu_initiated.c  --  GPU-initiated NVMe-oF 原型的 host 侧
  *
- * CPU 只做初始化:SPDK 建连、Fabric Connect、注册 MR、把队列映射给
- * GPU。稳态收发全在 kernel 内。
+ * CPU 只做初始化:SPDK 建连、Fabric Connect、注册 MR、把 SQ/CQ/dbrec/UAR
+ * 映射给 GPU。稳态收发全在 kernel 内 —— 构造命令胶囊、写 WQE、敲门铃、
+ * 轮询 CQ,一条都不经过 CPU。
  *
- * 出错时 CPU 兜底 —— kernel 只报错误码,QP 恢复要 modify_qp,
- * 那是 host API,kernel 里做不了。原型阶段够用。
+ * 出错时 CPU 兜底:kernel 只报错误码,QP 恢复要 modify_qp,那是 host API。
+ *
+ * ============ 用法 ============
+ *
+ *   -a <ip> -n <nqn>     必填
+ *   -g <id>              GPU 编号
+ *   -r <n> -b <bytes>    轮数、每轮字节数
+ *   -W                   发 WRITE(默认 READ)
+ *   -H                   命令胶囊放显存(默认主存)。见下面的已知问题。
+ *   -P                   只把 LBA 0 涂成 0xCC 然后退出
+ *   -V                   只回读 LBA 0 然后退出
+ *
+ * 写路径的校验必须用 -P / -V 分三个进程做:
+ *
+ *   ./gpu_initiated ... -P        涂 0xCC
+ *   ./gpu_initiated ... -W -r 1   kernel 写
+ *   ./gpu_initiated ... -V        看是不是变成 pattern
+ *
+ * 不能在本进程里回读 —— 见 docs/debug-notes.md 第 4 条。
  */
 
 #define _GNU_SOURCE
@@ -22,30 +40,42 @@
 
 extern int gpu_io_run(struct gpu_io_ctx *, unsigned int, unsigned long long,
 		      unsigned long long *, int *, unsigned int *);
-extern int gpu_ring_bench(void *, unsigned long long, unsigned int,
-			  unsigned long long *);
 extern int gpu_alloc_exportable(void **, int *, size_t);
 extern int gpu_map_host(void *, size_t, unsigned int, void **);
 extern int gpu_set_dev(int);
 extern int gpu_clock_khz(int, int *);
 extern int gpu_copy_to_host(void *, const void *, size_t);
 extern int gpu_memset_dev(void *, int, size_t);
+extern int gpu_sync(void);
 
 #define MC_HOST_REGISTER_MAPPED		0x02
 #define MC_HOST_REGISTER_IO_MEMORY	0x04
+
+#define CAP_AREA_LEN	(2 * 1024 * 1024)
+#define RPAT		0xbb		/* 读:预填,被 target 覆盖才算落地 */
+#define WPAT		0x5a		/* 写:pattern */
+#define CPAT		0xcc		/* -P 涂色 */
 
 static struct spdk_nvme_ctrlr	*g_ctrlr;
 static struct spdk_nvme_ns	*g_ns;
 static struct spdk_nvme_qpair	*g_qpair;
 static struct ibv_pd		*g_pd;
 static struct ibv_mr		*g_data_mr, *g_cap_mr;
-static void	*g_data_gpu, *g_cap_gpu;
-static size_t	g_data_len;
-static int	g_data_fd = -1, g_cap_fd = -1;
+
+static void	*g_base_gpu, *g_data_gpu;
+static void	*g_cap_host, *g_cap_dev, *g_cap_hbm;
+static size_t	g_data_len, g_total_len;
+static int	g_base_fd = -1;
+
 static char	g_traddr[64], g_nqn[224], g_trsvcid[16] = "4420";
 static int	g_gpu_id = 4;
 static uint32_t	g_rounds = 100;
 static uint32_t	g_io_bytes = 4096;
+static int	g_write, g_cap_in_hbm, g_paint, g_verify;
+
+/* ================================================================== */
+/* SPDK hooks:让 SPDK 用我们的 PD,并把显存注册成 dma-buf MR          */
+/* ================================================================== */
 
 static struct ibv_pd *
 hook_get_pd(const struct spdk_nvme_transport_id *t, struct ibv_context *v)
@@ -69,12 +99,23 @@ hook_get_rkey(struct ibv_pd *pd, void *buf, size_t size)
 	uint64_t a = (uint64_t)buf;
 	int i;
 
-	if (g_data_gpu && a >= (uint64_t)g_data_gpu &&
-	    a + size <= (uint64_t)g_data_gpu + g_data_len) {
+	/*
+	 * 显存只有一块分配,一个 MR 覆盖全部(-H 时数据区和胶囊区都在里面)。
+	 *
+	 * 别拆成两次 mcMalloc 各自导出各自注册:MACA 的 dma-buf,offset 0
+	 * 指的是底层分配的基址,不是你传进去那个子区间的起点。两块相邻的
+	 * mcMalloc 很可能落在同一个 slab,于是第二个 MR 实际映射到第一块的
+	 * 物理页,网卡读出来是另一块的内容。症状是 target 报
+	 *   Invalid NVMf I/O Command SGL: Type 0xa, Subtype 0xa
+	 * —— 0xAA 正是另一块的 memset 值,换成 0xBB 就变成 0xb/0xb,
+	 * 换成 0x5A 就变成 0x5/0xa。这个对应关系是定位它的关键线索。
+	 */
+	if (g_base_gpu && a >= (uint64_t)g_base_gpu &&
+	    a + size <= (uint64_t)g_base_gpu + g_total_len) {
 		if (!g_data_mr) {
-			g_data_mr = ibv_reg_dmabuf_mr(pd, 0, g_data_len,
-						      (uint64_t)g_data_gpu,
-						      g_data_fd, acc);
+			g_data_mr = ibv_reg_dmabuf_mr(pd, 0, g_total_len,
+						      (uint64_t)g_base_gpu,
+						      g_base_fd, acc);
 		}
 		return g_data_mr ? g_data_mr->rkey : 0;
 	}
@@ -104,6 +145,8 @@ static struct spdk_nvme_rdma_hooks g_hooks = {
 	.put_rkey   = hook_put_rkey,
 };
 
+/* ================================================================== */
+
 static bool
 probe_cb(void *c, const struct spdk_nvme_transport_id *t,
 	 struct spdk_nvme_ctrlr_opts *o)
@@ -130,9 +173,28 @@ attach_cb(void *c, const struct spdk_nvme_transport_id *t,
 }
 
 static void
-warm_cb(void *a, const struct spdk_nvme_cpl *cpl)
+io_cb(void *a, const struct spdk_nvme_cpl *cpl)
 {
 	*(int *)a = spdk_nvme_cpl_is_error(cpl) ? -1 : 1;
+}
+
+/* 用 SPDK 的 CPU 路径发一条并等完成。接管 QP 之前用,之后不能再用。 */
+static int
+cpu_io(int is_write, void *buf, uint64_t lba, uint32_t nlb)
+{
+	int st = 0;
+	int rc;
+
+	rc = is_write ?
+	     spdk_nvme_ns_cmd_write(g_ns, g_qpair, buf, lba, nlb, io_cb, &st, 0) :
+	     spdk_nvme_ns_cmd_read(g_ns, g_qpair, buf, lba, nlb, io_cb, &st, 0);
+	if (rc != 0) {
+		return -1;
+	}
+	while (!st) {
+		spdk_nvme_qpair_process_completions(g_qpair, 0);
+	}
+	return st > 0 ? 0 : -1;
 }
 
 static int cmp_d(const void *a, const void *b)
@@ -140,6 +202,14 @@ static int cmp_d(const void *a, const void *b)
 	double x = *(const double *)a, y = *(const double *)b;
 	return (x > y) - (x < y);
 }
+
+static void usage(const char *p)
+{
+	printf("用法: %s -a <ip> -n <nqn> [-g gpu] [-r rounds] [-b bytes]\n"
+	       "      [-W 发写] [-H 胶囊放显存] [-P 涂色] [-V 回读]\n", p);
+}
+
+/* ================================================================== */
 
 int
 main(int argc, char **argv)
@@ -154,6 +224,7 @@ main(int argc, char **argv)
 	struct gpu_io_ctx ctx;
 	unsigned long long *cycles;
 	double *us;
+	uint32_t sector, nlb;
 	int err = 0, clk_khz = 0, op;
 	unsigned int done = 0, i;
 	void *d_sq, *d_dbrec, *d_bf, *d_cq, *d_cqdb;
@@ -162,7 +233,7 @@ main(int argc, char **argv)
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPV")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -170,13 +241,17 @@ main(int argc, char **argv)
 		case 'g': g_gpu_id = atoi(optarg); break;
 		case 'r': g_rounds = (unsigned)atoi(optarg); break;
 		case 'b': g_io_bytes = (unsigned)atoi(optarg); break;
+		case 'W': g_write = 1; break;
+		case 'H': g_cap_in_hbm = 1; break;
+		case 'P': g_paint = 1; break;
+		case 'V': g_verify = 1; break;
 		default:
-			printf("用法: %s -a <ip> -n <nqn> [-g gpu] [-r rounds] [-b bytes]\n", argv[0]);
+			usage(argv[0]);
 			return 1;
 		}
 	}
 	if (!g_traddr[0] || !g_nqn[0]) {
-		printf("用法: %s -a <ip> -n <nqn> [-g gpu] [-r rounds] [-b bytes]\n", argv[0]);
+		usage(argv[0]);
 		return 1;
 	}
 
@@ -201,21 +276,36 @@ main(int argc, char **argv)
 	gpu_clock_khz(g_gpu_id, &clk_khz);
 	printf("\n[GPU] dev=%d clock=%d kHz\n", g_gpu_id, clk_khz);
 
+	/* ---- 显存:一块分配,-H 时把胶囊切在后半段 ---- */
 	g_data_len = (size_t)g_io_bytes * 2;
 	if (g_data_len < 2 * 1024 * 1024) {
 		g_data_len = 2 * 1024 * 1024;
 	}
-	if (gpu_alloc_exportable(&g_data_gpu, &g_data_fd, g_data_len) != 0) {
-		fprintf(stderr, "数据区分配失败\n");
+	g_total_len = g_data_len + (g_cap_in_hbm ? CAP_AREA_LEN : 0);
+	if (gpu_alloc_exportable(&g_base_gpu, &g_base_fd, g_total_len) != 0) {
+		fprintf(stderr, "显存分配失败\n");
 		return 1;
 	}
-	if (gpu_alloc_exportable(&g_cap_gpu, &g_cap_fd, 2 * 1024 * 1024) != 0) {
-		fprintf(stderr, "胶囊区分配失败\n");
-		return 1;
-	}
-	spdk_mem_register(g_data_gpu, g_data_len);
-	printf("[GPU] data=%p (%zu) capsule=%p\n", g_data_gpu, g_data_len, g_cap_gpu);
+	g_data_gpu = g_base_gpu;
+	spdk_mem_register(g_base_gpu, g_total_len);
 
+	if (g_cap_in_hbm) {
+		g_cap_hbm = (char *)g_base_gpu + g_data_len;
+		gpu_memset_dev(g_cap_hbm, 0, CAP_AREA_LEN);
+		gpu_sync();
+		printf("[GPU] data=%p (%zu)  capsule(HBM)=%p\n",
+		       g_data_gpu, g_data_len, g_cap_hbm);
+	} else {
+		if (posix_memalign(&g_cap_host, 4096, CAP_AREA_LEN) != 0) {
+			fprintf(stderr, "胶囊主存分配失败\n");
+			return 1;
+		}
+		memset(g_cap_host, 0, CAP_AREA_LEN);
+		printf("[GPU] data=%p (%zu)  capsule(host)=%p\n",
+		       g_data_gpu, g_data_len, g_cap_host);
+	}
+
+	/* ---- 建连 ---- */
 	spdk_nvme_rdma_init_hooks(&g_hooks);
 	trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
 	trid.adrfam = SPDK_NVMF_ADRFAM_IPV4;
@@ -232,42 +322,89 @@ main(int argc, char **argv)
 		fprintf(stderr, "alloc_io_qpair 失败\n");
 		return 1;
 	}
+	sector = spdk_nvme_ns_get_sector_size(g_ns);
+	nlb = g_io_bytes / sector;
+
+	/* ---- -P / -V:纯 CPU 路径,做完就退 ---- */
+	if (g_paint || g_verify) {
+		void *b = spdk_dma_zmalloc(g_io_bytes, 4096, NULL);
+		unsigned char *p8 = b;
+		unsigned q, npat = 0, ncpat = 0;
+		int rc;
+
+		if (!b) {
+			return 1;
+		}
+		if (g_paint) {
+			memset(b, CPAT, g_io_bytes);
+			rc = cpu_io(1, b, 0, nlb);
+			printf("[涂色] LBA 0 填 0x%02x %s\n", CPAT,
+			       rc == 0 ? "成功" : "失败");
+		} else {
+			rc = cpu_io(0, b, 0, nlb);
+			if (rc != 0) {
+				printf("[回读] 失败\n");
+			} else {
+				for (q = 0; q < g_io_bytes; q++) {
+					if (p8[q] == WPAT) npat++;
+					else if (p8[q] == CPAT) ncpat++;
+				}
+				printf("[回读] LBA 0: 0x%02x %u  0x%02x %u  前8字节 ",
+				       WPAT, npat, CPAT, ncpat);
+				for (q = 0; q < 8; q++) {
+					printf("%02x ", p8[q]);
+				}
+				printf("\n  %s\n",
+				       npat == g_io_bytes ? "*** 写成功了 ***" :
+				       ncpat == g_io_bytes ? "*** 没写,还是涂色 ***" :
+				       "*** 内容是别的东西 ***");
+			}
+		}
+		spdk_dma_free(b);
+		spdk_nvme_ctrlr_free_io_qpair(g_qpair);
+		spdk_nvme_detach(g_ctrlr);
+		return 0;
+	}
 
 	/*
-	 * 先用 SPDK 正常发一条:触发 hooks 注册显存 MR 拿 rkey,
-	 * 同时让 recv buffer 池进入稳定状态。之后交给 GPU。
+	 * 预热:用 SPDK 正常发一条,触发 hook 注册显存 MR 拿 rkey,
+	 * 同时让 recv buffer 池进入稳定状态。之后才能交给 GPU。
 	 */
-	{
-		int st = 0;
-
-		if (spdk_nvme_ns_cmd_read(g_ns, g_qpair, g_data_gpu, 0,
-					  g_io_bytes / spdk_nvme_ns_get_sector_size(g_ns),
-					  warm_cb, &st, 0) != 0) {
-			fprintf(stderr, "预热提交失败\n");
-			return 1;
-		}
-		while (!st) {
-			spdk_nvme_qpair_process_completions(g_qpair, 0);
-		}
-		if (st < 0) {
-			fprintf(stderr, "预热 I/O 出错\n");
-			return 1;
-		}
-		printf("[预热] SPDK 路径正常,显存 rkey=0x%x\n",
-		       g_data_mr ? g_data_mr->rkey : 0);
-	}
-
-	g_cap_mr = ibv_reg_dmabuf_mr(g_pd, 0, 2 * 1024 * 1024,
-				     (uint64_t)g_cap_gpu, g_cap_fd,
-				     IBV_ACCESS_LOCAL_WRITE |
-				     IBV_ACCESS_REMOTE_READ |
-				     IBV_ACCESS_RELAXED_ORDERING);
-	if (!g_cap_mr) {
-		fprintf(stderr, "胶囊区注册失败: %s\n", strerror(errno));
+	if (cpu_io(0, g_data_gpu, 0, nlb) != 0) {
+		fprintf(stderr, "预热 I/O 出错\n");
 		return 1;
 	}
-	printf("[MR] 胶囊 lkey=0x%x\n", g_cap_mr->lkey);
+	printf("[预热] SPDK 路径正常,显存 rkey=0x%x\n",
+	       g_data_mr ? g_data_mr->rkey : 0);
 
+	/* ---- 胶囊的 MR ---- */
+	if (g_cap_in_hbm) {
+		/* 预热已让 hook 把整块注册成一个 MR,直接复用 */
+		g_cap_mr = g_data_mr;
+		g_cap_dev = g_cap_hbm;
+		if (!g_cap_mr) {
+			fprintf(stderr, "预热未产生 MR\n");
+			return 1;
+		}
+		printf("[MR] 胶囊 lkey=0x%x (与数据区同一 MR)\n",
+		       g_cap_mr->lkey);
+	} else {
+		g_cap_mr = ibv_reg_mr(g_pd, g_cap_host, CAP_AREA_LEN,
+				      IBV_ACCESS_LOCAL_WRITE);
+		if (!g_cap_mr) {
+			fprintf(stderr, "胶囊注册失败: %s\n", strerror(errno));
+			return 1;
+		}
+		if (gpu_map_host(g_cap_host, CAP_AREA_LEN,
+				 MC_HOST_REGISTER_MAPPED, &g_cap_dev) != 0) {
+			fprintf(stderr, "胶囊映射给 GPU 失败\n");
+			return 1;
+		}
+		printf("[MR] 胶囊 lkey=0x%x  host=%p dev=%p\n",
+		       g_cap_mr->lkey, g_cap_host, g_cap_dev);
+	}
+
+	/* ---- 把队列交给 GPU ---- */
 	qp = spdk_nvme_qpair_get_ibv_qp(g_qpair);
 	cq = spdk_nvme_qpair_get_ibv_cq(g_qpair);
 	if (!qp || !cq) {
@@ -311,15 +448,51 @@ main(int argc, char **argv)
 	ctx.cq_cnt       = dvc.cqe_cnt;
 	ctx.cqe_size     = dvc.cqe_size;
 	ctx.qpn          = qp->qp_num;
-	ctx.capsule      = (volatile uint8_t *)g_cap_gpu;
+	/* capsule 是 GPU 写用的指针,capsule_addr 是网卡读用的地址。
+	 * 胶囊在主存时两者不同(前者是 mcHostRegister 的 device 指针)。 */
+	ctx.capsule      = (volatile uint8_t *)g_cap_dev;
+	ctx.capsule_addr = g_cap_in_hbm ? (uint64_t)g_cap_hbm
+					: (uint64_t)g_cap_host;
 	ctx.capsule_lkey = g_cap_mr->lkey;
-	ctx.capsule_addr = (uint64_t)g_cap_gpu;
 	ctx.data_addr    = (uint64_t)g_data_gpu;
 	ctx.data_rkey    = g_data_mr->rkey;
 	ctx.nsid         = spdk_nvme_ns_get_id(g_ns);
-	ctx.sector_size  = spdk_nvme_ns_get_sector_size(g_ns);
+	ctx.sector_size  = sector;
 	ctx.io_bytes     = g_io_bytes;
+	ctx.nvme_opc     = g_write ? 0x01 : 0x02;
 
+	/*
+	 * kernel 不补 recv buffer,每轮响应消耗一个。RQ 里现成有多少就只能
+	 * 跑多少轮 —— 超出的那轮响应无处安放,表现成和 CQE 判错一模一样的
+	 * 死等,别混淆。
+	 */
+	if (g_rounds > dvq.rq.wqe_cnt) {
+		printf("[警告] RQ 深度 %u < 轮数 %u,第 %u 轮之后会卡住\n",
+		       dvq.rq.wqe_cnt, g_rounds, dvq.rq.wqe_cnt);
+	}
+
+	/* ---- 准备源数据 ---- */
+	gpu_memset_dev(g_data_gpu, g_write ? WPAT : RPAT, g_io_bytes);
+	gpu_sync();		/* 必须:mcMemset 对 host 是异步的 */
+
+	if (g_write) {
+		/* 目标 LBA 涂成 0xCC,-V 时就能区分"没写"和"写了零" */
+		void *b = spdk_dma_zmalloc(g_io_bytes, 4096, NULL);
+
+		if (b) {
+			memset(b, CPAT, g_io_bytes);
+			cpu_io(1, b, 0, nlb);
+			spdk_dma_free(b);
+			printf("[涂色] LBA 0 已填 0x%02x\n", CPAT);
+		}
+	}
+
+	/*
+	 * 快照必须在所有 CPU 侧 I/O 之后拍 —— 上面的预热和涂色都会推进
+	 * SQ/CQ。用过期的 pi,kernel 会写进 SPDK 刚用过的 slot,而且 dbrec
+	 * 已经等于 pi+1,网卡认为没有新工作,命令根本发不出去,表现成
+	 * "完成 N/N"但 target 侧查无此命令。这个坑踩过两次。
+	 */
 	{
 		volatile uint32_t *qdb = (volatile uint32_t *)dvq.dbrec;
 		volatile uint32_t *cdb = (volatile uint32_t *)dvc.dbrec;
@@ -331,39 +504,13 @@ main(int argc, char **argv)
 		ctx.cq_phase = (uint8_t)((cq_ci / dvc.cqe_cnt) & 1);
 		printf("[接管] SQ pi=%u  CQ ci=%u phase=%u\n",
 		       sq_pi, cq_ci, ctx.cq_phase);
-
-		/*
-		 * kernel 不补 recv buffer,每轮响应消耗一个。RQ 里现成有
-		 * 多少就只能跑多少轮 —— 超出的那轮响应无处安放,会表现成
-		 * 和 CQE 判错一模一样的"死等",别混淆。
-		 */
-		if (g_rounds > dvq.rq.wqe_cnt) {
-			printf("[警告] RQ 深度 %u < 轮数 %u;kernel 不补 recv,"
-			       "第 %u 轮之后会卡住\n",
-			       dvq.rq.wqe_cnt, g_rounds, dvq.rq.wqe_cnt);
-		}
 	}
 
-	gpu_memset_dev(g_data_gpu, 0xAA, g_io_bytes);
-
-	{
-		unsigned long long rc_[64];
-
-		if (gpu_ring_bench(d_bf, 0, 64, rc_) == 0 && clk_khz) {
-			double sum = 0;
-			int k;
-
-			for (k = 1; k < 64; k++) {
-				sum += rc_[k];
-			}
-			printf("\n[门铃] kernel 内写一次 UAR: %.2f us\n",
-			       sum / 63.0 / (clk_khz / 1000.0));
-		}
-	}
-
+	/* ---- 跑 ---- */
 	cycles = calloc(g_rounds, sizeof(*cycles));
 	us = calloc(g_rounds, sizeof(*us));
-	printf("\n[运行] %u 轮, 每轮 %u 字节\n", g_rounds, g_io_bytes);
+	printf("\n[运行] %s %u 轮, 每轮 %u 字节\n",
+	       g_write ? "WRITE" : "READ", g_rounds, g_io_bytes);
 
 	if (gpu_io_run(&ctx, g_rounds, 0, cycles, &err, &done) != 0) {
 		fprintf(stderr, "kernel 执行失败\n");
@@ -378,64 +525,12 @@ main(int argc, char **argv)
 	printf("\n");
 
 	if (done == 0) {
-		unsigned char cap[64];
-		volatile uint32_t *qdb = (volatile uint32_t *)dvq.dbrec;
-		volatile uint32_t *cdb = (volatile uint32_t *)dvc.dbrec;
-		uint8_t *slot = (uint8_t *)dvq.sq.buf +
-				(size_t)(ctx.sq_pi & (dvq.sq.wqe_cnt - 1)) *
-				dvq.sq.stride;
-		uint32_t k;
+		struct ibv_qp_attr a;
+		struct ibv_qp_init_attr ia;
 
-		fprintf(stderr, "\n===== 诊断 =====\n");
-
-		/* kernel 写进 SQ 的 WQE。和 wqe_verify 里 SPDK 的对比:
-		 * 前 8 字节应是 opmod_idx_opcode + qpn_ds,
-		 * offset 11 应为 0x08(CQ_UPDATE)。 */
-		fprintf(stderr, "kernel 写的 WQE @slot %u:\n  ",
-			ctx.sq_pi & (dvq.sq.wqe_cnt - 1));
-		for (k = 0; k < 32; k++) {
-			fprintf(stderr, "%02x ", slot[k]);
-			if (k % 16 == 15) fprintf(stderr, "\n  ");
-		}
-		fprintf(stderr, "\n");
-
-		/* 胶囊在显存,拷回来看 */
-		gpu_copy_to_host(cap, g_cap_gpu, 64);
-		fprintf(stderr, "kernel 写的胶囊:\n  ");
-		for (k = 0; k < 64; k++) {
-			fprintf(stderr, "%02x ", cap[k]);
-			if (k % 16 == 15) fprintf(stderr, "\n  ");
-		}
-		fprintf(stderr, "\n");
-
-		fprintf(stderr, "dbrec: RQ=%u SQ=%u (接管时 SQ=%u)\n",
-			be32toh(qdb[0]) & 0xffff, be32toh(qdb[1]) & 0xffff,
-			ctx.sq_pi);
-		fprintf(stderr, "CQ dbrec ci=%u (接管时 %u)\n",
-			be32toh(cdb[0]) & 0xffffff, ctx.cq_ci);
-
-		/* CQ 里 ci 附近几个条目的 op_own,看有没有新 CQE */
-		fprintf(stderr, "CQ op_own (ci=%u 起 4 个):\n", ctx.cq_ci);
-		for (k = 0; k < 4; k++) {
-			uint32_t idx = (ctx.cq_ci + k) & (dvc.cqe_cnt - 1);
-			uint8_t *c8 = (uint8_t *)dvc.buf +
-				      (size_t)idx * dvc.cqe_size;
-			uint8_t oo = c8[dvc.cqe_size - 1];
-
-			fprintf(stderr, "  [%u] op_own=0x%02x opcode=%u owner=%u"
-				"  期望 owner=%u\n",
-				idx, oo, oo >> 4, oo & 1, ctx.cq_phase);
-		}
-
-		/* 顺带看看 QP 状态,error 说明网卡拒绝了我们的 WQE */
-		{
-			struct ibv_qp_attr a;
-			struct ibv_qp_init_attr ia;
-
-			if (ibv_query_qp(qp, &a, IBV_QP_STATE, &ia) == 0) {
-				fprintf(stderr, "QP state=%d (3=RTS 正常, "
-					"6=ERROR)\n", a.qp_state);
-			}
+		if (ibv_query_qp(qp, &a, IBV_QP_STATE, &ia) == 0) {
+			fprintf(stderr, "QP state=%d (3=RTS 正常, 6=ERROR)\n",
+				a.qp_state);
 		}
 		return 1;
 	}
@@ -456,24 +551,39 @@ main(int argc, char **argv)
 		       us[(unsigned)(done * 0.99)], us[done - 1]);
 	}
 
-	{
+	/* ---- 校验 ---- */
+	if (g_write) {
+		/*
+		 * 写的校验不能在本进程做。kernel 接管过这条 qpair —— 消费了
+		 * CQE、占了 RQ slot,SPDK 对它的内部状态已经失同步。再调
+		 * spdk_nvme_ns_cmd_read 要么静默读到全零(看着像"数据没落盘",
+		 * 白查一整天),要么直接在 nvme_rdma_process_recv_completion
+		 * 里空指针崩。
+		 */
+		printf("\n[校验] 写路径请另起进程验证:\n");
+		printf("  %s -a %s -n %s -g %d -V -b %u\n",
+		       argv[0], g_traddr, g_nqn, g_gpu_id, g_io_bytes);
+		printf("  期望看到 0x%02x %u\n", WPAT, g_io_bytes);
+	} else {
+		/* 读的校验走 gpu_copy_to_host,不碰 qpair,可信 */
 		unsigned char *h = malloc(g_io_bytes);
 		unsigned nz = 0;
 
 		gpu_copy_to_host(h, g_data_gpu, g_io_bytes);
 		for (i = 0; i < g_io_bytes; i++) {
-			if (h[i] != 0xAA) {
+			if (h[i] != RPAT) {
 				nz++;
 			}
 		}
-		printf("\n[校验] %u/%u 字节不再是 0xAA\n", nz, g_io_bytes);
-		printf("  (null bdev 读回全零,此数应接近 %u;若为 0 说明 DMA 没落到显存)\n",
-		       g_io_bytes);
+		printf("\n[校验] %u/%u 字节不再是 0x%02x  前8字节 ",
+		       nz, g_io_bytes, RPAT);
+		for (i = 0; i < 8; i++) {
+			printf("%02x ", h[i]);
+		}
+		printf("\n  %s\n", nz == g_io_bytes ? "*** 数据落进显存了 ***" :
+		       "*** DMA 没落到显存 ***");
 		free(h);
 	}
-
-	printf("\n---------------------------------------------------------\n");
-	printf("和 latency_baseline 的 CPU 路径对比,差值即真实收益。\n");
 
 	spdk_nvme_ctrlr_free_io_qpair(g_qpair);
 	spdk_nvme_detach(g_ctrlr);

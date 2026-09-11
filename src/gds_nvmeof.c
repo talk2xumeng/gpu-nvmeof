@@ -620,7 +620,7 @@ verify_data(void)
 	}
 
 	/* 把显存清掉,确保读回来的确实来自盘 */
-	GPU_CHECK(gpu_memset(g_ctx.gpu_buf, 0xAA, len));
+	GPU_CHECK(gpu_memset(g_ctx.gpu_buf, 0xBB, len));
 	GPU_CHECK(gpu_synchronize());
 
 	/* 远端盘 -> GPU */
@@ -661,7 +661,7 @@ verify_data(void)
 		       "(期望 0x%02x, 实际 0x%02x)\n",
 		       first_bad, host_src[first_bad], host_dst[first_bad]);
 
-		if (host_dst[first_bad] == 0xAA) {
+		if (host_dst[first_bad] == 0xBB) {
 			printf("         读回的是 memset 的值,说明 DMA 根本没落到显存。\n"
 			       "         检查 iova 是否传的 GPU VA、ACS 是否关闭。\n");
 		}

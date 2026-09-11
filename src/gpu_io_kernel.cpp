@@ -108,7 +108,12 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 
 		t0 = clock64();
 
-		nvme_build_rw_sqe((struct nvme_sqe *)cap, NVME_OPC_READ,
+		/*
+		 * READ  : target 发 RDMA_WRITE 写我们显存(显存作 DMA target)
+		 * WRITE : target 发 RDMA_READ  读我们显存(显存作 DMA source)
+		 * 后者和 -H 失败的是同一类动作,正好用来二分。
+		 */
+		nvme_build_rw_sqe((struct nvme_sqe *)cap, ctx.nvme_opc,
 				  (uint16_t)(i & 0xffff), ctx.nsid,
 				  lba, ctx.io_bytes / ctx.sector_size,
 				  ctx.data_addr, ctx.data_rkey, ctx.io_bytes);
@@ -124,10 +129,33 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 					     ctx.capsule_lkey, 64);
 
 		WQE_FENCE_QUEUE();
+
+
 		ctx.qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
 		WQE_FENCE_DB();
-		*ctx.bf_reg = db_val;
+
+		/*
+		 * BlueFlame 内联:整个 WQE(ds=2,32 字节)写进 BF 寄存器,
+		 * 不是只写 8 字节让网卡回 SQ 取。
+		 *
+		 * 这块网卡(bf.size=256)按内联解析 BF 写入。只写 8 字节时
+		 * 读命令侥幸能通 —— SEND 靠 dbrec 也发得出去;但写命令要
+		 * 网卡持有完整 WQE 才能服务 target 回来的 RDMA_READ,
+		 * 残缺就取不到数据,表现为 SC=0 成功但盘上全零。
+		 *
+		 * host 侧对照(wqe_verify -B)实测:8 字节失败,内联成功。
+		 */
+		{
+			volatile uint64_t *bfp = ctx.bf_reg;
+			const uint64_t *src = (const uint64_t *)(void *)sq_slot;
+			int w;
+
+			for (w = 0; w < 4; w++) {
+				bfp[w] = src[w];
+			}
+		}
 		WQE_FENCE_DB();
+		(void)db_val;
 
 		rc = poll_for_response(&ctx, &ci, &phase, timeout);
 
@@ -287,6 +315,17 @@ int gpu_copy_to_host(void *dst, const void *src, size_t len)
 int gpu_memset_dev(void *p, int v, size_t len)
 {
 	return mcMemset(p, v, len) == mcSuccess ? 0 : -1;
+}
+
+/*
+ * mcMemset 对 host 是异步的 —— 排进 stream 就返回。紧接着让网卡去读
+ * 这块显存,可能读到 memset 还没写完的旧内容。测试里表现为同一条命令
+ * 时而通过时而失败(赢/输竞态),非常容易误判成硬件问题。
+ * 凡是 memset 之后要交给网卡的地方,都得先同步。
+ */
+int gpu_sync(void)
+{
+	return mcDeviceSynchronize() == mcSuccess ? 0 : -1;
 }
 
 }

@@ -226,7 +226,19 @@ mlx5_build_send_wqe(void *sq_slot, uint16_t wqe_idx, uint32_t qpn,
 	dst[6] = wqe_hto_be32((uint32_t)(capsule_addr >> 32));
 	dst[7] = wqe_hto_be32((uint32_t)(capsule_addr & 0xffffffffu));
 
-	/* 门铃要写的 8 字节:只带下一个 index 和 qpn,opcode 位留空 */
+	/*
+	 * 门铃要写的 8 字节 = ctrl segment 的前 8 字节**原样**。
+	 *
+	 * rdma-core 的 mlx5_post_send 在 MLX5_DB_METHOD_DB 路径下就是
+	 * 把 ctrl seg 头 8 字节直接 mlx5_write64 到 BF 寄存器,带着真实的
+	 * opcode(0x0a SEND)和 ds(2),index 用的是**当前**这条的。
+	 *
+	 * 早先这里自己合成了一个「index+1、opcode 留空」的值:opcode 位
+	 * 为 0 即 MLX5_OPCODE_NOP,ds 也为 0。网卡把 BF 写入当成内联的
+	 * ctrl segment 解析时,拿到的是一条 ds=0 的畸形 NOP。
+	 *
+	 * 注意 dbrec 里放的才是 pi+1,两者含义不同,别混。
+	 */
 	{
 		uint32_t db[2];
 
