@@ -85,9 +85,10 @@ LDFLAGS    := $(SPDK_LIBS) $(SYS_LIBS) $(GPU_LIBS) $(RDMA_LIBS) $(EXTRA_LIBS)
 .PHONY: all probe clean check ldconfig gpucheck run-launch-probe \
         run-mmio-probe run-mmio-probe-w \
         run-verify run-bw run-host run-latency run-latency-noker sweep-block \
-        run-gpu-initiated help
+        run-gpu-initiated run-wqe-verify help
 
-all: $(BIN)/gds_nvmeof $(BIN)/latency_baseline $(BIN)/gpu_initiated
+all: $(BIN)/gds_nvmeof $(BIN)/latency_baseline $(BIN)/gpu_initiated \
+     $(BIN)/wqe_verify
 
 $(BIN):
 	@mkdir -p $(BIN)
@@ -114,11 +115,16 @@ $(BIN)/gpu_io_kernel.o: $(SRC)/wqe_build.h $(SRC)/gpu_io_ctx.h
 # GPU-initiated 原型。host 侧直接用了 mlx5dv 拿 SQ/CQ/UAR,要显式
 # 链 -lmlx5;kernel 那个 .o 是 C++ 编出来的,要 -lstdc++。
 $(BIN)/gpu_initiated: $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o \
-                      $(SRC)/gpu_io_ctx.h | $(BIN)
+                      $(SRC)/gpu_io_ctx.h $(SRC)/wqe_build.h | $(BIN)
 	@if [ -z "$(SPDK_LIBS)" ]; then \
 		echo "错误: pkg-config 找不到 SPDK,检查 SPDK_DIR=$(SPDK_DIR)"; exit 1; fi
 	$(CC) $(CFLAGS) -o $@ $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o \
 	      $(LDFLAGS) -lmlx5 -lstdc++
+	@echo "OK: $@"
+
+$(BIN)/wqe_verify: $(SRC)/wqe_verify.c $(SRC)/wqe_build.h \
+                   $(SRC)/gpu_backend.h | $(BIN)
+	$(CC) $(CFLAGS) -o $@ $(SRC)/wqe_verify.c $(LDFLAGS) -lmlx5 -lstdc++
 	@echo "OK: $@"
 
 $(BIN)/latency_baseline: $(SRC)/latency_baseline.c $(BIN)/kernels.o $(SRC)/gpu_backend.h | $(BIN)
@@ -141,6 +147,9 @@ $(BIN)/mmio_probe: $(SRC)/mmio_probe.cpp | $(BIN)
 	@echo "OK: $@"
 
 probe: $(BIN)/dmabuf_probe $(BIN)/launch_probe $(BIN)/mmio_probe
+
+run-wqe-verify: $(BIN)/wqe_verify
+	sudo ./$(BIN)/wqe_verify -a $(TARGET_IP) -n $(NQN) -g $(GPU_ID)
 
 # ---- 环境 ----
 
