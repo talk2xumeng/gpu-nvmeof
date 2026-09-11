@@ -11,6 +11,7 @@
 #   make run-latency      端到端延迟基线
 #   make run-latency-noker  同上但不跑 kernel(相减得 kernel 开销)
 #   make sweep-block      扫不同 KV block 粒度
+#   make run-gpu-initiated  GPU 内发起的 NVMe-oF 读(kernel 直接收发)
 #
 # 注意:动态库路径必须先 make ldconfig 注册,否则 sudo 下会找不到
 # librte_*.so —— gcc 生成的是 RUNPATH,sudo 提权后动态链接器进安全
@@ -37,6 +38,9 @@ COUNT      ?= 20000
 ROUNDS     ?= 2000
 # 64 token × 70272 B/token(DeepSeek MLA)≈ 4.5 MiB
 KVBLOCK    ?= 4718592
+# GPU-initiated 原型:单线程串行发,轮数受 RQ 深度限制
+GPU_ROUNDS ?= 100
+GPU_BS     ?= 4096
 
 SRC        := src
 BIN        := bin
@@ -80,9 +84,10 @@ LDFLAGS    := $(SPDK_LIBS) $(SYS_LIBS) $(GPU_LIBS) $(RDMA_LIBS) $(EXTRA_LIBS)
 
 .PHONY: all probe clean check ldconfig gpucheck run-launch-probe \
         run-mmio-probe run-mmio-probe-w \
-        run-verify run-bw run-host run-latency run-latency-noker sweep-block help
+        run-verify run-bw run-host run-latency run-latency-noker sweep-block \
+        run-gpu-initiated help
 
-all: $(BIN)/gds_nvmeof $(BIN)/latency_baseline
+all: $(BIN)/gds_nvmeof $(BIN)/latency_baseline $(BIN)/gpu_initiated
 
 $(BIN):
 	@mkdir -p $(BIN)
@@ -93,13 +98,27 @@ $(BIN)/gds_nvmeof: $(SRC)/gds_nvmeof.c $(SRC)/gpu_backend.h | $(BIN)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 	@echo "OK: $@"
 
-# 基线程序要链 mxcc 编的 kernel
-$(BIN)/kernels.o: $(SRC)/kernels.cpp | $(BIN)
+# host 程序要链 mxcc 编的 kernel。kernels.o 给基线测试,
+# gpu_io_kernel.o 给 GPU-initiated 原型。
+$(BIN)/%.o: $(SRC)/%.cpp | $(BIN)
 	@if [ ! -x "$(GPUCC)" ] && ! command -v $(GPUCC) >/dev/null; then \
 		echo "错误: 找不到 GPU 编译器 $(GPUCC)"; \
 		echo "  试试: find $(MACA_DIR) -name 'mxcc*' -maxdepth 3"; \
 		echo "  然后: make MXCC=<实际路径>"; exit 1; fi
 	$(GPUCC) $(GPUCFLAGS) -c -o $@ $<
+
+# WQE/CQE 的字节布局全在 wqe_build.h 里,改它必须重编 —— 否则只动
+# header 时 make 认为 .o 还是新的,你会拿着旧二进制查一晚上。
+$(BIN)/gpu_io_kernel.o: $(SRC)/wqe_build.h
+
+# GPU-initiated 原型。host 侧直接用了 mlx5dv 拿 SQ/CQ/UAR,要显式
+# 链 -lmlx5;kernel 那个 .o 是 C++ 编出来的,要 -lstdc++。
+$(BIN)/gpu_initiated: $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o | $(BIN)
+	@if [ -z "$(SPDK_LIBS)" ]; then \
+		echo "错误: pkg-config 找不到 SPDK,检查 SPDK_DIR=$(SPDK_DIR)"; exit 1; fi
+	$(CC) $(CFLAGS) -o $@ $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o \
+	      $(LDFLAGS) -lmlx5 -lstdc++
+	@echo "OK: $@"
 
 $(BIN)/latency_baseline: $(SRC)/latency_baseline.c $(BIN)/kernels.o $(SRC)/gpu_backend.h | $(BIN)
 	$(CC) $(CFLAGS) -o $@ $(SRC)/latency_baseline.c $(BIN)/kernels.o \
@@ -177,6 +196,12 @@ run-latency: $(BIN)/latency_baseline
 
 run-latency-noker: $(BIN)/latency_baseline
 	sudo $(LAT) -g $(GPU_ID) -b $(KVBLOCK) -r $(ROUNDS) -k 0
+
+# GPU-initiated:稳态收发全在 kernel 内,CPU 只做初始化。
+# 轮数别超过 RQ 深度 —— kernel 不补 recv buffer,超了会死等。
+run-gpu-initiated: $(BIN)/gpu_initiated
+	sudo ./$(BIN)/gpu_initiated -a $(TARGET_IP) -n $(NQN) \
+	     -g $(GPU_ID) -r $(GPU_ROUNDS) -b $(GPU_BS)
 
 # 扫 KV block 粒度:16/32/64/128 token @70272 B
 sweep-block: $(BIN)/latency_baseline
