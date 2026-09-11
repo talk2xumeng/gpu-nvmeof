@@ -273,12 +273,28 @@ mlx5_submit(volatile uint32_t *dbrec, volatile uint64_t *bf_reg,
 #define MLX5_CQE_OWNER_MASK	0x1
 #define MLX5_CQE_OPCODE_SHIFT	4
 
+/*
+ * 未使用的 CQE。libmlx5 建 CQ 时把整个 buffer 初始化成 op_own = 0xf0,
+ * 也就是 opcode=15、owner=0 —— owner 位和首圈的 phase(=0) 一模一样!
+ *
+ * 所以判 CQE 有效必须同时看 owner 和 opcode,少一个就会把还没写过的
+ * 空条目当成真 CQE 收割掉:轮询会在响应回来之前把整个 CQ 扫穿一圈,
+ * phase 翻转,之后真正的 CQE 落地时 owner 已经对不上了,永远等不到。
+ * rdma-core 的 get_sw_cqe() 就是这么两个条件一起判的。
+ */
+#define MLX5_CQE_INVALID		15
+
+/*
+ * 有效 = owner 对得上 && 不是尚未写过的空条目。两个条件缺一不可,
+ * 理由见上面 MLX5_CQE_INVALID 处的注释。
+ */
 WQE_FN int
 mlx5_cqe_is_valid(const void *cqe, uint32_t cqe_size, uint8_t phase)
 {
 	uint8_t op_own = ((const uint8_t *)cqe)[cqe_size - 1];
 
-	return (op_own & MLX5_CQE_OWNER_MASK) == (phase & 1);
+	return (op_own & MLX5_CQE_OWNER_MASK) == (phase & 1) &&
+	       (op_own >> MLX5_CQE_OPCODE_SHIFT) != MLX5_CQE_INVALID;
 }
 
 WQE_FN uint8_t

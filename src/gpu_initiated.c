@@ -354,6 +354,17 @@ main(int argc, char **argv)
 		ctx.cq_phase = (uint8_t)((cq_ci / dvc.cqe_cnt) & 1);
 		printf("[接管] SQ pi=%u  CQ ci=%u phase=%u\n",
 		       sq_pi, cq_ci, ctx.cq_phase);
+
+		/*
+		 * kernel 不补 recv buffer,每轮响应消耗一个。RQ 里现成有
+		 * 多少就只能跑多少轮 —— 超出的那轮响应无处安放,会表现成
+		 * 和 CQE 判错一模一样的"死等",别混淆。
+		 */
+		if (g_rounds > dvq.rq.wqe_cnt) {
+			printf("[警告] RQ 深度 %u < 轮数 %u;kernel 不补 recv,"
+			       "第 %u 轮之后会卡住\n",
+			       dvq.rq.wqe_cnt, g_rounds, dvq.rq.wqe_cnt);
+		}
 	}
 
 	gpu_memset_dev(g_data_gpu, 0xAA, g_io_bytes);

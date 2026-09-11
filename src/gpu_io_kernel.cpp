@@ -62,17 +62,25 @@ poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
 		uint32_t idx = *ci & (c->cq_cnt - 1);
 		volatile uint8_t *cqe = c->cq_buf + (size_t)idx * c->cqe_size;
 		uint8_t op_own = cqe[c->cqe_size - 1];
-		uint8_t opcode;
+		uint8_t opcode = op_own >> 4;
 
-		if ((op_own & 1) != (*phase & 1)) {
+		/*
+		 * owner 和 opcode 两个条件缺一不可。空条目的 op_own=0xf0,
+		 * owner 位恰好等于首圈的 phase(0) —— 只判 owner 的话,轮询
+		 * 会在响应回来之前(不到 1 us)把整个 CQ 的空条目全部当成
+		 * 有效 CQE 消费掉,绕回时 phase 翻转,真 CQE 落地后就再也
+		 * 对不上了。表现就是"发包成功但永远等不到完成"。
+		 */
+		if ((op_own & 1) != (*phase & 1) ||
+		    opcode == MLX5_CQE_INVALID) {
 			if (clock64() - start > timeout_cycles) {
 				return -1;
 			}
 			continue;
 		}
 
+		/* owner 确认之后再读 CQE 其余字段 */
 		__threadfence_system();
-		opcode = op_own >> 4;
 
 		(*ci)++;
 		if ((*ci & (c->cq_cnt - 1)) == 0) {
@@ -128,7 +136,13 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 				  lba, ctx.io_bytes / ctx.sector_size,
 				  ctx.data_addr, ctx.data_rkey, ctx.io_bytes);
 
-		db_val = mlx5_build_send_wqe((void *)sq_slot, (uint16_t)slot,
+		/*
+		 * ctrl seg 的 wqe_idx 和门铃里的索引用的是 16 位生产者
+		 * 计数 pi,不是取模之后的 slot —— slot 只用来算 SQ 里的
+		 * 地址。早先这里传 slot,pi 跑过 sq_wqe_cnt(512) 之后就会
+		 * 和 dbrec 写进去的 pi+1 对不上。
+		 */
+		db_val = mlx5_build_send_wqe((void *)sq_slot, pi,
 					     ctx.qpn, cap_addr,
 					     ctx.capsule_lkey, 64);
 
@@ -143,6 +157,13 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 		t1 = clock64();
 		cycles[i] = t1 - t0;
 
+		/*
+		 * 不管这一轮成功还是出错,已经消费掉的 CQE 都要把 ci 还给
+		 * 网卡,否则下次跑起来 CQ 会溢出。
+		 */
+		ctx.cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
+		WQE_FENCE_DB();
+
 		if (rc != 0) {
 			*err_out = rc;
 			*done_out = i;
@@ -151,7 +172,6 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 
 		pi++;
 		*done_out = i + 1;
-		ctx.cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
 	}
 }
 
