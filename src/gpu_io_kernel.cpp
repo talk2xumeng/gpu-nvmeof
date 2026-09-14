@@ -38,26 +38,31 @@ poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
 	for (;;) {
 		uint32_t idx = *ci & (c->cq_cnt - 1);
 		volatile uint8_t *cqe = c->cq_buf + (size_t)idx * c->cqe_size;
-		uint8_t op_own = cqe[c->cqe_size - 1];
-		uint8_t opcode = op_own >> 4;
+		uint8_t op_own, opcode;
 
 		/*
-		 * owner 和 opcode 两个条件缺一不可。空条目的 op_own=0xf0,
-		 * owner 位恰好等于首圈的 phase(0) —— 只判 owner 的话,轮询
-		 * 会在响应回来之前(不到 1 us)把整个 CQ 的空条目全部当成
-		 * 有效 CQE 消费掉,绕回时 phase 翻转,真 CQE 落地后就再也
-		 * 对不上了。表现就是"发包成功但永远等不到完成"。
+		 * fence 必须在读之前。
+		 *
+		 * CQ buffer 是主机内存映射给 GPU 的,网卡通过 DMA 写入。
+		 * volatile 只阻止编译器优化,挡不住 GPU 的 L2 缓存 ——
+		 * 第一次读到旧值后会一直命中缓存,永远等不到新 CQE。
+		 * 早先把 fence 放在判定之后,顺序反了。
 		 */
-		if ((op_own & 1) != (*phase & 1) ||
-		    opcode == MLX5_CQE_INVALID) {
+		__threadfence_system();
+		op_own = cqe[c->cqe_size - 1];
+		opcode = op_own >> 4;
+
+		/*
+		 * 0xF = MLX5_CQE_INVALID,该位置还没有 CQE。
+		 * 它的 owner bit 可能恰好与 phase 相符,不排除被误当成
+		 * 有效 CQE 消费掉,导致 ci 前进并跳过真正的响应。
+		 */
+		if (opcode == 0xF || (op_own & 1) != (*phase & 1)) {
 			if (clock64() - start > timeout_cycles) {
 				return -1;
 			}
 			continue;
 		}
-
-		/* owner 确认之后再读 CQE 其余字段 */
-		__threadfence_system();
 
 		(*ci)++;
 		if ((*ci & (c->cq_cnt - 1)) == 0) {
@@ -70,6 +75,7 @@ poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
 		if (opcode == MLX5_CQE_RESP_SEND) {
 			return 0;
 		}
+		/* 其余(发送完成)继续收 */
 	}
 }
 
