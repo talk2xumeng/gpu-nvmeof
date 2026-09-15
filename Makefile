@@ -15,6 +15,10 @@
 #   make run-gpu-read-verify    GPU 读 + 逐块校验(进程内)
 #   make run-gpu-write-verify   GPU 写 + 另起进程逐块回读
 #
+# 实验(tst/,各目录有 README 记录背景和结论):
+#   make pit7-matrix [MATRIX_V1=1]  坑 7:kernel 写显存对网卡的可见性
+#   make pit7-bench                 坑 7:kernel 填充微基准
+#
 # 注意:动态库路径必须先 make ldconfig 注册,否则 sudo 下会找不到
 # librte_*.so —— gcc 生成的是 RUNPATH,sudo 提权后动态链接器进安全
 # 模式会忽略 RUNPATH,同时清掉 LD_LIBRARY_PATH,两头都断。
@@ -52,6 +56,7 @@ endif
 
 SRC        := src
 BIN        := bin
+TST        := tst
 
 # ------------------------------------------------------------------
 
@@ -93,10 +98,13 @@ LDFLAGS    := $(SPDK_LIBS) $(SYS_LIBS) $(GPU_LIBS) $(RDMA_LIBS) $(EXTRA_LIBS)
 .PHONY: all probe clean check ldconfig gpucheck run-launch-probe run-wqe-verify \
         run-mmio-probe run-mmio-probe-w \
         run-verify run-bw run-host run-latency run-latency-noker sweep-block \
-        run-gpu-initiated run-gpu-read-verify run-gpu-write-verify help
+        run-gpu-initiated run-gpu-read-verify run-gpu-write-verify \
+        tst pit7-matrix pit7-bench help
 
+# 实验程序也在 all 里:src/ 改动若让它们编不过,当场就能发现,
+# 而不是等回头复现时才知道(坑 4)。
 all: $(BIN)/gds_nvmeof $(BIN)/latency_baseline $(BIN)/gpu_initiated \
-     $(BIN)/wqe_verify
+     $(BIN)/wqe_verify tst
 
 $(BIN):
 	@mkdir -p $(BIN)
@@ -246,6 +254,32 @@ sweep-block: $(BIN)/latency_baseline
 		sudo $(LAT) -g $(GPU_ID) -b $$b -r 500 2>/dev/null | \
 		  grep -E "总计|控制面|数据传输"; \
 	done
+
+# ---- 实验:tst/pit7 ----
+# 独立的一套 host + kernel,和 src/ 不共享 ctx 结构。
+PIT7 := $(TST)/pit7
+
+$(BIN)/pit7_io_kernel.o: $(PIT7)/pit7_io_kernel.cpp $(PIT7)/pit7_io_ctx.h \
+                         $(SRC)/wqe_build.h $(SRC)/blk_pattern.h | $(BIN)
+	$(GPUCC) $(GPUCFLAGS) -I$(PIT7) -c -o $@ $<
+
+$(BIN)/pit7_initiated: $(PIT7)/pit7_initiated.c $(BIN)/pit7_io_kernel.o \
+                       $(PIT7)/pit7_io_ctx.h $(SRC)/blk_pattern.h | $(BIN)
+	@if [ -z "$(SPDK_LIBS)" ]; then \
+		echo "错误: pkg-config 找不到 SPDK,检查 SPDK_DIR=$(SPDK_DIR)"; exit 1; fi
+	$(CC) $(CFLAGS) -I$(PIT7) -o $@ $(PIT7)/pit7_initiated.c \
+	      $(BIN)/pit7_io_kernel.o $(LDFLAGS) -lmlx5 -lstdc++
+	@echo "OK: $@"
+
+tst: $(BIN)/pit7_initiated
+
+pit7-matrix: $(BIN)/pit7_initiated
+	sudo BIN=$(BIN) TARGET_IP=$(TARGET_IP) NQN=$(NQN) GPU_ID=$(GPU_ID) \
+	     ROUNDS=$(GPU_ROUNDS) BS=$(GPU_BS) LBA=$(GPU_LBA) \
+	     MATRIX_V1=$(MATRIX_V1) $(PIT7)/pit7_matrix.sh
+
+pit7-bench: $(BIN)/pit7_initiated
+	sudo ./$(BIN)/pit7_initiated -g $(GPU_ID) -b $(GPU_BS) -B
 
 clean:
 	rm -rf $(BIN)

@@ -157,10 +157,11 @@ kernel 算出来的。如果 attention 和发送在同一个 kernel 里、中间
 设备同步，payload 会踩同一个坑。那时候要么整块用 uncached（MB 级
 数据，带宽代价未知），要么在两个 kernel 之间插同步点。
 
-**没测过的形态**：同一个 kernel 里先写 payload 再发命令。这是生产
-场景的真实样子。`-I` 已实现这个形态：host 把显存预填 0xEE，每轮由
-io kernel 写 pattern 后立即发 WRITE；`-D` 切换数据区分配 flag。
-延迟统计多出「填充」一段。
+**同一 kernel 先写 payload 再发命令**：已在 `tst/pit7` 测过，普通显存上
+确定性失败（100/100 取到旧值），flag 1/4 可修复。进一步实验表明，写入在
+kernel 内部始终不可见（fence、sleep 都无效），要到 kernel 退出或设备同步
+之后才可见 —— 生产上可能的形态是「写显存的 kernel」与「敲门铃的 kernel」
+分开，详见 `tst/pit7/README.md`。
 
 理想的解法是驱动组提供 kernel 内的 flush 原语，那样就能回到
 「普通 `mcMalloc` + cached 写 + 显式 flush」—— 写得快，网卡也读得到。
@@ -170,7 +171,7 @@ io kernel 写 pattern 后立即发 WRITE；`-D` 切换数据区分配 flag。
 ## 五、下一步建议顺序
 
 1. ~~**多块校验**~~ 已完成：读写各 100 块逐块一致
-2. **同一 kernel 内写 payload + 发命令** —— 实验中（分支 `exp/pit7`）。
+2. **同一 kernel 内写 payload + 发命令** —— 实验中（`tst/pit7`）。
    已知：普通显存 100/100 取到旧值，flag 1/4 可修复但填充贵三成；
    正在对照 Tutti 的 kernel 组织方式，看能否不靠 uncached 分配解决
 3. **并发提交** —— 有了 1 和 2 才好验证正确性

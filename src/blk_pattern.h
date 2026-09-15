@@ -12,7 +12,7 @@
  *
  * 所以任何一块读回来都能判定成下面之一:
  *   OK       完全一致
- *   FILL     整块单字节(0xBB 没落地 / 0xCC 没写 ...)
+ *   FILL     整块单字节(0xBB 没落地 / 0xCC 没写 / 0xEE 显存旧值 ...)
  *   CROSS    是本轮 pattern,但属于另一个 LBA  -> 串块
  *   OLDSEED  是 pattern,但 seed 不同            -> 上一轮残留
  *   BAD      其余(部分写入、乱码)
@@ -42,6 +42,7 @@
 #define BLK_RPAT	0xbb	/* 读:显存预填,被 target 覆盖才算落地 */
 #define BLK_WPAT	0x5a	/* 旧式写 pattern(-K) */
 #define BLK_CPAT	0xcc	/* 盘上涂色:还是它 = 没写到 */
+#define BLK_EPAT	0xee	/* 显存底色(tst/pit7):读到它 = 网卡取到了 kernel 写之前的旧值 */
 
 BLK_FN uint64_t
 blk_splitmix64(uint64_t z)
@@ -165,6 +166,7 @@ blk_map_char(const struct blk_result *r)
 		switch (r->fill) {
 		case BLK_RPAT:	return 'R';
 		case BLK_CPAT:	return 'C';
+		case BLK_EPAT:	return 'S';
 		case BLK_WPAT:	return 'W';
 		case 0x00:	return 'Z';
 		default:	return 'F';

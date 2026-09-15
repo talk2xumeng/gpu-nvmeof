@@ -127,7 +127,7 @@ mcExtMallocWithFlags(&ptr, len, flag);   /* 而不是 mcMalloc */
 
 代码里默认用 1,`-F` 可覆盖。
 
-**payload 上同样成立**(实验分支 `exp/pit7`:kernel 写 4 KiB payload
+**payload 上同样成立**(`tst/pit7`:kernel 写 4 KiB payload
 后立即发 WRITE,普通显存 100/100 块取到旧值,flag 1/4 全部正确)。
 现象是确定性的,不是竞态。
 
