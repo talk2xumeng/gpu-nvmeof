@@ -38,31 +38,26 @@ poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
 	for (;;) {
 		uint32_t idx = *ci & (c->cq_cnt - 1);
 		volatile uint8_t *cqe = c->cq_buf + (size_t)idx * c->cqe_size;
-		uint8_t op_own, opcode;
+		uint8_t op_own = cqe[c->cqe_size - 1];
+		uint8_t opcode = op_own >> 4;
 
 		/*
-		 * fence 必须在读之前。
-		 *
-		 * CQ buffer 是主机内存映射给 GPU 的,网卡通过 DMA 写入。
-		 * volatile 只阻止编译器优化,挡不住 GPU 的 L2 缓存 ——
-		 * 第一次读到旧值后会一直命中缓存,永远等不到新 CQE。
-		 * 早先把 fence 放在判定之后,顺序反了。
+		 * owner 和 opcode 两个条件缺一不可。空条目的 op_own=0xf0,
+		 * owner 位恰好等于首圈的 phase(0) —— 只判 owner 的话,轮询
+		 * 会在响应回来之前(不到 1 us)把整个 CQ 的空条目全部当成
+		 * 有效 CQE 消费掉,绕回时 phase 翻转,真 CQE 落地后就再也
+		 * 对不上了。表现就是"发包成功但永远等不到完成"。
 		 */
-		__threadfence_system();
-		op_own = cqe[c->cqe_size - 1];
-		opcode = op_own >> 4;
-
-		/*
-		 * 0xF = MLX5_CQE_INVALID,该位置还没有 CQE。
-		 * 它的 owner bit 可能恰好与 phase 相符,不排除被误当成
-		 * 有效 CQE 消费掉,导致 ci 前进并跳过真正的响应。
-		 */
-		if (opcode == 0xF || (op_own & 1) != (*phase & 1)) {
+		if ((op_own & 1) != (*phase & 1) ||
+		    opcode == MLX5_CQE_INVALID) {
 			if (clock64() - start > timeout_cycles) {
 				return -1;
 			}
 			continue;
 		}
+
+		/* owner 确认之后再读 CQE 其余字段 */
+		__threadfence_system();
 
 		(*ci)++;
 		if ((*ci & (c->cq_cnt - 1)) == 0) {
@@ -75,7 +70,6 @@ poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
 		if (opcode == MLX5_CQE_RESP_SEND) {
 			return 0;
 		}
-		/* 其余(发送完成)继续收 */
 	}
 }
 
@@ -119,8 +113,14 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 		 * WRITE : target 发 RDMA_READ  读我们显存(显存作 DMA source)
 		 * 后者和 -H 失败的是同一类动作,正好用来二分。
 		 */
+		/*
+		 * cid 高位打上 0xE 作标记,方便在 target 日志里把 kernel
+		 * 发的命令和 SPDK(预热、涂色)发的区分开 —— 两边的 SGL
+		 * 地址和 rkey 可能完全一样,只有 cid 能分。
+		 * 定位完可以改回 (uint16_t)(i & 0xffff)。
+		 */
 		nvme_build_rw_sqe((struct nvme_sqe *)cap, ctx.nvme_opc,
-				  (uint16_t)(i & 0xffff), ctx.nsid,
+				  (uint16_t)(0xE000u | (i & 0xfffu)), ctx.nsid,
 				  lba, ctx.io_bytes / ctx.sector_size,
 				  ctx.data_addr, ctx.data_rkey, ctx.io_bytes);
 
@@ -206,6 +206,26 @@ k_ring_only(volatile uint64_t *bf_reg, uint64_t val, uint32_t n,
 	}
 }
 
+/*
+ * 由 GPU kernel 自己往显存写 pattern —— 用普通 store,和
+ * nvme_build_rw_sqe 写胶囊是同一类动作。
+ *
+ * 对照用:gpu_memset_dev 走的是 mcMemset,那是 CPU 发起的 DMA 填充,
+ * 后面还跟 mcDeviceSynchronize,网卡当然读得到。真正要验的是
+ * "kernel 内的 store 对网卡可见吗"。
+ */
+__global__ void
+k_fill(volatile unsigned char *p, unsigned char v, unsigned int len)
+{
+	unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int stride = gridDim.x * blockDim.x;
+
+	for (; i < len; i += stride) {
+		p[i] = v;
+	}
+	__threadfence_system();
+}
+
 extern "C" {
 
 int
@@ -272,9 +292,32 @@ gpu_ring_bench(void *bf_dev_ptr, unsigned long long val, unsigned int n,
 }
 
 int
-gpu_alloc_exportable(void **ptr, int *fd, size_t len)
+gpu_alloc_exportable_ex(void **ptr, int *fd, size_t len, unsigned int flags)
 {
-	if (mcMalloc(ptr, len) != mcSuccess) {
+	mcError_t e;
+
+	/*
+	 * flags != 0 走 mcExtMallocWithFlags。MACA 的取值见
+	 * mcr/mc_runtime_types.h:
+	 *   0x1 Finegrained        细粒度区域
+	 *   0x3 WriteCoherence     写一致
+	 *   0x4 MapPcieDefault     uncache,映射到 PCIe 访问
+	 *   0x5 MapPcieCoherence   写一致 + 映射到 PCIe
+	 *   0x6 FixedMemDefault    uncache,固定内存区
+	 *
+	 * 为什么要它:普通 mcMalloc 的显存,GPU kernel 普通 store 写完之后,
+	 * 网卡的 DMA read 取到的是写入前的旧值 —— 写停在 L2 里。已实测无效
+	 * 的手段:__threadfence_system()、SyncMemops、门铃前空转 1 ms、
+	 * 去掉 RELAXED_ORDERING。只有把那段写拆到独立 kernel 再做
+	 * mcDeviceSynchronize 才正常,而 MACA 没暴露 kernel 内的 flush
+	 * (CanFlushRemoteWrites=0, HdpMemFlushCntl=0)。
+	 *
+	 * uncached 显存的 GPU 侧带宽会掉不少,所以只给 64 字节的命令胶囊用,
+	 * MB 级的 payload 仍然走普通 mcMalloc。
+	 */
+	e = flags ? mcExtMallocWithFlags(ptr, len, flags)
+		  : mcMalloc(ptr, len);
+	if (e != mcSuccess) {
 		return -1;
 	}
 	if (mcMemGetHandleForAddressRange(fd, *ptr, len, 1, 0) != mcSuccess) {
@@ -282,6 +325,12 @@ gpu_alloc_exportable(void **ptr, int *fd, size_t len)
 		return -1;
 	}
 	return 0;
+}
+
+int
+gpu_alloc_exportable(void **ptr, int *fd, size_t len)
+{
+	return gpu_alloc_exportable_ex(ptr, fd, len, 0);
 }
 
 int
@@ -329,6 +378,15 @@ int gpu_memset_dev(void *p, int v, size_t len)
  * 时而通过时而失败(赢/输竞态),非常容易误判成硬件问题。
  * 凡是 memset 之后要交给网卡的地方,都得先同步。
  */
+/* kernel 侧填充。不做 mcDeviceSynchronize 之外的任何 flush —— 就是要看
+ * kernel 的普通 store 能不能被网卡看到。 */
+int gpu_fill_kernel(void *p, int v, size_t len)
+{
+	k_fill<<<64, 256>>>((volatile unsigned char *)p,
+			    (unsigned char)v, (unsigned int)len);
+	return mcGetLastError() == mcSuccess ? 0 : -1;
+}
+
 int gpu_sync(void)
 {
 	return mcDeviceSynchronize() == mcSuccess ? 0 : -1;

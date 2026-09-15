@@ -41,12 +41,14 @@
 extern int gpu_io_run(struct gpu_io_ctx *, unsigned int, unsigned long long,
 		      unsigned long long *, int *, unsigned int *);
 extern int gpu_alloc_exportable(void **, int *, size_t);
+extern int gpu_alloc_exportable_ex(void **, int *, size_t, unsigned int);
 extern int gpu_map_host(void *, size_t, unsigned int, void **);
 extern int gpu_set_dev(int);
 extern int gpu_clock_khz(int, int *);
 extern int gpu_copy_to_host(void *, const void *, size_t);
 extern int gpu_memset_dev(void *, int, size_t);
 extern int gpu_sync(void);
+extern int gpu_fill_kernel(void *, int, size_t);
 
 #define MC_HOST_REGISTER_MAPPED		0x02
 #define MC_HOST_REGISTER_IO_MEMORY	0x04
@@ -72,6 +74,19 @@ static int	g_gpu_id = 4;
 static uint32_t	g_rounds = 100;
 static uint32_t	g_io_bytes = 4096;
 static int	g_write, g_cap_in_hbm, g_paint, g_verify;
+static int	g_fill_by_kernel;	/* -K: 源数据由 kernel 写,不用 mcMemset */
+/*
+ * -H 时胶囊区的分配 flag。默认 1 = mcDeviceMallocFinegrained。
+ *
+ * 普通 mcMalloc 的显存,GPU kernel 普通 store 写完之后网卡 DMA read
+ * 取到的是旧值 —— 写停在 L2 里,而 MACA 没有 kernel 内可用的 flush。
+ * 实测:flag 1(Finegrained)和 4(MapPcieDefault,uncache+映射 PCIe)
+ * 都能让网卡读到最新值;3(WriteCoherence)和 5 无效;6 分配失败。
+ * 选 1 因为它比完全 uncache 温和。-F 可覆盖。
+ */
+#define CAP_FLAGS_DEFAULT	1
+static unsigned	g_cap_flags = CAP_FLAGS_DEFAULT;
+static int	g_cap_fd = -1;
 
 /* ================================================================== */
 /* SPDK hooks:让 SPDK 用我们的 PD,并把显存注册成 dma-buf MR          */
@@ -206,7 +221,8 @@ static int cmp_d(const void *a, const void *b)
 static void usage(const char *p)
 {
 	printf("用法: %s -a <ip> -n <nqn> [-g gpu] [-r rounds] [-b bytes]\n"
-	       "      [-W 发写] [-H 胶囊放显存] [-P 涂色] [-V 回读]\n", p);
+	       "      [-W 发写] [-H 胶囊放显存] [-P 涂色] [-V 回读]\n"
+	       "      [-K 源数据由 kernel 写入]\n", p);
 }
 
 /* ================================================================== */
@@ -233,7 +249,7 @@ main(int argc, char **argv)
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPV")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPVKF:")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -245,6 +261,8 @@ main(int argc, char **argv)
 		case 'H': g_cap_in_hbm = 1; break;
 		case 'P': g_paint = 1; break;
 		case 'V': g_verify = 1; break;
+		case 'K': g_fill_by_kernel = 1; break;
+		case 'F': g_cap_flags = (unsigned)strtoul(optarg, NULL, 0); break;
 		default:
 			usage(argv[0]);
 			return 1;
@@ -281,7 +299,8 @@ main(int argc, char **argv)
 	if (g_data_len < 2 * 1024 * 1024) {
 		g_data_len = 2 * 1024 * 1024;
 	}
-	g_total_len = g_data_len + (g_cap_in_hbm ? CAP_AREA_LEN : 0);
+	g_total_len = g_data_len +
+		      ((g_cap_in_hbm && !g_cap_flags) ? CAP_AREA_LEN : 0);
 	if (gpu_alloc_exportable(&g_base_gpu, &g_base_fd, g_total_len) != 0) {
 		fprintf(stderr, "显存分配失败\n");
 		return 1;
@@ -289,7 +308,23 @@ main(int argc, char **argv)
 	g_data_gpu = g_base_gpu;
 	spdk_mem_register(g_base_gpu, g_total_len);
 
-	if (g_cap_in_hbm) {
+	if (g_cap_in_hbm && g_cap_flags) {
+		/* 胶囊区单独分配,带 uncache / 一致性 flag。
+		 * 留意 MACA 的 dma-buf 导出 offset 0 是底层分配的基址 ——
+		 * 两次普通 mcMalloc 落同一 slab 会让第二个 MR 错位。
+		 * ExtMalloc 是另一套分配器,但 lkey 得和数据区不同才算真分开,
+		 * 启动时会打出来核对。 */
+		if (gpu_alloc_exportable_ex(&g_cap_hbm, &g_cap_fd,
+					    CAP_AREA_LEN, g_cap_flags) != 0) {
+			fprintf(stderr, "胶囊区 ExtMalloc(flag=0x%x) 失败\n",
+				g_cap_flags);
+			return 1;
+		}
+		gpu_memset_dev(g_cap_hbm, 0, CAP_AREA_LEN);
+		gpu_sync();
+		printf("[GPU] data=%p (%zu)  capsule(HBM flag=0x%x)=%p\n",
+		       g_data_gpu, g_data_len, g_cap_flags, g_cap_hbm);
+	} else if (g_cap_in_hbm) {
 		g_cap_hbm = (char *)g_base_gpu + g_data_len;
 		gpu_memset_dev(g_cap_hbm, 0, CAP_AREA_LEN);
 		gpu_sync();
@@ -378,7 +413,22 @@ main(int argc, char **argv)
 	       g_data_mr ? g_data_mr->rkey : 0);
 
 	/* ---- 胶囊的 MR ---- */
-	if (g_cap_in_hbm) {
+	if (g_cap_in_hbm && g_cap_flags) {
+		g_cap_mr = ibv_reg_dmabuf_mr(g_pd, 0, CAP_AREA_LEN,
+					     (uint64_t)g_cap_hbm, g_cap_fd,
+					     IBV_ACCESS_LOCAL_WRITE |
+					     IBV_ACCESS_REMOTE_READ |
+					     IBV_ACCESS_REMOTE_WRITE);
+		if (!g_cap_mr) {
+			fprintf(stderr, "胶囊注册失败: %s\n", strerror(errno));
+			return 1;
+		}
+		g_cap_dev = g_cap_hbm;
+		printf("[MR] 胶囊 lkey=0x%x (独立 MR,数据区 rkey=0x%x)%s\n",
+		       g_cap_mr->lkey, g_data_mr->rkey,
+		       g_cap_mr->lkey == g_data_mr->rkey ?
+		       "  *** 两者相同,可能落在同一 slab ***" : "");
+	} else if (g_cap_in_hbm) {
 		/* 预热已让 hook 把整块注册成一个 MR,直接复用 */
 		g_cap_mr = g_data_mr;
 		g_cap_dev = g_cap_hbm;
@@ -472,8 +522,23 @@ main(int argc, char **argv)
 	}
 
 	/* ---- 准备源数据 ---- */
-	gpu_memset_dev(g_data_gpu, g_write ? WPAT : RPAT, g_io_bytes);
-	gpu_sync();		/* 必须:mcMemset 对 host 是异步的 */
+	if (g_fill_by_kernel) {
+		/*
+		 * 关键对照:pattern 由 kernel 的普通 store 写入,和
+		 * nvme_build_rw_sqe 写胶囊是同一类动作。
+		 * 配 -W 用 —— target 的 RDMA_READ 来取这块数据,
+		 * 取到 pattern 说明 kernel 的写对网卡可见,取到零/旧值
+		 * 就说明不可见,那 -H 失败的根因也就定了。
+		 */
+		gpu_memset_dev(g_data_gpu, 0, g_io_bytes);
+		gpu_sync();		/* 先清零,底色要和 pattern 不同 */
+		gpu_fill_kernel(g_data_gpu, g_write ? WPAT : RPAT, g_io_bytes);
+		gpu_sync();		/* 等 kernel 跑完,但不做额外 flush */
+		printf("[填充] 源数据由 kernel 写入 (普通 store)\n");
+	} else {
+		gpu_memset_dev(g_data_gpu, g_write ? WPAT : RPAT, g_io_bytes);
+		gpu_sync();	/* 必须:mcMemset 对 host 是异步的 */
+	}
 
 	if (g_write) {
 		/* 目标 LBA 涂成 0xCC,-V 时就能区分"没写"和"写了零" */
@@ -517,6 +582,112 @@ main(int argc, char **argv)
 		return 1;
 	}
 
+	/*
+	 * dbrec 增量是判断"命令到底有没有发出去"最直接的指标。
+	 *
+	 * SQ 增量应该等于轮数。只涨 CPU 侧那几条的量,就说明 kernel 写的
+	 * WQE 网卡没取走 —— 多半是接管快照过期(pi 和 dbrec 已经相等,
+	 * 网卡认为没有新工作)。这种情况下 kernel 收割的是前一条 CPU 命令
+	 * 的 CQE,照样报"完成 N/N",但 target 侧查无此命令。
+	 */
+	{
+		volatile uint32_t *qdb = (volatile uint32_t *)dvq.dbrec;
+		volatile uint32_t *cdb = (volatile uint32_t *)dvc.dbrec;
+		uint32_t sq_now = be32toh(qdb[1]) & 0xffff;
+		uint32_t cq_now = be32toh(cdb[0]) & 0xffffff;
+
+		printf("[dbrec] SQ %u -> %u (+%u, 期望 +%u)   CQ %u -> %u (+%u)\n",
+		       ctx.sq_pi, sq_now, sq_now - ctx.sq_pi, g_rounds,
+		       ctx.cq_ci, cq_now, cq_now - ctx.cq_ci);
+		if (sq_now - ctx.sq_pi != g_rounds) {
+			printf("  *** SQ 增量不等于轮数:kernel 的命令没发出去 ***\n");
+		}
+	}
+
+	/*
+	 * kernel 写完之后,CPU 读回 SQ slot 和胶囊,确认它到底写了什么。
+	 *
+	 * dbrec 正常、CQ 也涨,不代表网卡执行的是我们这条命令 —— 如果
+	 * kernel 的 WQE 没落到网卡看得到的地方,门铃可能让网卡重新处理了
+	 * slot 里的旧内容(上一条 SPDK 命令留下的),现象一模一样,但
+	 * target 侧看到的是另一条命令。
+	 *
+	 * 判据:
+	 *   WQE offset 3    = 0x0a (MLX5_OPCODE_SEND)
+	 *   WQE offset 1-2  = 接管时的 sq_pi(大端)
+	 *   WQE offset 16-31 = data seg,addr 应指向胶囊
+	 *   胶囊 offset 0   = 0x02 READ / 0x01 WRITE
+	 *   胶囊 offset 2-3 = cid,小端。kernel 打了 0xE000 标记则是 00 e0
+	 */
+	{
+		uint32_t slot = ctx.sq_pi & (dvq.sq.wqe_cnt - 1);
+		uint8_t *w = (uint8_t *)dvq.sq.buf +
+			     (size_t)slot * dvq.sq.stride;
+		uint8_t cap[64];
+		int k;
+
+		printf("\n[SQ] slot %u (pi=%u):\n  ", slot, ctx.sq_pi);
+		for (k = 0; k < 32; k++) {
+			printf("%02x ", w[k]);
+			if (k % 16 == 15) {
+				printf("\n  ");
+			}
+		}
+
+		if (g_cap_in_hbm) {
+			gpu_copy_to_host(cap, g_cap_hbm, 64);
+		} else {
+			memcpy(cap, g_cap_host, 64);
+		}
+		printf("\n[胶囊] ");
+		for (k = 0; k < 16; k++) {
+			printf("%02x ", cap[k]);
+		}
+		printf("\n  opc=0x%02x cid=0x%04x %s\n", cap[0],
+		       (unsigned)(cap[2] | (cap[3] << 8)),
+		       (w[3] == 0x0a) ? "" : "*** WQE opcode 不是 SEND ***");
+	}
+
+	/*
+	 * CQE dump。op_own 的高 4 位是 opcode:
+	 *   0  MLX5_CQE_REQ        我们发的 SEND 完成了
+	 *   2  MLX5_CQE_RESP_SEND  收到对端的 SEND(响应胶囊)
+	 *   13 MLX5_CQE_REQ_ERR / 14 MLX5_CQE_RESP_ERR
+	 *   15 MLX5_CQE_INVALID    这一格还没被网卡写过
+	 * 低位是 owner bit,要和 cq_phase 一致才算新 CQE。
+	 *
+	 * 后 16 字节里有 s_wqe_opcode_qpn 和 wqe_counter,能看出这个
+	 * CQE 对应哪条 WQE。错误 CQE 的 syndrome 在 offset 55,
+	 * vendor_err 在 54 —— syndrome 0x05 是 WR_FLUSH_ERR,只是
+	 * 后果,真凶在更早的 CQE 里。
+	 */
+	{
+		unsigned k;
+
+		printf("[CQE] ci=%u 起 4 个 (phase=%u):\n",
+		       ctx.cq_ci, ctx.cq_phase);
+		for (k = 0; k < 4; k++) {
+			uint32_t idx = (ctx.cq_ci + k) & (dvc.cqe_cnt - 1);
+			uint8_t *c = (uint8_t *)dvc.buf +
+				     (size_t)idx * dvc.cqe_size;
+			uint8_t oo = c[dvc.cqe_size - 1];
+			uint8_t opc = oo >> 4;
+			unsigned q;
+
+			printf("  [%u] op_own=0x%02x opcode=%u owner=%u",
+			       idx, oo, opc, oo & 1);
+			if (opc == 13 || opc == 14) {
+				printf("  syndrome=0x%02x vendor=0x%02x",
+				       c[55], c[54]);
+			}
+			printf("\n      尾16: ");
+			for (q = dvc.cqe_size - 16; q < dvc.cqe_size; q++) {
+				printf("%02x ", c[q]);
+			}
+			printf("\n");
+		}
+	}
+
 	printf("[结果] 完成 %u / %u", done, g_rounds);
 	if (err) {
 		printf(", 错误码 %d (%s)", err,
@@ -546,9 +717,19 @@ main(int argc, char **argv)
 			sum += us[i];
 		}
 		printf("\n===== kernel 内往返延迟 (us) =====\n");
-		printf("  mean %.1f   min %.1f   p50 %.1f   p99 %.1f   max %.1f\n",
+		printf("  mean %.1f  min %.1f  p50 %.1f  p90 %.1f  p99 %.1f  max %.1f\n",
 		       sum / done, us[0], us[done / 2],
+		       us[(unsigned)(done * 0.90)],
 		       us[(unsigned)(done * 0.99)], us[done - 1]);
+		/*
+		 * p99 比 p50 高一两个数量级是常见的,别当成网络问题:
+		 * kernel 单线程自旋轮询 CQ,会被 GPU 调度打断,clock64()
+		 * 在长自旋下也未必可靠。比较不同配置时以 p50 为准。
+		 */
+		if (us[(unsigned)(done * 0.99)] > us[done / 2] * 5) {
+			printf("  (p99 远高于 p50 —— 多半是 GPU 调度打断自旋,"
+			       "比较时以 p50 为准)\n");
+		}
 	}
 
 	/* ---- 校验 ---- */
