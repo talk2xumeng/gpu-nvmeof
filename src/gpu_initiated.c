@@ -13,17 +13,25 @@
  *   -g <id>              GPU 编号
  *   -r <n> -b <bytes>    轮数、每轮字节数
  *   -W                   发 WRITE(默认 READ)
- *   -H                   命令胶囊放显存(默认主存)。见下面的已知问题。
- *   -P                   只把 LBA 0 涂成 0xCC 然后退出
- *   -V                   只回读 LBA 0 然后退出
+ *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
+ *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
+ *   -L <lba>             起始 LBA(默认 0),第 i 轮用 L + i*nlb
+ *   -S <seed>            pattern seed,0-255(默认 1)。每次运行都该换
+ *   -K                   旧式对照:单块、单字节 pattern、独立 kernel 填充
+ *   -P                   把 [L, L+r) 涂成 0xCC 然后退出
+ *   -V                   回读 [L, L+r) 逐块校验然后退出(-S 要和写入时一致)
  *
- * 写路径的校验必须用 -P / -V 分三个进程做:
+ * 多块校验:第 i 轮读写显存第 i 块、LBA L+i*nlb,每块内容由
+ * (seed, LBA) 决定(blk_pattern.h),漏块/串块/残留都能区分。
  *
- *   ./gpu_initiated ... -P        涂 0xCC
- *   ./gpu_initiated ... -W -r 1   kernel 写
- *   ./gpu_initiated ... -V        看是不是变成 pattern
+ *   读:进程内先用 CPU 路径把 pattern 写到盘上,kernel 读回显存,
+ *       结束后 mcMemcpy 拷回逐块比对 —— 不碰 qpair,可信。
+ *   写:进程内先把盘涂成 0xCC,kernel 写;校验必须另起进程:
  *
- * 不能在本进程里回读 —— 见 docs/debug-notes.md 第 4 条。
+ *   ./gpu_initiated ... -W -S 37     kernel 写
+ *   ./gpu_initiated ... -V -S 37     逐块回读
+ *
+ * 不能在本进程里回读 —— 见 docs/debug-notes.md 坑 3。
  */
 
 #define _GNU_SOURCE
@@ -37,6 +45,7 @@
 #include <endian.h>
 
 #include "gpu_io_ctx.h"
+#include "blk_pattern.h"
 
 extern int gpu_io_run(struct gpu_io_ctx *, unsigned int, unsigned long long,
 		      unsigned long long *, unsigned long long *,
@@ -48,6 +57,7 @@ extern int gpu_map_host(void *, size_t, unsigned int, void **);
 extern int gpu_set_dev(int);
 extern int gpu_clock_khz(int, int *);
 extern int gpu_copy_to_host(void *, const void *, size_t);
+extern int gpu_copy_to_dev(void *, const void *, size_t);
 extern int gpu_memset_dev(void *, int, size_t);
 extern int gpu_sync(void);
 extern int gpu_fill_kernel(void *, int, size_t);
@@ -56,9 +66,10 @@ extern int gpu_fill_kernel(void *, int, size_t);
 #define MC_HOST_REGISTER_IO_MEMORY	0x04
 
 #define CAP_AREA_LEN	(2 * 1024 * 1024)
-#define RPAT		0xbb		/* 读:预填,被 target 覆盖才算落地 */
-#define WPAT		0x5a		/* 写:pattern */
-#define CPAT		0xcc		/* -P 涂色 */
+#define RPAT		BLK_RPAT	/* 读:预填,被 target 覆盖才算落地 */
+#define WPAT		BLK_WPAT	/* -K 旧式写 pattern */
+#define CPAT		BLK_CPAT	/* 盘上涂色 */
+#define HUGE_2M		(2UL * 1024 * 1024)
 
 static struct spdk_nvme_ctrlr	*g_ctrlr;
 static struct spdk_nvme_ns	*g_ns;
@@ -77,6 +88,9 @@ static uint32_t	g_rounds = 100;
 static uint32_t	g_io_bytes = 4096;
 static int	g_write, g_cap_in_hbm, g_paint, g_verify;
 static int	g_fill_by_kernel;	/* -K: 源数据由 kernel 写,不用 mcMemset */
+static uint64_t	g_start_lba;
+static uint8_t	g_seed = 1;
+
 /*
  * -H 时胶囊区的分配 flag。默认 1 = mcDeviceMallocFinegrained。
  *
@@ -223,8 +237,85 @@ static int cmp_d(const void *a, const void *b)
 static void usage(const char *p)
 {
 	printf("用法: %s -a <ip> -n <nqn> [-g gpu] [-r rounds] [-b bytes]\n"
-	       "      [-W 发写] [-H 胶囊放显存] [-P 涂色] [-V 回读]\n"
-	       "      [-K 源数据由 kernel 写入]\n", p);
+	       "      [-L start_lba] [-S seed] [-W 发写]\n"
+	       "      [-H 胶囊放显存] [-F cap_flag]\n"
+	       "      [-P 涂色] [-V 逐块回读] [-K 旧式单块对照]\n", p);
+}
+
+/*
+ * 逐块比对并打印。buf 是 n 块连续数据,第 i 块期望 (seed, lba0 + i*nlb)。
+ * 返回不一致的块数。
+ *
+ * 块图每字符一块:
+ *   .  一致          X  串块(本轮 pattern,别的 LBA)
+ *   R  0xBB 没落地   O  上一轮残留(seed 不同)
+ *   C  0xCC 没写到   S  0xEE 显存旧值(坑 7)
+ *   W  0x5A 旧式     Z  全零
+ *   F  其他单字节    ?  部分写入/乱码
+ */
+static unsigned
+report_blocks(const char *tag, const uint8_t *buf, uint32_t n, uint32_t bs,
+	      uint32_t nlb, uint64_t lba0, uint8_t seed)
+{
+	unsigned cnt[128] = { 0 };
+	unsigned bad = 0, shown = 0, i;
+	struct blk_result r;
+
+	printf("\n[%s] %u 块 × %u 字节, LBA %" PRIu64 " 起, seed %u\n  ",
+	       tag, n, bs, lba0, seed);
+	for (i = 0; i < n; i++) {
+		blk_check(buf + (size_t)i * bs, bs, seed,
+			  lba0 + (uint64_t)i * nlb, &r);
+		putchar(blk_map_char(&r));
+		cnt[(unsigned char)blk_map_char(&r)]++;
+		if (r.v != BLK_OK) {
+			bad++;
+		}
+		if (i % 64 == 63 && i + 1 < n) {
+			printf("\n  ");
+		}
+	}
+	printf("\n  ");
+	for (i = 0; i < 128; i++) {
+		if (cnt[i]) {
+			printf("%c=%u ", (char)i, cnt[i]);
+		}
+	}
+	printf("\n");
+
+	for (i = 0; i < n && shown < 8; i++) {
+		uint64_t lba = lba0 + (uint64_t)i * nlb;
+
+		if (blk_check(buf + (size_t)i * bs, bs, seed, lba, &r) == BLK_OK) {
+			continue;
+		}
+		shown++;
+		printf("  块 %u (LBA %" PRIu64 "): ", i, lba);
+		switch (r.v) {
+		case BLK_FILL:
+			printf("整块 0x%02x\n", r.fill);
+			break;
+		case BLK_CROSS:
+			printf("串块,内容属于 LBA %" PRIu64 " (块 %" PRId64 ")\n",
+			       r.lba, (int64_t)(r.lba - lba0) / (int64_t)nlb);
+			break;
+		case BLK_OLDSEED:
+			printf("残留,seed %u LBA %" PRIu64 "\n", r.seed, r.lba);
+			break;
+		default:
+			printf("首个不一致在偏移 %zu (%02x",
+			       r.bad_off, buf[(size_t)i * bs + r.bad_off]);
+			printf(" 期望 %02x)\n", (unsigned)
+			       ((blk_word(seed, lba, (uint32_t)(r.bad_off / 8)) >>
+				 ((r.bad_off % 8) * 8)) & 0xff));
+			break;
+		}
+	}
+	if (bad > shown) {
+		printf("  ...另有 %u 块\n", bad - shown);
+	}
+	printf("  %s\n", bad ? "*** FAIL ***" : "*** PASS:逐块一致 ***");
+	return bad;
 }
 
 /* ================================================================== */
@@ -242,7 +333,7 @@ main(int argc, char **argv)
 	struct gpu_io_ctx ctx;
 	unsigned long long *cycles, *c_cap, *c_sub, *c_wait, *c_spin;
 	double *us;
-	uint32_t sector, nlb;
+	uint32_t sector, nlb, nblk;
 	int err = 0, clk_khz = 0, op;
 	unsigned int done = 0, i;
 	void *d_sq, *d_dbrec, *d_bf, *d_cq, *d_cqdb;
@@ -251,7 +342,7 @@ main(int argc, char **argv)
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPVKF:")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPVKF:L:S:")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -265,6 +356,8 @@ main(int argc, char **argv)
 		case 'V': g_verify = 1; break;
 		case 'K': g_fill_by_kernel = 1; break;
 		case 'F': g_cap_flags = (unsigned)strtoul(optarg, NULL, 0); break;
+		case 'L': g_start_lba = strtoull(optarg, NULL, 0); break;
+		case 'S': g_seed = (uint8_t)strtoul(optarg, NULL, 0); break;
 		default:
 			usage(argv[0]);
 			return 1;
@@ -272,6 +365,10 @@ main(int argc, char **argv)
 	}
 	if (!g_traddr[0] || !g_nqn[0]) {
 		usage(argv[0]);
+		return 1;
+	}
+	if (g_io_bytes % 8 || g_rounds == 0) {
+		fprintf(stderr, "-b 必须是 8 的倍数,-r 必须 > 0\n");
 		return 1;
 	}
 
@@ -296,11 +393,14 @@ main(int argc, char **argv)
 	gpu_clock_khz(g_gpu_id, &clk_khz);
 	printf("\n[GPU] dev=%d clock=%d kHz\n", g_gpu_id, clk_khz);
 
-	/* ---- 显存:一块分配,-H 时把胶囊切在后半段 ---- */
-	g_data_len = (size_t)g_io_bytes * 2;
-	if (g_data_len < 2 * 1024 * 1024) {
-		g_data_len = 2 * 1024 * 1024;
-	}
+	/*
+	 * ---- 显存:一块分配,-H 时把胶囊切在后半段 ----
+	 * 多块模式下每轮一块,数据区 = 轮数 × 块大小,按 2 MiB 取整。
+	 * -P/-V 不碰显存,只留最小的一块给 hook 用。
+	 */
+	nblk = (g_fill_by_kernel || g_paint || g_verify) ? 1 : g_rounds;
+	g_data_len = (size_t)nblk * g_io_bytes;
+	g_data_len = (g_data_len + HUGE_2M - 1) / HUGE_2M * HUGE_2M;
 	g_total_len = g_data_len +
 		      ((g_cap_in_hbm && !g_cap_flags) ? CAP_AREA_LEN : 0);
 	if (gpu_alloc_exportable(&g_base_gpu, &g_base_fd, g_total_len) != 0) {
@@ -362,45 +462,55 @@ main(int argc, char **argv)
 	sector = spdk_nvme_ns_get_sector_size(g_ns);
 	nlb = g_io_bytes / sector;
 
-	/* ---- -P / -V:纯 CPU 路径,做完就退 ---- */
+	if (g_io_bytes % sector) {
+		fprintf(stderr, "-b %u 不是扇区 %u 的整数倍\n", g_io_bytes, sector);
+		return 1;
+	}
+
+	/* ---- -P / -V:纯 CPU 路径,做完就退。范围 [L, L+r) ---- */
 	if (g_paint || g_verify) {
 		void *b = spdk_dma_zmalloc(g_io_bytes, 4096, NULL);
-		unsigned char *p8 = b;
-		unsigned q, npat = 0, ncpat = 0;
-		int rc;
+		uint8_t *all = NULL;
+		unsigned nfail = 0, bad = 0;
 
 		if (!b) {
 			return 1;
 		}
-		if (g_paint) {
-			memset(b, CPAT, g_io_bytes);
-			rc = cpu_io(1, b, 0, nlb);
-			printf("[涂色] LBA 0 填 0x%02x %s\n", CPAT,
-			       rc == 0 ? "成功" : "失败");
-		} else {
-			rc = cpu_io(0, b, 0, nlb);
-			if (rc != 0) {
-				printf("[回读] 失败\n");
-			} else {
-				for (q = 0; q < g_io_bytes; q++) {
-					if (p8[q] == WPAT) npat++;
-					else if (p8[q] == CPAT) ncpat++;
-				}
-				printf("[回读] LBA 0: 0x%02x %u  0x%02x %u  前8字节 ",
-				       WPAT, npat, CPAT, ncpat);
-				for (q = 0; q < 8; q++) {
-					printf("%02x ", p8[q]);
-				}
-				printf("\n  %s\n",
-				       npat == g_io_bytes ? "*** 写成功了 ***" :
-				       ncpat == g_io_bytes ? "*** 没写,还是涂色 ***" :
-				       "*** 内容是别的东西 ***");
+		if (g_verify) {
+			all = malloc((size_t)g_rounds * g_io_bytes);
+			if (!all) {
+				return 1;
 			}
+		}
+		memset(b, CPAT, g_io_bytes);
+		for (i = 0; i < g_rounds; i++) {
+			uint64_t lba = g_start_lba + (uint64_t)i * nlb;
+
+			if (g_paint) {
+				nfail += cpu_io(1, b, lba, nlb) != 0;
+				continue;
+			}
+			if (cpu_io(0, b, lba, nlb) != 0) {
+				nfail++;
+				memset(b, 0, g_io_bytes);
+			}
+			memcpy(all + (size_t)i * g_io_bytes, b, g_io_bytes);
+		}
+		if (g_paint) {
+			printf("[涂色] LBA %" PRIu64 " 起 %u 块填 0x%02x,失败 %u\n",
+			       g_start_lba, g_rounds, CPAT, nfail);
+		} else {
+			if (nfail) {
+				printf("[回读] %u 块 I/O 失败(按全零计)\n", nfail);
+			}
+			bad = report_blocks("回读", all, g_rounds, g_io_bytes,
+					    nlb, g_start_lba, g_seed);
+			free(all);
 		}
 		spdk_dma_free(b);
 		spdk_nvme_ctrlr_free_io_qpair(g_qpair);
 		spdk_nvme_detach(g_ctrlr);
-		return 0;
+		return (nfail || bad) ? 2 : 0;
 	}
 
 	/*
@@ -512,6 +622,7 @@ main(int argc, char **argv)
 	ctx.sector_size  = sector;
 	ctx.io_bytes     = g_io_bytes;
 	ctx.nvme_opc     = g_write ? 0x01 : 0x02;
+	ctx.data_step    = g_fill_by_kernel ? 0 : g_io_bytes;
 
 	/*
 	 * kernel 不补 recv buffer,每轮响应消耗一个。RQ 里现成有多少就只能
@@ -523,35 +634,78 @@ main(int argc, char **argv)
 		       dvq.rq.wqe_cnt, g_rounds, dvq.rq.wqe_cnt);
 	}
 
-	/* ---- 准备源数据 ---- */
+	/* ---- 准备源数据 / 盘上底色 ---- */
 	if (g_fill_by_kernel) {
 		/*
-		 * 关键对照:pattern 由 kernel 的普通 store 写入,和
-		 * nvme_build_rw_sqe 写胶囊是同一类动作。
-		 * 配 -W 用 —— target 的 RDMA_READ 来取这块数据,
-		 * 取到 pattern 说明 kernel 的写对网卡可见,取到零/旧值
-		 * 就说明不可见,那 -H 失败的根因也就定了。
+		 * 旧式对照(-K):单块,pattern 由独立 kernel 的普通 store 写入,
+		 * 之后 mcDeviceSynchronize。配 -W 用 —— 取到 pattern 说明
+		 * "独立 kernel + 设备同步"这一形态对网卡可见。
 		 */
 		gpu_memset_dev(g_data_gpu, 0, g_io_bytes);
 		gpu_sync();		/* 先清零,底色要和 pattern 不同 */
 		gpu_fill_kernel(g_data_gpu, g_write ? WPAT : RPAT, g_io_bytes);
 		gpu_sync();		/* 等 kernel 跑完,但不做额外 flush */
-		printf("[填充] 源数据由 kernel 写入 (普通 store)\n");
-	} else {
-		gpu_memset_dev(g_data_gpu, g_write ? WPAT : RPAT, g_io_bytes);
+		printf("[填充] 源数据由独立 kernel 写入 (普通 store)\n");
+	} else if (!g_write) {
+		/* 读:显存预填 0xBB,盘上写本轮 pattern */
+		void *b = spdk_dma_zmalloc(g_io_bytes, 4096, NULL);
+		unsigned nfail = 0;
+
+		gpu_memset_dev(g_data_gpu, RPAT, (size_t)nblk * g_io_bytes);
 		gpu_sync();	/* 必须:mcMemset 对 host 是异步的 */
+		if (!b) {
+			return 1;
+		}
+		for (i = 0; i < nblk; i++) {
+			uint64_t lba = g_start_lba + (uint64_t)i * nlb;
+
+			blk_fill(b, g_io_bytes, g_seed, lba);
+			nfail += cpu_io(1, b, lba, nlb) != 0;
+		}
+		spdk_dma_free(b);
+		printf("[准备] 显存 %u 块预填 0x%02x;盘上 %u 块写入 pattern"
+		       " (seed %u),失败 %u\n", nblk, RPAT, nblk, g_seed, nfail);
+		if (nfail) {
+			return 1;
+		}
+	} else {
+		/* 写:host 生成 pattern 拷进显存 */
+		uint8_t *h = malloc((size_t)nblk * g_io_bytes);
+
+		if (!h) {
+			return 1;
+		}
+		for (i = 0; i < nblk; i++) {
+			blk_fill(h + (size_t)i * g_io_bytes, g_io_bytes, g_seed,
+				 g_start_lba + (uint64_t)i * nlb);
+		}
+		if (gpu_copy_to_dev(g_data_gpu, h,
+				    (size_t)nblk * g_io_bytes) != 0) {
+			fprintf(stderr, "HtoD 失败\n");
+			return 1;
+		}
+		gpu_sync();
+		free(h);
+		printf("[准备] 显存 %u 块写入 pattern (seed %u, HtoD)\n",
+		       nblk, g_seed);
 	}
 
 	if (g_write) {
-		/* 目标 LBA 涂成 0xCC,-V 时就能区分"没写"和"写了零" */
+		/* 目标 LBA 全部涂成 0xCC,-V 时就能区分"没写"和"写了别的" */
 		void *b = spdk_dma_zmalloc(g_io_bytes, 4096, NULL);
+		unsigned nfail = 0;
 
-		if (b) {
-			memset(b, CPAT, g_io_bytes);
-			cpu_io(1, b, 0, nlb);
-			spdk_dma_free(b);
-			printf("[涂色] LBA 0 已填 0x%02x\n", CPAT);
+		if (!b) {
+			return 1;
 		}
+		memset(b, CPAT, g_io_bytes);
+		for (i = 0; i < nblk; i++) {
+			nfail += cpu_io(1, b, g_start_lba + (uint64_t)i * nlb,
+					nlb) != 0;
+		}
+		spdk_dma_free(b);
+		printf("[涂色] LBA %" PRIu64 " 起 %u 块已填 0x%02x,失败 %u\n",
+		       g_start_lba, nblk, CPAT, nfail);
 	}
 
 	/*
@@ -580,11 +734,12 @@ main(int argc, char **argv)
 	c_wait = calloc(g_rounds, sizeof(*c_wait));
 	c_spin = calloc(g_rounds, sizeof(*c_spin));
 	us = calloc(g_rounds, sizeof(*us));
-	printf("\n[运行] %s %u 轮, 每轮 %u 字节\n",
-	       g_write ? "WRITE" : "READ", g_rounds, g_io_bytes);
+	printf("\n[运行] %s %u 轮, 每轮 %u 字节, %s\n",
+	       g_write ? "WRITE" : "READ", g_rounds, g_io_bytes,
+	       ctx.data_step ? "每轮一块" : "单块复用");
 
-	if (gpu_io_run(&ctx, g_rounds, 0, cycles, c_cap, c_sub, c_wait, c_spin,
-		       &err, &done) != 0) {
+	if (gpu_io_run(&ctx, g_rounds, g_start_lba, cycles, c_cap,
+		       c_sub, c_wait, c_spin, &err, &done) != 0) {
 		fprintf(stderr, "kernel 执行失败\n");
 		return 1;
 	}
@@ -792,31 +947,43 @@ main(int argc, char **argv)
 		 * 里空指针崩。
 		 */
 		printf("\n[校验] 写路径请另起进程验证:\n");
-		printf("  %s -a %s -n %s -g %d -V -b %u\n",
-		       argv[0], g_traddr, g_nqn, g_gpu_id, g_io_bytes);
-		printf("  期望看到 0x%02x %u\n", WPAT, g_io_bytes);
-	} else {
-		/* 读的校验走 gpu_copy_to_host,不碰 qpair,可信 */
+		printf("  %s -a %s -n %s -g %d -b %u -r %u -L %" PRIu64
+		       " -S %u -V\n", argv[0], g_traddr, g_nqn, g_gpu_id,
+		       g_io_bytes, done, g_start_lba, g_seed);
+		if (g_fill_by_kernel) {
+			printf("  -K 是单块旧式 pattern:期望第 0 块 W,其余 C\n");
+		}
+	} else if (g_fill_by_kernel) {
 		unsigned char *h = malloc(g_io_bytes);
 		unsigned nz = 0;
 
 		gpu_copy_to_host(h, g_data_gpu, g_io_bytes);
 		for (i = 0; i < g_io_bytes; i++) {
-			if (h[i] != RPAT) {
-				nz++;
-			}
+			nz += h[i] != RPAT;
 		}
-		printf("\n[校验] %u/%u 字节不再是 0x%02x  前8字节 ",
+		printf("\n[校验] -K 单块:%u/%u 字节不再是 0x%02x\n",
 		       nz, g_io_bytes, RPAT);
-		for (i = 0; i < 8; i++) {
-			printf("%02x ", h[i]);
+		free(h);
+	} else {
+		/*
+		 * 读的校验走 gpu_copy_to_host,不碰 qpair,可信。
+		 * 只比对完成了的轮数;未完成的块应该还是 0xBB。
+		 */
+		uint8_t *h = malloc((size_t)nblk * g_io_bytes);
+
+		if (!h || gpu_copy_to_host(h, g_data_gpu,
+					   (size_t)nblk * g_io_bytes) != 0) {
+			fprintf(stderr, "DtoH 失败\n");
+			return 1;
 		}
-		printf("\n  %s\n", nz == g_io_bytes ? "*** 数据落进显存了 ***" :
-		       "*** DMA 没落到显存 ***");
+		if (report_blocks("校验", h, done, g_io_bytes, nlb,
+				  g_start_lba, g_seed)) {
+			err = err ? err : -3;
+		}
 		free(h);
 	}
 
 	spdk_nvme_ctrlr_free_io_qpair(g_qpair);
 	spdk_nvme_detach(g_ctrlr);
-	return 0;
+	return (err || done != g_rounds) ? 2 : 0;
 }

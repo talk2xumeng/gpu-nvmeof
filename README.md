@@ -72,8 +72,13 @@ src/
   kernels.cpp         基线用的 GPU kernel,mxcc 编译
   gpu_backend.h       MACA/CUDA 后端抽象
   dmabuf_probe.c      显存注册路径能力探测
+  gpu_initiated.c     GPU-initiated 原型 host 侧(初始化 + 校验)
+  gpu_io_kernel.cpp   GPU-initiated 原型 kernel(稳态收发)
+  blk_pattern.h       逐块可辨识的校验 pattern,host/kernel 共用
 docs/
   NVMeoF-GPU验证手册.md
+  status.md           GPU-initiated 现状与差距
+  debug-notes.md      GPU-initiated 排查笔记(先读这个)
 scripts/
 ```
 

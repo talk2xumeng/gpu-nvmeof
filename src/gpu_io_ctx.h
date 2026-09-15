@@ -37,6 +37,12 @@ struct gpu_io_ctx {
 	uint16_t		sq_pi;	/* 接管时从 dbrec 读出的 SQ 生产者索引 */
 	uint32_t		cq_ci;	/* 同上,CQ 消费者索引 */
 	uint8_t			cq_phase;
+
+	/*
+	 * 多块:第 i 轮用显存 data_addr + i * data_step 那一块。
+	 * data_step = 0 是旧行为(每轮同一块),-K 对照实验用。
+	 */
+	uint64_t		data_step;
 };
 
 #endif /* GPU_IO_CTX_H */

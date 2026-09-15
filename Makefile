@@ -12,6 +12,8 @@
 #   make run-latency-noker  同上但不跑 kernel(相减得 kernel 开销)
 #   make sweep-block      扫不同 KV block 粒度
 #   make run-gpu-initiated  GPU 内发起的 NVMe-oF 读(kernel 直接收发)
+#   make run-gpu-read-verify    GPU 读 + 逐块校验(进程内)
+#   make run-gpu-write-verify   GPU 写 + 另起进程逐块回读
 #
 # 注意:动态库路径必须先 make ldconfig 注册,否则 sudo 下会找不到
 # librte_*.so —— gcc 生成的是 RUNPATH,sudo 提权后动态链接器进安全
@@ -41,6 +43,12 @@ KVBLOCK    ?= 4718592
 # GPU-initiated 原型:单线程串行发,轮数受 RQ 深度限制
 GPU_ROUNDS ?= 100
 GPU_BS     ?= 4096
+GPU_LBA    ?= 0
+# pattern seed:每次 make 取一个新值,防止上一轮留在盘上的数据冒充本轮结果。
+# 必须是立即展开(:=),?= 是递归展开,两行 recipe 跨秒会拿到不同的值。
+ifeq ($(origin SEED),undefined)
+SEED       := $(shell echo $$(( $$(date +%s) % 255 + 1 )))
+endif
 
 SRC        := src
 BIN        := bin
@@ -85,7 +93,7 @@ LDFLAGS    := $(SPDK_LIBS) $(SYS_LIBS) $(GPU_LIBS) $(RDMA_LIBS) $(EXTRA_LIBS)
 .PHONY: all probe clean check ldconfig gpucheck run-launch-probe run-wqe-verify \
         run-mmio-probe run-mmio-probe-w \
         run-verify run-bw run-host run-latency run-latency-noker sweep-block \
-        run-gpu-initiated help
+        run-gpu-initiated run-gpu-read-verify run-gpu-write-verify help
 
 all: $(BIN)/gds_nvmeof $(BIN)/latency_baseline $(BIN)/gpu_initiated \
      $(BIN)/wqe_verify
@@ -115,7 +123,8 @@ $(BIN)/gpu_io_kernel.o: $(SRC)/wqe_build.h $(SRC)/gpu_io_ctx.h
 # GPU-initiated 原型。host 侧直接用了 mlx5dv 拿 SQ/CQ/UAR,要显式
 # 链 -lmlx5;kernel 那个 .o 是 C++ 编出来的,要 -lstdc++。
 $(BIN)/gpu_initiated: $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o \
-                      $(SRC)/gpu_io_ctx.h $(SRC)/wqe_build.h | $(BIN)
+                      $(SRC)/gpu_io_ctx.h $(SRC)/wqe_build.h \
+                      $(SRC)/blk_pattern.h | $(BIN)
 	@if [ -z "$(SPDK_LIBS)" ]; then \
 		echo "错误: pkg-config 找不到 SPDK,检查 SPDK_DIR=$(SPDK_DIR)"; exit 1; fi
 	$(CC) $(CFLAGS) -o $@ $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o \
@@ -215,6 +224,18 @@ run-latency-noker: $(BIN)/latency_baseline
 run-gpu-initiated: $(BIN)/gpu_initiated
 	sudo ./$(BIN)/gpu_initiated -a $(TARGET_IP) -n $(NQN) \
 	     -g $(GPU_ID) -r $(GPU_ROUNDS) -b $(GPU_BS)
+
+# 逐块校验。轮数同样受 RQ 深度限制。
+GI := $(BIN)/gpu_initiated -a $(TARGET_IP) -n $(NQN) -g $(GPU_ID) \
+      -r $(GPU_ROUNDS) -b $(GPU_BS) -L $(GPU_LBA) -S $(SEED)
+
+run-gpu-read-verify: $(BIN)/gpu_initiated
+	sudo ./$(GI)
+
+# 写的回读必须另起进程(debug-notes 坑 3)。第一步失败也要回读看现场。
+run-gpu-write-verify: $(BIN)/gpu_initiated
+	-sudo ./$(GI) -W
+	sudo ./$(GI) -V
 
 # 扫 KV block 粒度:16/32/64/128 token @70272 B
 sweep-block: $(BIN)/latency_baseline

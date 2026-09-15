@@ -10,6 +10,7 @@
  * ①② 用的是 wqe_build.h,那份布局已和 SPDK 实际提交的逐字节比对过。
  *
  * 一版只做单线程串行 —— 一个 warp 发一条,等完成,再发下一条。
+ * 第 i 轮用显存第 i 块(data_step),LBA 同步递增,便于逐块校验。
  *
  * 三个约束:
  * 1. SQ/CQ/dbrec 在主机内存(SPDK 用 ibv_create_qp 建的),fence 必须
@@ -116,6 +117,7 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 		uint64_t cap_addr = ctx.capsule_addr + (uint64_t)cap_idx * 64;
 		uint64_t lba = start_lba +
 			       (uint64_t)i * (ctx.io_bytes / ctx.sector_size);
+		uint64_t blk_addr = ctx.data_addr + (uint64_t)i * ctx.data_step;
 		uint64_t db_val;
 		int rc;
 
@@ -135,7 +137,7 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 		nvme_build_rw_sqe((struct nvme_sqe *)cap, ctx.nvme_opc,
 				  (uint16_t)(0xE000u | (i & 0xfffu)), ctx.nsid,
 				  lba, ctx.io_bytes / ctx.sector_size,
-				  ctx.data_addr, ctx.data_rkey, ctx.io_bytes);
+				  blk_addr, ctx.data_rkey, ctx.io_bytes);
 
 		t1 = clock64();		/* 写胶囊耗时 = t1 - t0 */
 
@@ -398,6 +400,12 @@ int gpu_clock_khz(int dev, int *khz)
 int gpu_copy_to_host(void *dst, const void *src, size_t len)
 {
 	return mcMemcpy(dst, src, len, mcMemcpyDeviceToHost) == mcSuccess ? 0 : -1;
+}
+
+/* 同步拷贝;调用方仍应在交给网卡之前 gpu_sync(),见坑 2 */
+int gpu_copy_to_dev(void *dst, const void *src, size_t len)
+{
+	return mcMemcpy(dst, src, len, mcMemcpyHostToDevice) == mcSuccess ? 0 : -1;
 }
 
 int gpu_memset_dev(void *p, int v, size_t len)
