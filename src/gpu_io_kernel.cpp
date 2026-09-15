@@ -31,11 +31,19 @@
  */
 __device__ static int
 poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
-		  uint64_t timeout_cycles)
+		  uint64_t timeout_cycles, uint64_t *spins_out)
 {
 	uint64_t start = clock64();
+	uint64_t spins = 0;
 
 	for (;;) {
+		/*
+		 * 数圈数是为了区分"真的在等网络"和"自旋本身很贵"。
+		 * CQ buffer 在主存,GPU 每转一圈都要走 PCIe 读 64 字节 ——
+		 * 几百纳秒一次。转几十圈就能凑出几十微秒,那和网络无关。
+		 * 转几万圈才说明确实在等对端。
+		 */
+		spins++;
 		uint32_t idx = *ci & (c->cq_cnt - 1);
 		volatile uint8_t *cqe = c->cq_buf + (size_t)idx * c->cqe_size;
 		uint8_t op_own = cqe[c->cqe_size - 1];
@@ -51,6 +59,7 @@ poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
 		if ((op_own & 1) != (*phase & 1) ||
 		    opcode == MLX5_CQE_INVALID) {
 			if (clock64() - start > timeout_cycles) {
+				*spins_out = spins;
 				return -1;
 			}
 			continue;
@@ -65,9 +74,11 @@ poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
 		}
 
 		if (opcode == MLX5_CQE_REQ_ERR || opcode == MLX5_CQE_RESP_ERR) {
+			*spins_out = spins;
 			return -2;
 		}
 		if (opcode == MLX5_CQE_RESP_SEND) {
+			*spins_out = spins;
 			return 0;
 		}
 	}
@@ -75,7 +86,8 @@ poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
 
 __global__ void
 k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
-	 uint64_t *cycles, int *err_out, uint32_t *done_out)
+	 uint64_t *cycles, uint64_t *c_cap, uint64_t *c_sub, uint64_t *c_wait,
+	 uint64_t *c_spin, int *err_out, uint32_t *done_out)
 {
 	uint32_t i;
 	uint16_t pi;
@@ -94,7 +106,8 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 	*done_out = 0;
 
 	for (i = 0; i < rounds; i++) {
-		uint64_t t0, t1;
+		uint64_t t0, t1, t2, t3;
+		uint64_t spins = 0;
 		uint32_t slot = pi & (ctx.sq_wqe_cnt - 1);
 		volatile uint8_t *sq_slot = ctx.sq_buf +
 					    (size_t)slot * ctx.sq_stride;
@@ -124,6 +137,8 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 				  lba, ctx.io_bytes / ctx.sector_size,
 				  ctx.data_addr, ctx.data_rkey, ctx.io_bytes);
 
+		t1 = clock64();		/* 写胶囊耗时 = t1 - t0 */
+
 		/*
 		 * ctrl seg 的 wqe_idx 和门铃里的索引用的是 16 位生产者
 		 * 计数 pi,不是取模之后的 slot —— slot 只用来算 SQ 里的
@@ -141,15 +156,11 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 		WQE_FENCE_DB();
 
 		/*
-		 * BlueFlame 内联:整个 WQE(ds=2,32 字节)写进 BF 寄存器,
-		 * 不是只写 8 字节让网卡回 SQ 取。
+		 * BlueFlame 内联:整个 WQE(32 字节)写进 BF 寄存器。
 		 *
-		 * 这块网卡(bf.size=256)按内联解析 BF 写入。只写 8 字节时
-		 * 读命令侥幸能通 —— SEND 靠 dbrec 也发得出去;但写命令要
-		 * 网卡持有完整 WQE 才能服务 target 回来的 RDMA_READ,
-		 * 残缺就取不到数据,表现为 SC=0 成功但盘上全零。
-		 *
-		 * host 侧对照(wqe_verify -B)实测:8 字节失败,内联成功。
+		 * host 侧对照(wqe_verify 加/不加 -B)实测两种都能工作 ——
+		 * 只写 8 字节(ctrl seg 前半)也行,网卡会回 SQ 取。这里用
+		 * 内联是因为它是跑通时的形态,没有性能上的理由。
 		 */
 		{
 			volatile uint64_t *bfp = ctx.bf_reg;
@@ -163,10 +174,16 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 		WQE_FENCE_DB();
 		(void)db_val;
 
-		rc = poll_for_response(&ctx, &ci, &phase, timeout);
+		t2 = clock64();		/* 提交耗时 = t2 - t1 */
 
-		t1 = clock64();
-		cycles[i] = t1 - t0;
+		rc = poll_for_response(&ctx, &ci, &phase, timeout, &spins);
+		t3 = clock64();		/* 等待耗时 = t3 - t2 */
+
+		cycles[i] = t3 - t0;
+		c_cap[i]  = t1 - t0;	/* 写 64 字节胶囊 */
+		c_sub[i]  = t2 - t1;	/* 写 WQE + dbrec + 门铃 */
+		c_wait[i] = t3 - t2;	/* 网络往返 + target 处理 + 轮询 */
+		c_spin[i] = spins;	/* 轮询圈数 */
 
 		/*
 		 * 不管这一轮成功还是出错,已经消费掉的 CQE 都要把 ci 还给
@@ -231,21 +248,30 @@ extern "C" {
 int
 gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
 	   unsigned long long start_lba, unsigned long long *host_cycles,
+	   unsigned long long *host_cap, unsigned long long *host_sub,
+	   unsigned long long *host_wait, unsigned long long *host_spin,
 	   int *host_err, unsigned int *host_done)
 {
-	uint64_t *d_cycles = NULL;
+	uint64_t *d_cycles = NULL, *d_cap = NULL, *d_sub = NULL, *d_wait = NULL;
+	uint64_t *d_spin = NULL;
 	int *d_err = NULL;
 	uint32_t *d_done = NULL;
+	size_t sz = rounds * sizeof(uint64_t);
 	mcError_t e;
 	int rc = -1;
 
-	if (mcMalloc((void **)&d_cycles, rounds * sizeof(uint64_t)) != mcSuccess ||
+	if (mcMalloc((void **)&d_cycles, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_cap, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_sub, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_wait, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_spin, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_err, sizeof(int)) != mcSuccess ||
 	    mcMalloc((void **)&d_done, sizeof(uint32_t)) != mcSuccess) {
 		goto out;
 	}
 
-	k_gpu_io<<<1, 32>>>(*ctx, rounds, start_lba, d_cycles, d_err, d_done);
+	k_gpu_io<<<1, 32>>>(*ctx, rounds, start_lba, d_cycles,
+			    d_cap, d_sub, d_wait, d_spin, d_err, d_done);
 
 	e = mcGetLastError();
 	if (e != mcSuccess) {
@@ -258,13 +284,20 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
 		goto out;
 	}
 
-	mcMemcpy(host_cycles, d_cycles, rounds * sizeof(uint64_t),
-		 mcMemcpyDeviceToHost);
+	mcMemcpy(host_cycles, d_cycles, sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_cap,  d_cap,  sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_sub,  d_sub,  sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_wait, d_wait, sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_spin, d_spin, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_err, d_err, sizeof(int), mcMemcpyDeviceToHost);
 	mcMemcpy(host_done, d_done, sizeof(uint32_t), mcMemcpyDeviceToHost);
 	rc = 0;
 out:
 	if (d_cycles) mcFree(d_cycles);
+	if (d_cap)    mcFree(d_cap);
+	if (d_sub)    mcFree(d_sub);
+	if (d_wait)   mcFree(d_wait);
+	if (d_spin)   mcFree(d_spin);
 	if (d_err)    mcFree(d_err);
 	if (d_done)   mcFree(d_done);
 	return rc;

@@ -39,6 +39,8 @@
 #include "gpu_io_ctx.h"
 
 extern int gpu_io_run(struct gpu_io_ctx *, unsigned int, unsigned long long,
+		      unsigned long long *, unsigned long long *,
+		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, int *, unsigned int *);
 extern int gpu_alloc_exportable(void **, int *, size_t);
 extern int gpu_alloc_exportable_ex(void **, int *, size_t, unsigned int);
@@ -238,7 +240,7 @@ main(int argc, char **argv)
 	struct mlx5dv_cq dvc;
 	struct mlx5dv_obj obj;
 	struct gpu_io_ctx ctx;
-	unsigned long long *cycles;
+	unsigned long long *cycles, *c_cap, *c_sub, *c_wait, *c_spin;
 	double *us;
 	uint32_t sector, nlb;
 	int err = 0, clk_khz = 0, op;
@@ -573,11 +575,16 @@ main(int argc, char **argv)
 
 	/* ---- 跑 ---- */
 	cycles = calloc(g_rounds, sizeof(*cycles));
+	c_cap  = calloc(g_rounds, sizeof(*c_cap));
+	c_sub  = calloc(g_rounds, sizeof(*c_sub));
+	c_wait = calloc(g_rounds, sizeof(*c_wait));
+	c_spin = calloc(g_rounds, sizeof(*c_spin));
 	us = calloc(g_rounds, sizeof(*us));
 	printf("\n[运行] %s %u 轮, 每轮 %u 字节\n",
 	       g_write ? "WRITE" : "READ", g_rounds, g_io_bytes);
 
-	if (gpu_io_run(&ctx, g_rounds, 0, cycles, &err, &done) != 0) {
+	if (gpu_io_run(&ctx, g_rounds, 0, cycles, c_cap, c_sub, c_wait, c_spin,
+		       &err, &done) != 0) {
 		fprintf(stderr, "kernel 执行失败\n");
 		return 1;
 	}
@@ -706,31 +713,74 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	for (i = 0; i < done; i++) {
-		us[i] = cycles[i] / (clk_khz / 1000.0);
-	}
-	qsort(us, done, sizeof(double), cmp_d);
+	/*
+	 * 分段统计。总时间拆成三段:
+	 *   胶囊  写那 64 字节。-H 时胶囊在 uncached 显存,这一段会明显变贵
+	 *   提交  写 WQE + dbrec + 敲门铃,全在主存,应该很稳
+	 *   等待  网络往返 + target 处理 + 轮询到 CQE。min 值最接近真实网络往返
+	 *
+	 * p99 常比 p50 高一两个数量级,别当网络问题:kernel 单线程自旋轮询,
+	 * 会被 GPU 调度打断,clock64() 在长自旋下也未必可靠。比较配置时看 p50。
+	 */
 	{
-		double sum = 0;
+		static const char *names[4] = { "总计", "  胶囊", "  提交", "  等待" };
+		unsigned long long *srcs[4] = { cycles, c_cap, c_sub, c_wait };
+		int k;
 
-		for (i = 0; i < done; i++) {
-			sum += us[i];
+		printf("\n===== kernel 内延迟分段 (us) =====\n");
+		printf("  %-6s %8s %8s %8s %8s %8s\n",
+		       "段", "mean", "min", "p50", "p90", "p99");
+		for (k = 0; k < 4; k++) {
+			double sum = 0;
+
+			for (i = 0; i < done; i++) {
+				us[i] = srcs[k][i] / (clk_khz / 1000.0);
+				sum += us[i];
+			}
+			qsort(us, done, sizeof(double), cmp_d);
+			printf("  %-6s %8.1f %8.1f %8.1f %8.1f %8.1f\n",
+			       names[k], sum / done, us[0], us[done / 2],
+			       us[(unsigned)(done * 0.90)],
+			       us[(unsigned)(done * 0.99)]);
 		}
-		printf("\n===== kernel 内往返延迟 (us) =====\n");
-		printf("  mean %.1f  min %.1f  p50 %.1f  p90 %.1f  p99 %.1f  max %.1f\n",
-		       sum / done, us[0], us[done / 2],
-		       us[(unsigned)(done * 0.90)],
-		       us[(unsigned)(done * 0.99)], us[done - 1]);
+
 		/*
-		 * p99 比 p50 高一两个数量级是常见的,别当成网络问题:
-		 * kernel 单线程自旋轮询 CQ,会被 GPU 调度打断,clock64()
-		 * 在长自旋下也未必可靠。比较不同配置时以 p50 为准。
+		 * 轮询圈数。CQ buffer 在主存,GPU 每转一圈要走 PCIe 读
+		 * 64 字节 —— 几百纳秒一次。
+		 *   转几十圈    -> 等待时间不是花在等网络上,是自旋本身贵
+		 *   转几万圈    -> 确实在等对端,那 45 us 就是真实往返
 		 */
-		if (us[(unsigned)(done * 0.99)] > us[done / 2] * 5) {
-			printf("  (p99 远高于 p50 —— 多半是 GPU 调度打断自旋,"
-			       "比较时以 p50 为准)\n");
+		{
+			unsigned long long smin = ~0ULL, smax = 0, ssum = 0;
+			double wsum = 0;
+
+			for (i = 0; i < done; i++) {
+				if (c_spin[i] < smin) smin = c_spin[i];
+				if (c_spin[i] > smax) smax = c_spin[i];
+				ssum += c_spin[i];
+				wsum += c_wait[i] / (clk_khz / 1000.0);
+			}
+			printf("\n  轮询圈数: mean %llu  min %llu  max %llu",
+			       ssum / done, smin, smax);
+			if (ssum) {
+				printf("   平均每圈 %.0f ns",
+				       wsum * 1000.0 / (double)ssum);
+			}
+			printf("\n");
 		}
+
+		/* 逐轮等待时间,看双峰是怎么分布的:
+		 * 前几轮快之后稳定 -> 冷启动
+		 * 快慢交替有周期   -> target poll group 轮转或 GPU 调度
+		 * 完全随机         -> 别的 */
+		printf("  逐轮等待(us): ");
+		for (i = 0; i < done && i < 40; i++) {
+			printf("%.0f ", c_wait[i] / (clk_khz / 1000.0));
+		}
+		printf("%s\n", done > 40 ? "..." : "");
 	}
+
+
 
 	/* ---- 校验 ---- */
 	if (g_write) {
