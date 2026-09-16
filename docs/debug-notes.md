@@ -195,7 +195,8 @@ target 拒掉的命令照样 `完成 N/N`,dbrec 增量也全对,只有数据没�
 - 现在 host 侧会检查 `spdk_nvme_ctrlr_get_max_xfer_size`,超了直接退出
 - target 要测大块:`nvmf_create_transport -t RDMA -c 512 -u 131072 -i 1048576`
   (`io_unit_size` 必须 ≥ `max_io_size / 16`)
-- 根治:kernel 读响应胶囊里的 status(并发设计 C1 会做)
+- 根治:kernel 读响应胶囊里的 status —— C1 已做,结果行分"响应"和
+  "NVMe 成功";status SCT=0 SC=0x02(Invalid Field)多半就是这个
 - 以前 `gds_nvmeof` 的 1 MiB 数据,底层同样是 128 KiB 一段发的
 
 ## 有用的观测手段

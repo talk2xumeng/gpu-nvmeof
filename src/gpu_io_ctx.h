@@ -43,6 +43,69 @@ struct gpu_io_ctx {
 	 * data_step = 0 是旧行为(每轮同一块),-K 对照实验用。
 	 */
 	uint64_t		data_step;
+
+	/* ---- 并发(docs/concurrency-design.md) ---- */
+	uint32_t		qd;		/* submitter 线程数 = 同时在飞的 I/O 数 */
+	uint32_t		njobs;		/* 本次 launch 的 I/O 总数 */
+
+	/*
+	 * RQ 和 recv buffer。响应胶囊落在 SPDK 预先 post 的 recv buffer 里
+	 * (spdk_nvme_rdma_rsp.cpl,16 字节),poller 靠它拿 cid 和 NVMe status。
+	 * RESP CQE 的 wqe_counter 是 RQ 消费计数,& (rq_wqe_cnt-1) 即槽位。
+	 */
+	volatile uint8_t	*rq_buf;
+	uint32_t		rq_wqe_cnt;
+	uint32_t		rq_stride;
+	uint32_t		rq_tail;	/* 接管时最老的已 post 槽的计数(诊断用) */
+	uint64_t		rsp_host_base;	/* recv buffer 区间,网卡看到的地址 */
+	uint64_t		rsp_len;
+	volatile uint8_t	*rsp_dev;	/* 同一区间的 GPU 映射 */
 };
+
+/*
+ * kernel 内线程共享的状态,放显存。字段只由注释里的一方写。
+ * 布局 host 和 kernel 共用,host 同步后整块拷回。
+ */
+struct gio_shared {
+	uint32_t	next_job;	/* submitter, atomicCAS */
+	uint32_t	sq_lock;	/* submitter, atomicCAS / release store */
+	uint32_t	sq_pi;		/* submitter,锁内 */
+	uint32_t	done_cnt;	/* poller */
+	uint32_t	abort;		/* 任一方 */
+	int32_t		err;		/* 置 abort 的一方写,第一个错误码 */
+	uint32_t	nvme_err;	/* poller:status 非 0 的响应数 */
+	uint16_t	first_status;	/* poller:第一个非 0 status */
+	uint16_t	first_bad_cid;	/* poller:第一个对不上的 cid */
+	uint32_t	cid_bad;	/* poller */
+	uint32_t	wc_mismatch;	/* poller:wqe_counter 与顺序推算不符 */
+	uint32_t	cqe_req;	/* poller:SEND 完成数 */
+	uint32_t	cqe_resp;	/* poller:响应数 */
+	uint32_t	err_cqe;	/* poller:错误 CQE 的 (vendor << 8) | syndrome */
+	uint32_t	rsvd;
+	uint64_t	poll_spins;	/* poller */
+	uint64_t	poll_hits;	/* poller:读到有效 CQE 的圈数 */
+};
+
+/* 每个 tag(= submitter 线程)一项,放显存 */
+struct gio_tag {
+	uint32_t	state;		/* 0 空闲 1 已提交(submitter) 2 完成 3 NVMe 出错(poller) */
+	uint32_t	job;		/* submitter */
+	uint16_t	status;		/* poller:NVMe status 字(含 phase tag 位) */
+	uint16_t	rsvd;
+	uint32_t	rsvd2;
+};
+
+#define GIO_ST_IDLE	0
+#define GIO_ST_POSTED	1
+#define GIO_ST_DONE	2
+#define GIO_ST_NVME_ERR	3
+
+#define GIO_CID_TAG	0x8000u		/* kernel 的 cid = 0x8000 | tag,和 SPDK 的 0..N-1 分开 */
+
+/* kernel 错误码 */
+#define GIO_E_TIMEOUT	(-1)
+#define GIO_E_CQE	(-2)
+#define GIO_E_CID	(-3)
+#define GIO_E_RSP_ADDR	(-4)
 
 #endif /* GPU_IO_CTX_H */

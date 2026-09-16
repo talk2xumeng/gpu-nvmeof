@@ -1,207 +1,355 @@
 /*
- * gpu_io_kernel.cpp  --  kernel 内完成 NVMe-oF 读的全流程
+ * gpu_io_kernel.cpp  --  kernel 内完成 NVMe-oF 读写的全流程
  *
- * 稳态下 CPU 完全不参与:
- *   ① 构造 NVMe 命令胶囊(写显存,本地访问)
- *   ② 构造 mlx5 SEND WQE 写进 SQ
- *   ③ 更新 dbrec + 敲 UAR 门铃
- *   ④ 轮询 CQ 等 target 的响应
+ * 稳态下 CPU 完全不参与。一次 launch,QD + 1 个线程:
  *
- * ①② 用的是 wqe_build.h,那份布局已和 SPDK 实际提交的逐字节比对过。
+ *   thread 0      poller:独占 CQ。收 RESP → 从 recv buffer 读出 cid 和
+ *                 NVMe status → 按 cid 找到 tag,置完成
+ *   thread 1..QD  submitter:领任务 → 写胶囊 → 抢锁写 WQE/dbrec/门铃 →
+ *                 等自己的 tag 完成
  *
- * 一版只做单线程串行 —— 一个 warp 发一条,等完成,再发下一条。
- * 第 i 轮用显存第 i 块(data_step),LBA 同步递增,便于逐块校验。
+ * 设计见 docs/concurrency-design.md。WQE / 胶囊布局在 wqe_build.h,
+ * 已和 SPDK 实际提交的逐字节比对过。
  *
- * 三个约束:
- * 1. SQ/CQ/dbrec 在主机内存(SPDK 用 ibv_create_qp 建的),fence 必须
- *    是 system 级。以后用 DEVX 把队列建到显存才能降到 __threadfence()。
- * 2. 接管后这个 qpair 不能再调 spdk_nvme_ns_cmd_*,否则两边抢同一 slot。
- * 3. kernel 不补 recv buffer,所以单次 launch 轮数不能超过 RQ 深度。
+ * 约束:
+ * 1. SQ/CQ/dbrec/recv buffer 在主机内存(SPDK 建的),fence 用 system 级
+ * 2. 接管后这个 qpair 不能再调 spdk_nvme_ns_cmd_*(坑 3)
+ * 3. C1 阶段 kernel 不补 recv buffer,总 I/O 数不能超过已 post 的数量
+ * 4. clock64() 是每线程各自的计数,跨线程的时间戳不能相减 ——
+ *    等待时间只在 submitter 自己的线程里量
  */
 
 #include <mcr/mc_runtime.h>
 #include <stdio.h>
+#include <string.h>
 #include "gpu_io_ctx.h"
 
 #define USE_MACA_DEVICE 1
 #include "wqe_build.h"
 
-/*
- * 一次 I/O 产生两个 CQE:我们那条 SEND 的发送完成,以及 target 回的
- * 响应胶囊(RESP_SEND)。顺序不保证,收到后者才算真的完成。
- */
-__device__ static int
-poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
-		  uint64_t timeout_cycles, uint64_t *spins_out)
+#define GIO_TIMEOUT	2000000000ULL	/* ~1.25 s @ 1.6 GHz */
+
+/* ---- 线程间可见的读写(同 Mooncake maca_ops.cuh 的 ld_acquire/st_release) ---- */
+
+__device__ static inline uint32_t
+ld_acq32(uint32_t *p)
 {
-	uint64_t start = clock64();
-	uint64_t spins = 0;
+	__threadfence_system();
+	return *(volatile uint32_t *)p;
+}
+
+__device__ static inline void
+st_rel32(uint32_t *p, uint32_t v)
+{
+	*(volatile uint32_t *)p = v;
+	__threadfence_system();
+}
+
+__device__ static inline void
+st_rel16(uint16_t *p, uint16_t v)
+{
+	*(volatile uint16_t *)p = v;
+	__threadfence_system();
+}
+
+__device__ static void
+set_abort(struct gio_shared *sh, int err)
+{
+	if (atomicCAS(&sh->abort, 0u, 1u) == 0u) {
+		st_rel32((uint32_t *)&sh->err, (uint32_t)err);
+	}
+}
+
+/* ================================================================== */
+/* poller                                                              */
+/* ================================================================== */
+
+/*
+ * 处理一个 RESP_SEND:定位 recv buffer → 读 NVMe CQE → 置 tag 完成。
+ *
+ * NVMe CQE(16 字节,小端):
+ *   [12..13] cid
+ *   [14..15] status:bit0 = phase tag,bit1..8 = SC,bit9..11 = SCT
+ */
+__device__ static void
+handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
+	    uint16_t wqe_counter, uint32_t seq)
+{
+	uint32_t k = wqe_counter & (c->rq_wqe_cnt - 1);
+	volatile uint8_t *seg = c->rq_buf + (size_t)k * c->rq_stride;
+	uint64_t addr = 0;
+	volatile uint8_t *cpl;
+	uint16_t cid, status;
+	uint32_t tag;
+	int b;
+
+	if (((c->rq_tail + seq) & 0xffff) != wqe_counter) {
+		st_rel32(&sh->wc_mismatch, sh->wc_mismatch + 1);
+	}
+
+	/* mlx5_wqe_data_seg:byte_count(4) lkey(4) addr(8),大端 */
+	for (b = 0; b < 8; b++) {
+		addr = (addr << 8) | seg[8 + b];
+	}
+	if (addr < c->rsp_host_base ||
+	    addr + 16 > c->rsp_host_base + c->rsp_len) {
+		set_abort(sh, GIO_E_RSP_ADDR);
+		return;
+	}
+	cpl = c->rsp_dev + (addr - c->rsp_host_base);
+	cid = (uint16_t)(cpl[12] | ((uint16_t)cpl[13] << 8));
+	status = (uint16_t)(cpl[14] | ((uint16_t)cpl[15] << 8));
+
+	tag = cid & ~GIO_CID_TAG;
+	if ((cid & GIO_CID_TAG) == 0 || tag >= c->qd) {
+		if (sh->cid_bad == 0) {
+			st_rel16(&sh->first_bad_cid, cid);
+		}
+		st_rel32(&sh->cid_bad, sh->cid_bad + 1);
+		set_abort(sh, GIO_E_CID);
+		return;
+	}
+
+	st_rel16(&tags[tag].status, status);
+	if ((status >> 1) != 0) {
+		if (sh->nvme_err == 0) {
+			st_rel16(&sh->first_status, status);
+		}
+		st_rel32(&sh->nvme_err, sh->nvme_err + 1);
+		st_rel32(&tags[tag].state, GIO_ST_NVME_ERR);
+	} else {
+		st_rel32(&tags[tag].state, GIO_ST_DONE);
+	}
+	st_rel32(&sh->done_cnt, sh->done_cnt + 1);
+}
+
+__device__ static void
+poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
+{
+	uint32_t ci = c->cq_ci;
+	uint8_t phase = c->cq_phase;
+	uint32_t seq = 0;
+	uint64_t spins = 0, hits = 0;
+	uint64_t idle_since = clock64();
 
 	for (;;) {
-		/*
-		 * 数圈数是为了区分"真的在等网络"和"自旋本身很贵"。
-		 * CQ buffer 在主存,GPU 每转一圈都要走 PCIe 读 64 字节 ——
-		 * 几百纳秒一次。转几十圈就能凑出几十微秒,那和网络无关。
-		 * 转几万圈才说明确实在等对端。
-		 */
-		spins++;
-		uint32_t idx = *ci & (c->cq_cnt - 1);
+		uint32_t idx = ci & (c->cq_cnt - 1);
 		volatile uint8_t *cqe = c->cq_buf + (size_t)idx * c->cqe_size;
 		uint8_t op_own = cqe[c->cqe_size - 1];
 		uint8_t opcode = op_own >> 4;
 
+		spins++;
+
 		/*
-		 * owner 和 opcode 两个条件缺一不可。空条目的 op_own=0xf0,
-		 * owner 位恰好等于首圈的 phase(0) —— 只判 owner 的话,轮询
-		 * 会在响应回来之前(不到 1 us)把整个 CQ 的空条目全部当成
-		 * 有效 CQE 消费掉,绕回时 phase 翻转,真 CQE 落地后就再也
-		 * 对不上了。表现就是"发包成功但永远等不到完成"。
+		 * owner 和 opcode 两个条件缺一不可。空条目 op_own=0xf0,owner 位
+		 * 恰好等于首圈的 phase(0) —— 只判 owner 会把空条目当 CQE 消费掉。
 		 */
-		if ((op_own & 1) != (*phase & 1) ||
-		    opcode == MLX5_CQE_INVALID) {
-			if (clock64() - start > timeout_cycles) {
-				*spins_out = spins;
-				return -1;
+		if ((op_own & 1) != (phase & 1) || opcode == MLX5_CQE_INVALID) {
+			if (ld_acq32(&sh->done_cnt) >= c->njobs ||
+			    ld_acq32(&sh->abort)) {
+				break;
+			}
+			if (clock64() - idle_since > GIO_TIMEOUT) {
+				set_abort(sh, GIO_E_TIMEOUT);
+				break;
 			}
 			continue;
 		}
 
 		/* owner 确认之后再读 CQE 其余字段 */
 		__threadfence_system();
+		hits++;
+		idle_since = clock64();
 
-		(*ci)++;
-		if ((*ci & (c->cq_cnt - 1)) == 0) {
-			*phase ^= 1;
-		}
-
-		if (opcode == MLX5_CQE_REQ_ERR || opcode == MLX5_CQE_RESP_ERR) {
-			*spins_out = spins;
-			return -2;
-		}
 		if (opcode == MLX5_CQE_RESP_SEND) {
-			*spins_out = spins;
+			/* wqe_counter:cqe64 offset 60,大端 */
+			uint16_t wc = (uint16_t)((cqe[c->cqe_size - 4] << 8) |
+						 cqe[c->cqe_size - 3]);
+
+			st_rel32(&sh->cqe_resp, sh->cqe_resp + 1);
+			handle_resp(c, sh, tags, wc, seq);
+			seq++;
+		} else if (opcode == MLX5_CQE_REQ) {
+			st_rel32(&sh->cqe_req, sh->cqe_req + 1);
+		} else if (opcode == MLX5_CQE_REQ_ERR ||
+			   opcode == MLX5_CQE_RESP_ERR) {
+			/* cqe64 在条目末尾;syndrome 在其 offset 55,vendor_err 在 54 */
+			uint32_t base = c->cqe_size - 64;
+
+			st_rel32(&sh->err_cqe, ((uint32_t)cqe[base + 54] << 8) |
+					       cqe[base + 55]);
+			set_abort(sh, GIO_E_CQE);
+		}
+
+		ci++;
+		if ((ci & (c->cq_cnt - 1)) == 0) {
+			phase ^= 1;
+		}
+		/* 已消费的 CQE 立刻还给网卡,出错也要还,否则 CQ 会溢出 */
+		c->cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
+		WQE_FENCE_DB();
+
+		if (ld_acq32(&sh->abort)) {
+			break;
+		}
+	}
+	sh->poll_spins = spins;
+	sh->poll_hits = hits;
+}
+
+/* ================================================================== */
+/* submitter                                                           */
+/* ================================================================== */
+
+__device__ static int
+claim_job(struct gio_shared *sh, uint32_t njobs, uint32_t *job)
+{
+	for (;;) {
+		uint32_t j = ld_acq32(&sh->next_job);
+
+		if (j >= njobs || ld_acq32(&sh->abort)) {
 			return 0;
+		}
+		if (atomicCAS(&sh->next_job, j, j + 1) == j) {
+			*job = j;
+			return 1;
+		}
+	}
+}
+
+__device__ static uint64_t
+sq_lock(struct gio_shared *sh)
+{
+	uint64_t spins = 0;
+
+	while (atomicCAS(&sh->sq_lock, 0u, 1u) != 0u) {
+		spins++;
+	}
+	return spins;
+}
+
+__device__ static void
+sq_unlock(struct gio_shared *sh)
+{
+	st_rel32(&sh->sq_lock, 0u);
+}
+
+/*
+ * 锁内:写 WQE → dbrec → BlueFlame 门铃。
+ *
+ * ctrl seg 的 wqe_idx 和门铃里的索引用 16 位生产者计数 pi,不是取模后
+ * 的 slot —— slot 只用来算地址。pi 跑过 sq_wqe_cnt 之后两者就不同了。
+ *
+ * BlueFlame 内联:整个 WQE(32 字节)写进 BF 寄存器。只写 8 字节也行
+ * (网卡回 SQ 取),这里沿用跑通时的形态。
+ */
+__device__ static void
+post_locked(struct gpu_io_ctx *c, struct gio_shared *sh, uint64_t cap_addr)
+{
+	uint16_t pi = (uint16_t)ld_acq32(&sh->sq_pi);
+	uint32_t slot = pi & (c->sq_wqe_cnt - 1);
+	volatile uint8_t *sq_slot = c->sq_buf + (size_t)slot * c->sq_stride;
+	volatile uint64_t *bfp = c->bf_reg;
+	const uint64_t *src;
+	int w;
+
+	(void)mlx5_build_send_wqe((void *)sq_slot, pi, c->qpn, cap_addr,
+				  c->capsule_lkey, 64);
+	WQE_FENCE_QUEUE();
+
+	c->qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
+	WQE_FENCE_DB();
+
+	src = (const uint64_t *)(void *)sq_slot;
+	for (w = 0; w < 4; w++) {
+		bfp[w] = src[w];
+	}
+	WQE_FENCE_DB();
+
+	st_rel32(&sh->sq_pi, (uint32_t)pi + 1);
+}
+
+__device__ static void
+submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
+	  uint32_t tag, uint64_t start_lba, uint64_t *c_cap, uint64_t *c_sub,
+	  uint64_t *c_wait, uint64_t *c_spin, uint64_t *c_lock,
+	  uint32_t *c_stat)
+{
+	volatile uint8_t *cap = c->capsule + (size_t)tag * 64;
+	uint64_t cap_addr = c->capsule_addr + (uint64_t)tag * 64;
+	uint32_t nlb = c->io_bytes / c->sector_size;
+	uint32_t j;
+
+	while (claim_job(sh, c->njobs, &j)) {
+		uint64_t lba = start_lba + (uint64_t)j * nlb;
+		uint64_t blk = c->data_addr + (uint64_t)j * c->data_step;
+		uint64_t t0, t1, t2, t3, lspins, spins = 0;
+		uint32_t st;
+
+		t0 = clock64();
+		nvme_build_rw_sqe((struct nvme_sqe *)cap, c->nvme_opc,
+				  (uint16_t)(GIO_CID_TAG | tag), c->nsid,
+				  lba, nlb, blk, c->data_rkey, c->io_bytes);
+		__threadfence_system();		/* 胶囊在主存,网卡要读 */
+		t1 = clock64();
+
+		/* 必须在门铃之前置 POSTED,否则 poller 置的 DONE 会被覆盖 */
+		st_rel32(&tags[tag].job, j);
+		st_rel32(&tags[tag].state, GIO_ST_POSTED);
+
+		lspins = sq_lock(sh);
+		post_locked(c, sh, cap_addr);
+		sq_unlock(sh);
+		t2 = clock64();
+
+		for (;;) {
+			spins++;
+			st = ld_acq32(&tags[tag].state);
+			if (st >= GIO_ST_DONE) {
+				break;
+			}
+			if (ld_acq32(&sh->abort)) {
+				break;
+			}
+			if (clock64() - t2 > GIO_TIMEOUT) {
+				set_abort(sh, GIO_E_TIMEOUT);
+				break;
+			}
+		}
+		t3 = clock64();
+
+		c_cap[j]  = t1 - t0;	/* 写 64 字节胶囊 */
+		c_sub[j]  = t2 - t1;	/* 抢锁 + WQE + dbrec + 门铃 */
+		c_wait[j] = t3 - t2;	/* 网络往返 + target + poller 转交 */
+		c_spin[j] = spins;
+		c_lock[j] = lspins;
+		c_stat[j] = (st >= GIO_ST_DONE) ?
+			    ld_acq32((uint32_t *)&tags[tag].status) & 0xffff :
+			    0xffffffffu;	/* 没等到 */
+
+		st_rel32(&tags[tag].state, GIO_ST_IDLE);
+		if (st < GIO_ST_DONE) {
+			break;
 		}
 	}
 }
 
 __global__ void
-k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
-	 uint64_t *cycles, uint64_t *c_cap, uint64_t *c_sub, uint64_t *c_wait,
-	 uint64_t *c_spin, int *err_out, uint32_t *done_out)
+k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
+	 uint64_t start_lba, uint64_t *c_cap, uint64_t *c_sub,
+	 uint64_t *c_wait, uint64_t *c_spin, uint64_t *c_lock,
+	 uint32_t *c_stat)
 {
-	uint32_t i;
-	uint16_t pi;
-	uint32_t ci;
-	uint8_t phase;
-	const uint64_t timeout = 2000000000ULL;
+	uint32_t t = threadIdx.x;
 
-	if (threadIdx.x != 0 || blockIdx.x != 0) {
+	if (blockIdx.x != 0 || t > ctx.qd) {
 		return;
 	}
-
-	pi = ctx.sq_pi;
-	ci = ctx.cq_ci;
-	phase = ctx.cq_phase;
-	*err_out = 0;
-	*done_out = 0;
-
-	for (i = 0; i < rounds; i++) {
-		uint64_t t0, t1, t2, t3;
-		uint64_t spins = 0;
-		uint32_t slot = pi & (ctx.sq_wqe_cnt - 1);
-		volatile uint8_t *sq_slot = ctx.sq_buf +
-					    (size_t)slot * ctx.sq_stride;
-		uint32_t cap_idx = i & 0x3f;
-		volatile uint8_t *cap = ctx.capsule + (size_t)cap_idx * 64;
-		uint64_t cap_addr = ctx.capsule_addr + (uint64_t)cap_idx * 64;
-		uint64_t lba = start_lba +
-			       (uint64_t)i * (ctx.io_bytes / ctx.sector_size);
-		uint64_t blk_addr = ctx.data_addr + (uint64_t)i * ctx.data_step;
-		uint64_t db_val;
-		int rc;
-
-		t0 = clock64();
-
-		/*
-		 * READ  : target 发 RDMA_WRITE 写我们显存(显存作 DMA target)
-		 * WRITE : target 发 RDMA_READ  读我们显存(显存作 DMA source)
-		 * 后者和 -H 失败的是同一类动作,正好用来二分。
-		 */
-		/*
-		 * cid 高位打上 0xE 作标记,方便在 target 日志里把 kernel
-		 * 发的命令和 SPDK(预热、涂色)发的区分开 —— 两边的 SGL
-		 * 地址和 rkey 可能完全一样,只有 cid 能分。
-		 * 定位完可以改回 (uint16_t)(i & 0xffff)。
-		 */
-		nvme_build_rw_sqe((struct nvme_sqe *)cap, ctx.nvme_opc,
-				  (uint16_t)(0xE000u | (i & 0xfffu)), ctx.nsid,
-				  lba, ctx.io_bytes / ctx.sector_size,
-				  blk_addr, ctx.data_rkey, ctx.io_bytes);
-
-		t1 = clock64();		/* 写胶囊耗时 = t1 - t0 */
-
-		/*
-		 * ctrl seg 的 wqe_idx 和门铃里的索引用的是 16 位生产者
-		 * 计数 pi,不是取模之后的 slot —— slot 只用来算 SQ 里的
-		 * 地址。早先这里传 slot,pi 跑过 sq_wqe_cnt(512) 之后就会
-		 * 和 dbrec 写进去的 pi+1 对不上。
-		 */
-		db_val = mlx5_build_send_wqe((void *)sq_slot, pi,
-					     ctx.qpn, cap_addr,
-					     ctx.capsule_lkey, 64);
-
-		WQE_FENCE_QUEUE();
-
-
-		ctx.qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
-		WQE_FENCE_DB();
-
-		/*
-		 * BlueFlame 内联:整个 WQE(32 字节)写进 BF 寄存器。
-		 *
-		 * host 侧对照(wqe_verify 加/不加 -B)实测两种都能工作 ——
-		 * 只写 8 字节(ctrl seg 前半)也行,网卡会回 SQ 取。这里用
-		 * 内联是因为它是跑通时的形态,没有性能上的理由。
-		 */
-		{
-			volatile uint64_t *bfp = ctx.bf_reg;
-			const uint64_t *src = (const uint64_t *)(void *)sq_slot;
-			int w;
-
-			for (w = 0; w < 4; w++) {
-				bfp[w] = src[w];
-			}
-		}
-		WQE_FENCE_DB();
-		(void)db_val;
-
-		t2 = clock64();		/* 提交耗时 = t2 - t1 */
-
-		rc = poll_for_response(&ctx, &ci, &phase, timeout, &spins);
-		t3 = clock64();		/* 等待耗时 = t3 - t2 */
-
-		cycles[i] = t3 - t0;
-		c_cap[i]  = t1 - t0;	/* 写 64 字节胶囊 */
-		c_sub[i]  = t2 - t1;	/* 写 WQE + dbrec + 门铃 */
-		c_wait[i] = t3 - t2;	/* 网络往返 + target 处理 + 轮询 */
-		c_spin[i] = spins;	/* 轮询圈数 */
-
-		/*
-		 * 不管这一轮成功还是出错,已经消费掉的 CQE 都要把 ci 还给
-		 * 网卡,否则下次跑起来 CQ 会溢出。
-		 */
-		ctx.cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
-		WQE_FENCE_DB();
-
-		if (rc != 0) {
-			*err_out = rc;
-			*done_out = i;
-			return;
-		}
-
-		pi++;
-		*done_out = i + 1;
+	if (t == 0) {
+		poller(&ctx, sh, tags);
+	} else {
+		submitter(&ctx, sh, tags, t - 1, start_lba, c_cap, c_sub,
+			  c_wait, c_spin, c_lock, c_stat);
 	}
 }
 
@@ -247,33 +395,59 @@ k_fill(volatile unsigned char *p, unsigned char v, unsigned int len)
 
 extern "C" {
 
+/*
+ * 返回 0 表示 kernel 正常跑完(不代表 I/O 全成功,看 sh_out)。
+ * 逐 I/O 数组长度 = ctx->njobs;c_stat 是 NVMe status 字,
+ * 0xffffffff 表示没等到完成。
+ */
 int
-gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
-	   unsigned long long start_lba, unsigned long long *host_cycles,
+gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	   unsigned long long *host_cap, unsigned long long *host_sub,
 	   unsigned long long *host_wait, unsigned long long *host_spin,
-	   int *host_err, unsigned int *host_done)
+	   unsigned long long *host_lock, unsigned int *host_stat,
+	   struct gio_shared *sh_out)
 {
-	uint64_t *d_cycles = NULL, *d_cap = NULL, *d_sub = NULL, *d_wait = NULL;
-	uint64_t *d_spin = NULL;
-	int *d_err = NULL;
-	uint32_t *d_done = NULL;
-	size_t sz = rounds * sizeof(uint64_t);
+	uint64_t *d_cap = NULL, *d_sub = NULL, *d_wait = NULL;
+	uint64_t *d_spin = NULL, *d_lock = NULL;
+	uint32_t *d_stat = NULL;
+	struct gio_shared *d_sh = NULL, sh0;
+	struct gio_tag *d_tags = NULL;
+	size_t sz = ctx->njobs * sizeof(uint64_t);
+	size_t tsz = ctx->qd * sizeof(struct gio_tag);
+	unsigned int nthr = 32;
 	mcError_t e;
 	int rc = -1;
 
-	if (mcMalloc((void **)&d_cycles, sz) != mcSuccess ||
-	    mcMalloc((void **)&d_cap, sz) != mcSuccess ||
+	while (nthr < ctx->qd + 1) {
+		nthr <<= 1;
+	}
+	if (nthr > 256) {
+		fprintf(stderr, "QD %u 太大(单 block 最多 255 个 submitter)\n",
+			ctx->qd);
+		return -1;
+	}
+
+	if (mcMalloc((void **)&d_cap, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_sub, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_wait, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_spin, sz) != mcSuccess ||
-	    mcMalloc((void **)&d_err, sizeof(int)) != mcSuccess ||
-	    mcMalloc((void **)&d_done, sizeof(uint32_t)) != mcSuccess) {
+	    mcMalloc((void **)&d_lock, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_stat, ctx->njobs * sizeof(uint32_t)) != mcSuccess ||
+	    mcMalloc((void **)&d_sh, sizeof(*d_sh)) != mcSuccess ||
+	    mcMalloc((void **)&d_tags, tsz) != mcSuccess) {
+		fprintf(stderr, "kernel 工作区分配失败\n");
 		goto out;
 	}
 
-	k_gpu_io<<<1, 32>>>(*ctx, rounds, start_lba, d_cycles,
-			    d_cap, d_sub, d_wait, d_spin, d_err, d_done);
+	memset(&sh0, 0, sizeof(sh0));
+	sh0.sq_pi = ctx->sq_pi;
+	mcMemcpy(d_sh, &sh0, sizeof(sh0), mcMemcpyHostToDevice);
+	mcMemset(d_tags, 0, tsz);
+	mcMemset(d_stat, 0xff, ctx->njobs * sizeof(uint32_t));
+	mcDeviceSynchronize();
+
+	k_gpu_io<<<1, nthr>>>(*ctx, d_sh, d_tags, start_lba, d_cap, d_sub,
+			      d_wait, d_spin, d_lock, d_stat);
 
 	e = mcGetLastError();
 	if (e != mcSuccess) {
@@ -286,22 +460,24 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
 		goto out;
 	}
 
-	mcMemcpy(host_cycles, d_cycles, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_cap,  d_cap,  sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_sub,  d_sub,  sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_wait, d_wait, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_spin, d_spin, sz, mcMemcpyDeviceToHost);
-	mcMemcpy(host_err, d_err, sizeof(int), mcMemcpyDeviceToHost);
-	mcMemcpy(host_done, d_done, sizeof(uint32_t), mcMemcpyDeviceToHost);
+	mcMemcpy(host_lock, d_lock, sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_stat, d_stat, ctx->njobs * sizeof(uint32_t),
+		 mcMemcpyDeviceToHost);
+	mcMemcpy(sh_out, d_sh, sizeof(*sh_out), mcMemcpyDeviceToHost);
 	rc = 0;
 out:
-	if (d_cycles) mcFree(d_cycles);
-	if (d_cap)    mcFree(d_cap);
-	if (d_sub)    mcFree(d_sub);
-	if (d_wait)   mcFree(d_wait);
-	if (d_spin)   mcFree(d_spin);
-	if (d_err)    mcFree(d_err);
-	if (d_done)   mcFree(d_done);
+	if (d_cap)  mcFree(d_cap);
+	if (d_sub)  mcFree(d_sub);
+	if (d_wait) mcFree(d_wait);
+	if (d_spin) mcFree(d_spin);
+	if (d_lock) mcFree(d_lock);
+	if (d_stat) mcFree(d_stat);
+	if (d_sh)   mcFree(d_sh);
+	if (d_tags) mcFree(d_tags);
 	return rc;
 }
 

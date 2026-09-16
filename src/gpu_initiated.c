@@ -2,8 +2,9 @@
  * gpu_initiated.c  --  GPU-initiated NVMe-oF 原型的 host 侧
  *
  * CPU 只做初始化:SPDK 建连、Fabric Connect、注册 MR、把 SQ/CQ/dbrec/UAR
- * 映射给 GPU。稳态收发全在 kernel 内 —— 构造命令胶囊、写 WQE、敲门铃、
- * 轮询 CQ,一条都不经过 CPU。
+ * 和 recv buffer 映射给 GPU。稳态收发全在 kernel 内 —— 构造命令胶囊、
+ * 写 WQE、敲门铃、轮询 CQ、按 cid 分发完成,一条都不经过 CPU。
+ * 并发模型见 docs/concurrency-design.md。
  *
  * 出错时 CPU 兜底:kernel 只报错误码,QP 恢复要 modify_qp,那是 host API。
  *
@@ -11,7 +12,8 @@
  *
  *   -a <ip> -n <nqn>     必填
  *   -g <id>              GPU 编号
- *   -r <n> -b <bytes>    轮数、每轮字节数
+ *   -r <n> -b <bytes>    I/O 总数、每条字节数
+ *   -Q <qd>              同时在飞的 I/O 数(submitter 线程数,默认 1)
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -47,10 +49,11 @@
 #include "gpu_io_ctx.h"
 #include "blk_pattern.h"
 
-extern int gpu_io_run(struct gpu_io_ctx *, unsigned int, unsigned long long,
+extern int gpu_io_run(struct gpu_io_ctx *, unsigned long long,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned long long *,
-		      unsigned long long *, int *, unsigned int *);
+		      unsigned long long *, unsigned int *,
+		      struct gio_shared *);
 extern int gpu_alloc_exportable(void **, int *, size_t);
 extern int gpu_alloc_exportable_ex(void **, int *, size_t, unsigned int);
 extern int gpu_map_host(void *, size_t, unsigned int, void **);
@@ -85,6 +88,7 @@ static int	g_base_fd = -1;
 static char	g_traddr[64], g_nqn[224], g_trsvcid[16] = "4420";
 static int	g_gpu_id = 4;
 static uint32_t	g_rounds = 100;
+static uint32_t	g_qd = 1;
 static uint32_t	g_io_bytes = 4096;
 static int	g_write, g_cap_in_hbm, g_paint, g_verify;
 static int	g_fill_by_kernel;	/* -K: 源数据由 kernel 写,不用 mcMemset */
@@ -236,7 +240,7 @@ static int cmp_d(const void *a, const void *b)
 
 static void usage(const char *p)
 {
-	printf("用法: %s -a <ip> -n <nqn> [-g gpu] [-r rounds] [-b bytes]\n"
+	printf("用法: %s -a <ip> -n <nqn> [-g gpu] [-r n_io] [-b bytes] [-Q qd]\n"
 	       "      [-L start_lba] [-S seed] [-W 发写]\n"
 	       "      [-H 胶囊放显存] [-F cap_flag]\n"
 	       "      [-P 涂色] [-V 逐块回读] [-K 旧式单块对照]\n", p);
@@ -331,18 +335,23 @@ main(int argc, char **argv)
 	struct mlx5dv_cq dvc;
 	struct mlx5dv_obj obj;
 	struct gpu_io_ctx ctx;
-	unsigned long long *cycles, *c_cap, *c_sub, *c_wait, *c_spin;
+	unsigned long long *cycles, *c_cap, *c_sub, *c_wait, *c_spin, *c_lock;
+	unsigned int *c_stat;
+	struct gio_shared sh;
+	struct spdk_nvme_io_qpair_opts qopts;
+	void *d_rsp = NULL;
+	uint32_t rq_posted = 0;
 	double *us;
 	uint32_t sector, nlb, nblk;
 	int err = 0, clk_khz = 0, op;
 	unsigned int done = 0, i;
-	void *d_sq, *d_dbrec, *d_bf, *d_cq, *d_cqdb;
+	void *d_sq, *d_rq, *d_q, *d_dbrec, *d_bf, *d_cq, *d_cqdb;
 
 	memset(&dvq, 0, sizeof(dvq));
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPVKF:L:S:")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:Q:WHPVKF:L:S:")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -350,6 +359,7 @@ main(int argc, char **argv)
 		case 'g': g_gpu_id = atoi(optarg); break;
 		case 'r': g_rounds = (unsigned)atoi(optarg); break;
 		case 'b': g_io_bytes = (unsigned)atoi(optarg); break;
+		case 'Q': g_qd = (unsigned)atoi(optarg); break;
 		case 'W': g_write = 1; break;
 		case 'H': g_cap_in_hbm = 1; break;
 		case 'P': g_paint = 1; break;
@@ -370,6 +380,13 @@ main(int argc, char **argv)
 	if (g_io_bytes % 8 || g_rounds == 0) {
 		fprintf(stderr, "-b 必须是 8 的倍数,-r 必须 > 0\n");
 		return 1;
+	}
+	if (g_qd == 0 || g_qd > 255) {
+		fprintf(stderr, "-Q 取 1..255\n");
+		return 1;
+	}
+	if (g_qd > g_rounds) {
+		g_qd = g_rounds;
 	}
 
 	printf("=========================================================\n");
@@ -603,9 +620,33 @@ main(int argc, char **argv)
 	       qp->qp_num, dvq.sq.wqe_cnt, dvq.sq.stride,
 	       dvc.cqe_cnt, dvc.cqe_size);
 
-	if (gpu_map_host(dvq.sq.buf, (size_t)dvq.sq.wqe_cnt * dvq.sq.stride,
-			 MC_HOST_REGISTER_MAPPED, &d_sq) ||
-	    gpu_map_host((void *)dvq.dbrec, 64,
+	/*
+	 * mlx5 的 RQ 和 SQ 在同一块 buffer 里(RQ 在前),SQ 起点往往不对齐页,
+	 * 两者可能共用一页。整段一起注册,再按偏移算出各自的设备指针。
+	 */
+	{
+		char *rq_lo = (char *)dvq.rq.buf;
+		char *rq_hi = rq_lo + (size_t)dvq.rq.wqe_cnt * dvq.rq.stride;
+		char *sq_lo = (char *)dvq.sq.buf;
+		char *sq_hi = sq_lo + (size_t)dvq.sq.wqe_cnt * dvq.sq.stride;
+		char *lo = rq_lo < sq_lo ? rq_lo : sq_lo;
+		char *hi = rq_hi > sq_hi ? rq_hi : sq_hi;
+
+		if ((size_t)(hi - lo) > (size_t)((rq_hi - rq_lo) +
+						 (sq_hi - sq_lo)) + 8192) {
+			fprintf(stderr, "RQ %p 与 SQ %p 不相邻,和预期的 mlx5 "
+				"布局不同\n", rq_lo, sq_lo);
+			return 1;
+		}
+		if (gpu_map_host(lo, (size_t)(hi - lo),
+				 MC_HOST_REGISTER_MAPPED, &d_q) != 0) {
+			fprintf(stderr, "映射 RQ+SQ 给 GPU 失败\n");
+			return 1;
+		}
+		d_sq = (char *)d_q + (sq_lo - lo);
+		d_rq = (char *)d_q + (rq_lo - lo);
+	}
+	if (gpu_map_host((void *)dvq.dbrec, 64,
 			 MC_HOST_REGISTER_MAPPED, &d_dbrec) ||
 	    gpu_map_host(dvc.buf, (size_t)dvc.cqe_cnt * dvc.cqe_size,
 			 MC_HOST_REGISTER_MAPPED, &d_cq) ||
@@ -617,7 +658,7 @@ main(int argc, char **argv)
 		fprintf(stderr, "映射队列给 GPU 失败\n");
 		return 1;
 	}
-	printf("[映射] SQ/CQ/dbrec/UAR 均已交给 GPU\n");
+	printf("[映射] RQ/SQ/CQ/dbrec/UAR 均已交给 GPU\n");
 
 	ctx.sq_buf       = (volatile uint8_t *)d_sq;
 	ctx.qp_dbrec     = (volatile uint32_t *)d_dbrec;
@@ -644,14 +685,110 @@ main(int argc, char **argv)
 	ctx.data_step    = g_fill_by_kernel ? 0 : g_io_bytes;
 
 	/*
-	 * kernel 不补 recv buffer,每轮响应消耗一个。RQ 里现成有多少就只能
-	 * 跑多少轮 —— 超出的那轮响应无处安放,表现成和 CQE 判错一模一样的
-	 * 死等,别混淆。
+	 * ---- RQ 与 recv buffer ----
+	 *
+	 * 响应胶囊落在 SPDK 预先 post 的 recv buffer 里(rsps[i].cpl,连续
+	 * 数组,spdk_zmalloc 大页)。poller 要从里面读 cid 和 NVMe status,
+	 * 所以这段也得映射给 GPU。地址从 RQ 槽里现读,不依赖 SPDK 私有结构。
+	 *
+	 * rdma-core 把 RQ 生产者计数写在 dbrec[0](大端,低 16 位)。SPDK
+	 * 每消费一个就立刻补一个,所以接管时已 post 的数量恒为 queue size,
+	 * 最老那个的计数 = head - posted。RESP CQE 的 wqe_counter 应该从这里
+	 * 开始逐个递增 —— kernel 会核对(wc_mismatch)。
 	 */
-	if (g_rounds > dvq.rq.wqe_cnt) {
-		printf("[警告] RQ 深度 %u < 轮数 %u,第 %u 轮之后会卡住\n",
-		       dvq.rq.wqe_cnt, g_rounds, dvq.rq.wqe_cnt);
+	{
+		volatile uint32_t *qdb = (volatile uint32_t *)dvq.dbrec;
+		uint32_t head = be32toh(qdb[0]) & 0xffff;
+		uint32_t mask = dvq.rq.wqe_cnt - 1;
+		uint64_t amin = ~0ULL, amax = 0, gap = ~0ULL, prev = 0;
+		uint32_t lkey0 = 0, bad = 0, k;
+		uint64_t base, end;
+
+		spdk_nvme_ctrlr_get_default_io_qpair_opts(g_ctrlr, &qopts,
+							  sizeof(qopts));
+		rq_posted = qopts.io_queue_size;
+		if (rq_posted > dvq.rq.wqe_cnt) {
+			rq_posted = dvq.rq.wqe_cnt;
+		}
+		for (k = 0; k < rq_posted; k++) {
+			uint8_t *seg = (uint8_t *)dvq.rq.buf +
+				       (size_t)((head - rq_posted + k) & mask) *
+				       dvq.rq.stride;
+			uint32_t len, lkey;
+			uint64_t addr;
+
+			memcpy(&len, seg, 4);
+			memcpy(&lkey, seg + 4, 4);
+			memcpy(&addr, seg + 8, 8);
+			len = be32toh(len);
+			lkey = be32toh(lkey);
+			addr = be64toh(addr);
+			if (k == 0) {
+				lkey0 = lkey;
+			}
+			if (len != 16 || lkey != lkey0) {
+				bad++;
+			}
+			if (addr < amin) amin = addr;
+			if (addr > amax) amax = addr;
+			if (k && addr > prev && addr - prev < gap) {
+				gap = addr - prev;
+			}
+			prev = addr;
+		}
+		printf("[RQ] wqe_cnt=%u stride=%u head=%u posted=%u "
+		       "(io_queue_size=%u) lkey=0x%x 异常槽=%u\n",
+		       dvq.rq.wqe_cnt, dvq.rq.stride, head, rq_posted,
+		       qopts.io_queue_size, lkey0, bad);
+		printf("[RQ] recv buffer 0x%" PRIx64 " .. 0x%" PRIx64
+		       " (跨 %" PRIu64 " 字节, 最小间隔 %" PRIu64 ")\n",
+		       amin, amax + 16, amax + 16 - amin,
+		       gap == ~0ULL ? 0 : gap);
+		if (bad) {
+			fprintf(stderr, "RQ 槽内容和预期不符(len 应为 16、lkey 一致),"
+				"不能继续\n");
+			return 1;
+		}
+
+		base = amin & ~4095ULL;
+		end = (amax + 16 + 4095) & ~4095ULL;
+		if (gpu_map_host((void *)base, end - base,
+				 MC_HOST_REGISTER_MAPPED, &d_rsp) != 0) {
+			fprintf(stderr, "recv buffer 映射给 GPU 失败(SPDK 大页)。\n"
+				"见 docs/concurrency-design.md「上机前要确认的」第 2 条\n");
+			return 1;
+		}
+		printf("[映射] recv buffer 0x%" PRIx64 " +%" PRIu64 " -> %p\n",
+		       base, end - base, d_rsp);
+
+		ctx.rq_buf        = (volatile uint8_t *)d_rq;
+		ctx.rq_wqe_cnt    = dvq.rq.wqe_cnt;
+		ctx.rq_stride     = dvq.rq.stride;
+		ctx.rq_tail       = (head - rq_posted) & 0xffff;
+		ctx.rsp_host_base = base;
+		ctx.rsp_len       = end - base;
+		ctx.rsp_dev       = (volatile uint8_t *)d_rsp;
 	}
+
+	/*
+	 * C1 不补 recv buffer:每条 I/O 的响应消耗一个,总数不能超过已 post 的。
+	 * 超出的那条响应无处安放,表现是超时。
+	 */
+	if (!g_paint && !g_verify && g_rounds > rq_posted) {
+		fprintf(stderr, "-r %u 超过已 post 的 recv 数 %u(C1 尚不补充)\n",
+			g_rounds, rq_posted);
+		return 1;
+	}
+	if (rq_posted < 2) {
+		fprintf(stderr, "已 post 的 recv 数 %u 异常\n", rq_posted);
+		return 1;
+	}
+	if (g_qd >= rq_posted) {
+		g_qd = rq_posted - 1;
+		printf("[QD] 超过 queue size,降为 %u\n", g_qd);
+	}
+	ctx.qd = g_qd;
+	ctx.njobs = g_rounds;
 
 	/* ---- 准备源数据 / 盘上底色 ---- */
 	if (g_fill_by_kernel) {
@@ -752,15 +889,59 @@ main(int argc, char **argv)
 	c_sub  = calloc(g_rounds, sizeof(*c_sub));
 	c_wait = calloc(g_rounds, sizeof(*c_wait));
 	c_spin = calloc(g_rounds, sizeof(*c_spin));
+	c_lock = calloc(g_rounds, sizeof(*c_lock));
+	c_stat = calloc(g_rounds, sizeof(*c_stat));
 	us = calloc(g_rounds, sizeof(*us));
-	printf("\n[运行] %s %u 轮, 每轮 %u 字节, %s\n",
-	       g_write ? "WRITE" : "READ", g_rounds, g_io_bytes,
-	       ctx.data_step ? "每轮一块" : "单块复用");
+	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u, %s\n",
+	       g_write ? "WRITE" : "READ", g_rounds, g_io_bytes, g_qd,
+	       ctx.data_step ? "每条一块" : "单块复用");
 
-	if (gpu_io_run(&ctx, g_rounds, g_start_lba, cycles, c_cap,
-		       c_sub, c_wait, c_spin, &err, &done) != 0) {
+	if (gpu_io_run(&ctx, g_start_lba, c_cap, c_sub, c_wait, c_spin,
+		       c_lock, c_stat, &sh) != 0) {
 		fprintf(stderr, "kernel 执行失败\n");
 		return 1;
+	}
+
+	/*
+	 * done = 等到了响应的条数(不论 NVMe status);ok = status 为 0 的。
+	 * 这是坑 9 的根治:target 拒掉的命令不再算成功。
+	 */
+	{
+		unsigned ok = 0;
+
+		for (i = 0; i < g_rounds; i++) {
+			if (c_stat[i] != 0xffffffffu) {
+				cycles[done] = c_cap[i] + c_sub[i] + c_wait[i];
+				done++;
+				ok += (c_stat[i] >> 1) == 0;
+			}
+		}
+		err = sh.err;
+		printf("[完成] 响应 %u / %u, NVMe 成功 %u, NVMe 出错 %u",
+		       done, g_rounds, ok, sh.nvme_err);
+		if (sh.nvme_err) {
+			printf(" (首个 status=0x%04x: SCT=%u SC=0x%02x%s)",
+			       sh.first_status, (sh.first_status >> 9) & 7,
+			       (sh.first_status >> 1) & 0xff,
+			       ((sh.first_status >> 1) & 0xff) == 0x02 &&
+			       ((sh.first_status >> 9) & 7) == 0 ?
+			       " Invalid Field —— 常见于超过 max_io_size" : "");
+		}
+		printf("\n[poller] CQE: SEND 完成 %u, 响应 %u;cid 异常 %u",
+		       sh.cqe_req, sh.cqe_resp, sh.cid_bad);
+		if (sh.cid_bad) {
+			printf(" (首个 0x%04x)", sh.first_bad_cid);
+		}
+		printf(";wqe_counter 不连续 %u;轮询 %llu 圈, 命中 %llu\n",
+		       sh.wc_mismatch, (unsigned long long)sh.poll_spins,
+		       (unsigned long long)sh.poll_hits);
+		if (sh.err_cqe) {
+			printf("[poller] 错误 CQE syndrome=0x%02x vendor=0x%02x\n",
+			       sh.err_cqe & 0xff, (sh.err_cqe >> 8) & 0xff);
+		}
+		if (ok != g_rounds && !err) {
+			err = -5;
+		}
 	}
 
 	/*
@@ -775,12 +956,14 @@ main(int argc, char **argv)
 		volatile uint32_t *qdb = (volatile uint32_t *)dvq.dbrec;
 		volatile uint32_t *cdb = (volatile uint32_t *)dvc.dbrec;
 		uint32_t sq_now = be32toh(qdb[1]) & 0xffff;
+		uint32_t rq_now = be32toh(qdb[0]) & 0xffff;
 		uint32_t cq_now = be32toh(cdb[0]) & 0xffffff;
 
-		printf("[dbrec] SQ %u -> %u (+%u, 期望 +%u)   CQ %u -> %u (+%u)\n",
-		       ctx.sq_pi, sq_now, sq_now - ctx.sq_pi, g_rounds,
-		       ctx.cq_ci, cq_now, cq_now - ctx.cq_ci);
-		if (sq_now - ctx.sq_pi != g_rounds) {
+		printf("[dbrec] SQ %u -> %u (+%u, 期望 +%u)   CQ %u -> %u (+%u)"
+		       "   RQ head %u\n",
+		       ctx.sq_pi, sq_now, (sq_now - ctx.sq_pi) & 0xffff, g_rounds,
+		       ctx.cq_ci, cq_now, cq_now - ctx.cq_ci, rq_now);
+		if (((sq_now - ctx.sq_pi) & 0xffff) != g_rounds) {
 			printf("  *** SQ 增量不等于轮数:kernel 的命令没发出去 ***\n");
 		}
 	}
@@ -798,7 +981,7 @@ main(int argc, char **argv)
 	 *   WQE offset 1-2  = 接管时的 sq_pi(大端)
 	 *   WQE offset 16-31 = data seg,addr 应指向胶囊
 	 *   胶囊 offset 0   = 0x02 READ / 0x01 WRITE
-	 *   胶囊 offset 2-3 = cid,小端。kernel 打了 0xE000 标记则是 00 e0
+	 *   胶囊 offset 2-3 = cid,小端。kernel 的是 0x8000 | tag
 	 */
 	{
 		uint32_t slot = ctx.sq_pi & (dvq.sq.wqe_cnt - 1);
@@ -872,7 +1055,11 @@ main(int argc, char **argv)
 	printf("[结果] 完成 %u / %u", done, g_rounds);
 	if (err) {
 		printf(", 错误码 %d (%s)", err,
-		       err == -1 ? "轮询超时" : "CQE 报错");
+		       err == GIO_E_TIMEOUT ? "超时" :
+		       err == GIO_E_CQE ? "CQE 报错" :
+		       err == GIO_E_CID ? "响应 cid 对不上" :
+		       err == GIO_E_RSP_ADDR ? "recv buffer 地址越界" :
+		       "有 NVMe 出错");
 	}
 	printf("\n");
 
@@ -888,18 +1075,38 @@ main(int argc, char **argv)
 	}
 
 	/*
-	 * 分段统计。总时间拆成三段:
+	 * 分段统计(只统计等到了响应的 I/O)。总时间拆成三段:
 	 *   胶囊  写那 64 字节。-H 时胶囊在 uncached 显存,这一段会明显变贵
-	 *   提交  写 WQE + dbrec + 敲门铃,全在主存,应该很稳
-	 *   等待  网络往返 + target 处理 + 轮询到 CQE。min 值最接近真实网络往返
+	 *   提交  抢锁 + 写 WQE + dbrec + 敲门铃。QD 大时抢锁会占比上升
+	 *   等待  网络往返 + target 处理 + poller 收割 + submitter 看到完成
 	 *
 	 * p99 常比 p50 高一两个数量级,别当网络问题:kernel 单线程自旋轮询,
 	 * 会被 GPU 调度打断,clock64() 在长自旋下也未必可靠。比较配置时看 p50。
 	 */
 	{
 		static const char *names[4] = { "总计", "  胶囊", "  提交", "  等待" };
-		unsigned long long *srcs[4] = { cycles, c_cap, c_sub, c_wait };
+		unsigned long long *srcs[4];
+		unsigned long long *compact[4];
+		unsigned n = 0;
 		int k;
+
+		/* 按"等到了响应"压紧,cycles 已经压过 */
+		for (k = 1; k < 4; k++) {
+			compact[k] = calloc(done ? done : 1, sizeof(**compact));
+		}
+		for (i = 0; i < g_rounds; i++) {
+			if (c_stat[i] == 0xffffffffu) {
+				continue;
+			}
+			compact[1][n] = c_cap[i];
+			compact[2][n] = c_sub[i];
+			compact[3][n] = c_wait[i];
+			n++;
+		}
+		srcs[0] = cycles;
+		srcs[1] = compact[1];
+		srcs[2] = compact[2];
+		srcs[3] = compact[3];
 
 		printf("\n===== kernel 内延迟分段 (us) =====\n");
 		printf("  %-6s %8s %8s %8s %8s %8s\n",
@@ -919,22 +1126,28 @@ main(int argc, char **argv)
 		}
 
 		/*
-		 * 轮询圈数。CQ buffer 在主存,GPU 每转一圈要走 PCIe 读
-		 * 64 字节 —— 几百纳秒一次。
-		 *   转几十圈    -> 等待时间不是花在等网络上,是自旋本身贵
-		 *   转几万圈    -> 确实在等对端,那 45 us 就是真实往返
+		 * submitter 等待圈数:每圈是一次跨线程读 tag 状态。
+		 * 锁自旋:抢 SQ 锁失败的次数,QD 大时看它判断锁是不是瓶颈。
 		 */
 		{
 			unsigned long long smin = ~0ULL, smax = 0, ssum = 0;
 			double wsum = 0;
 
-			for (i = 0; i < done; i++) {
+			unsigned long long lsum = 0, lmax = 0;
+
+			for (i = 0; i < g_rounds; i++) {
+				if (c_stat[i] == 0xffffffffu) {
+					continue;
+				}
 				if (c_spin[i] < smin) smin = c_spin[i];
 				if (c_spin[i] > smax) smax = c_spin[i];
 				ssum += c_spin[i];
 				wsum += c_wait[i] / (clk_khz / 1000.0);
+				lsum += c_lock[i];
+				if (c_lock[i] > lmax) lmax = c_lock[i];
 			}
-			printf("\n  轮询圈数: mean %llu  min %llu  max %llu",
+			printf("\n  锁自旋: mean %llu  max %llu", lsum / done, lmax);
+			printf("\n  等待圈数: mean %llu  min %llu  max %llu",
 			       ssum / done, smin, smax);
 			if (ssum) {
 				printf("   平均每圈 %.0f ns",
@@ -947,11 +1160,18 @@ main(int argc, char **argv)
 		 * 前几轮快之后稳定 -> 冷启动
 		 * 快慢交替有周期   -> target poll group 轮转或 GPU 调度
 		 * 完全随机         -> 别的 */
-		printf("  逐轮等待(us): ");
-		for (i = 0; i < done && i < 40; i++) {
-			printf("%.0f ", c_wait[i] / (clk_khz / 1000.0));
+		printf("  逐条等待(us): ");
+		for (i = 0; i < g_rounds && i < 40; i++) {
+			if (c_stat[i] == 0xffffffffu) {
+				printf("- ");
+			} else {
+				printf("%.0f ", c_wait[i] / (clk_khz / 1000.0));
+			}
 		}
-		printf("%s\n", done > 40 ? "..." : "");
+		printf("%s\n", g_rounds > 40 ? "..." : "");
+		for (k = 1; k < 4; k++) {
+			free(compact[k]);
+		}
 	}
 
 
@@ -995,7 +1215,7 @@ main(int argc, char **argv)
 			fprintf(stderr, "DtoH 失败\n");
 			return 1;
 		}
-		if (report_blocks("校验", h, done, g_io_bytes, nlb,
+		if (report_blocks("校验", h, nblk, g_io_bytes, nlb,
 				  g_start_lba, g_seed)) {
 			err = err ? err : -3;
 		}

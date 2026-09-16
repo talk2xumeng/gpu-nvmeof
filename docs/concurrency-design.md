@@ -107,10 +107,13 @@ loop:
     switch opcode:
       REQ(SEND 完成):         忽略(可计数)
       RESP_SEND:
-          k    = rq_tail & rq_mask             ← FIFO;同时和 wqe_counter 核对
+          k    = wqe_counter & rq_mask         ← RESP 的 wqe_counter 是 RQ 消费计数;
+                                                  同时和顺序推算核对
           seg  = RQ[k] 的 data seg → addr
           cpl  = rsp 设备映射[addr - rsp_host_base]
-          cid  = cpl.cid;  tag = cid & 0x7fff   ← 校验高位是 0x8000
+          cid  = cpl[12..13];  status = cpl[14..15]   ← 小端
+          tag  = cid & 0x7fff                         ← 校验高位是 0x8000
+          NVMe 出错 = (status >> 1) != 0              ← bit0 是 phase tag
           tags[tag].nvme_status = cpl.status
           tags[tag].state = status ? 3 : 2
           done_cnt++
@@ -143,6 +146,11 @@ loop:
 
 ## 计时与指标
 
+`clock64()` 是每线程各自的计数(Tutti 的 MACA 原语说明里写明是
+per-SM counter),**跨线程的时间戳不能相减**。所以每条 I/O 的等待时间
+在 submitter 自己的线程里量(门铃后 → 看到完成),poller 只统计自己的
+圈数。
+
 - 每条 I/O:`t_post`(门铃后)、`t_done`(poller 置完成时)→ 延迟分布
 - 整体:launch 内第一条提交到最后一条完成 → IOPS、带宽
 - poller:轮询圈数、每圈耗时、空转比例
@@ -160,6 +168,17 @@ loop:
 
 C1–C3 进 `src/`(替换现有串行 kernel,保留 `-K` 等旧开关的语义);
 不再需要的旧路径删掉,不留两套。
+
+## C1 实现要点(已落地)
+
+- 共享状态和 tag 表放显存(只有 kernel 线程访问,不涉及坑 7);队列、
+  胶囊、recv buffer 在主存
+- 跨线程读写照 Mooncake `maca_ops.cuh`:读前 / 写后 `__threadfence_system()`;
+  锁和领任务用 `atomicCAS`(返回旧值)
+- mlx5 的 RQ 和 SQ 在同一块 buffer 里(RQ 在前),SQ 起点通常不对齐页,
+  两者整段一起 `mcHostRegister`
+- `posted` 取 `io_queue_size`(不超过 RQ wqe_cnt);`rq_tail = head - posted`
+- 结果区分"等到响应"和"NVMe 成功",坑 9 根治
 
 ## 上机前要确认的
 

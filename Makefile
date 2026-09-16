@@ -47,6 +47,7 @@ KVBLOCK    ?= 4718592
 # GPU-initiated 原型:单线程串行发,轮数受 RQ 深度限制
 GPU_ROUNDS ?= 100
 GPU_BS     ?= 4096
+GPU_QD     ?= 1
 GPU_LBA    ?= 0
 # pit7-bench 注册 MR 用的网卡(和 GPU 同 NUMA / PCIe switch 的那张)
 IBDEV      ?= mlx5_1
@@ -233,11 +234,11 @@ run-latency-noker: $(BIN)/latency_baseline
 # 轮数别超过 RQ 深度 —— kernel 不补 recv buffer,超了会死等。
 run-gpu-initiated: $(BIN)/gpu_initiated
 	sudo ./$(BIN)/gpu_initiated -a $(TARGET_IP) -n $(NQN) \
-	     -g $(GPU_ID) -r $(GPU_ROUNDS) -b $(GPU_BS)
+	     -g $(GPU_ID) -r $(GPU_ROUNDS) -b $(GPU_BS) -Q $(GPU_QD)
 
-# 逐块校验。轮数同样受 RQ 深度限制。
+# 逐块校验。I/O 总数目前受已 post 的 recv 数(queue size)限制,C2 解除。
 GI := $(BIN)/gpu_initiated -a $(TARGET_IP) -n $(NQN) -g $(GPU_ID) \
-      -r $(GPU_ROUNDS) -b $(GPU_BS) -L $(GPU_LBA) -S $(SEED)
+      -r $(GPU_ROUNDS) -b $(GPU_BS) -Q $(GPU_QD) -L $(GPU_LBA) -S $(SEED)
 
 run-gpu-read-verify: $(BIN)/gpu_initiated
 	sudo ./$(GI)
