@@ -177,8 +177,12 @@ C1–C3 进 `src/`(替换现有串行 kernel,保留 `-K` 等旧开关的语义);
   锁和领任务用 `atomicCAS`(返回旧值)
 - mlx5 的 RQ 和 SQ 在同一块 buffer 里(RQ 在前),SQ 起点通常不对齐页,
   两者整段一起 `mcHostRegister`
-- `posted` 取 `io_queue_size`(不超过 RQ wqe_cnt);`rq_tail = head - posted`,
-  **在接管快照处读 head**(预写/涂色会推进它,坑 1 同理)
+- `rq_tail = sq_pi`(已消费 recv = 已收响应 = 已发命令),挂着的 recv =
+  `head - sq_pi`,**都在接管快照处读**。不能用 `head - io_queue_size`:SPDK
+  补 recv 是批量延迟 flush 的,最后消费的那个常常没 post 回去,实测挂着
+  127 个而不是 128 个
+- recv buffer 在 DPDK 大页上,映射后先做 GPU/主存逐字节自检,不一致就按
+  2 MiB 对齐重注册
 - **角色按 block 分,不按线程分**:`<<<QD+1, 32>>>`,blockIdx 0 = poller,
   1..QD = submitter,每个 block 只有 thread 0 干活。第一版把角色放在同一
   block 的不同线程里,结果 submitter 独占着空等到超时,poller 一圈没转 ——

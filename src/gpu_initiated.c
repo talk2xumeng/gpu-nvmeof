@@ -57,6 +57,8 @@ extern int gpu_io_run(struct gpu_io_ctx *, unsigned long long,
 extern int gpu_alloc_exportable(void **, int *, size_t);
 extern int gpu_alloc_exportable_ex(void **, int *, size_t, unsigned int);
 extern int gpu_map_host(void *, size_t, unsigned int, void **);
+extern int gpu_unmap_host(void *);
+extern int gpu_peek(void *, unsigned char *, unsigned int);
 extern int gpu_set_dev(int);
 extern int gpu_clock_khz(int, int *);
 extern int gpu_copy_to_host(void *, const void *, size_t);
@@ -247,6 +249,34 @@ static void usage(const char *p)
 }
 
 /*
+ * 核对 host 注册映射:GPU 从 dev 读 len 字节,和主存 host 逐字节比。
+ * 返回不一致的字节数(-1 = kernel 失败),first 带回首个不一致偏移。
+ */
+static long
+map_selftest(void *host, void *dev, size_t len, size_t *first)
+{
+	unsigned char *g = malloc(len);
+	long bad = 0;
+	size_t k;
+
+	*first = len;
+	if (!g || gpu_peek(dev, g, (unsigned)len) != 0) {
+		free(g);
+		return -1;
+	}
+	for (k = 0; k < len; k++) {
+		if (g[k] != ((unsigned char *)host)[k]) {
+			if (bad == 0) {
+				*first = k;
+			}
+			bad++;
+		}
+	}
+	free(g);
+	return bad;
+}
+
+/*
  * 逐块比对并打印。buf 是 n 块连续数据,第 i 块期望 (seed, lba0 + i*nlb)。
  * 返回不一致的块数。
  *
@@ -341,6 +371,8 @@ main(int argc, char **argv)
 	struct spdk_nvme_io_qpair_opts qopts;
 	void *d_rsp = NULL;
 	uint32_t rq_posted = 0;
+	uint64_t rsp_lo = 0, rsp_hi = 0, rsp_gap = 0, rsp_map_base = 0;
+	size_t rsp_map_len = 0;
 	double *us;
 	uint32_t sector, nlb, nblk;
 	int err = 0, clk_khz = 0, op;
@@ -750,6 +782,9 @@ main(int argc, char **argv)
 			return 1;
 		}
 
+		rsp_lo = amin;
+		rsp_hi = amax + 16;
+		rsp_gap = (gap == ~0ULL) ? 0 : gap;
 		base = amin & ~4095ULL;
 		end = (amax + 16 + 4095) & ~4095ULL;
 		if (gpu_map_host((void *)base, end - base,
@@ -760,6 +795,50 @@ main(int argc, char **argv)
 		}
 		printf("[映射] recv buffer 0x%" PRIx64 " +%" PRIu64 " -> %p\n",
 		       base, end - base, d_rsp);
+
+		/*
+		 * 自检:SPDK 的 recv buffer 在 DPDK 大页上。若 mcHostRegister
+		 * 按大页边界对齐了注册范围,返回的设备指针可能不对应我们传入的
+		 * 起点(同坑 6 一类)。不一致就按 2 MiB 对齐重注册再测。
+		 */
+		{
+			size_t first;
+			long bad = map_selftest((void *)base, d_rsp,
+						end - base, &first);
+
+			printf("[映射自检] 4K 对齐注册: 不一致 %ld 字节", bad);
+			if (bad > 0) {
+				printf(" (首个偏移 0x%zx)", first);
+			}
+			printf("\n");
+			if (bad != 0) {
+				uint64_t hb = amin & ~(HUGE_2M - 1);
+				uint64_t he = (amax + 16 + HUGE_2M - 1) &
+					      ~(HUGE_2M - 1);
+				void *d2;
+
+				gpu_unmap_host((void *)base);
+				if (gpu_map_host((void *)hb, he - hb,
+						 MC_HOST_REGISTER_MAPPED,
+						 &d2) != 0) {
+					fprintf(stderr, "按 2 MiB 对齐重注册失败\n");
+					return 1;
+				}
+				d_rsp = (char *)d2 + (base - hb);
+				bad = map_selftest((void *)base, d_rsp,
+						   end - base, &first);
+				printf("[映射自检] 2M 对齐注册 0x%" PRIx64
+				       " +%" PRIu64 " -> %p: 不一致 %ld 字节\n",
+				       hb, he - hb, d2, bad);
+				if (bad != 0) {
+					fprintf(stderr, "recv buffer 的 GPU 视图和主存"
+						"对不上,不能继续\n");
+					return 1;
+				}
+			}
+		}
+		rsp_map_base = base;
+		rsp_map_len = end - base;
 
 		ctx.rq_buf        = (volatile uint8_t *)d_rq;
 		ctx.rq_wqe_cnt    = dvq.rq.wqe_cnt;
@@ -773,11 +852,6 @@ main(int argc, char **argv)
 	 * C1 不补 recv buffer:每条 I/O 的响应消耗一个,总数不能超过已 post 的。
 	 * 超出的那条响应无处安放,表现是超时。
 	 */
-	if (!g_paint && !g_verify && g_rounds > rq_posted) {
-		fprintf(stderr, "-r %u 超过已 post 的 recv 数 %u(C1 尚不补充)\n",
-			g_rounds, rq_posted);
-		return 1;
-	}
 	if (rq_posted < 2) {
 		fprintf(stderr, "已 post 的 recv 数 %u 异常\n", rq_posted);
 		return 1;
@@ -884,9 +958,22 @@ main(int argc, char **argv)
 		 * RQ 的快照也必须在这里拍:上面的预写/涂色会推进 RQ head
 		 * (SPDK 每消费一个 recv 就补一个)。
 		 */
-		ctx.rq_tail = (rq_head - rq_posted) & 0xffff;
-		printf("[接管] SQ pi=%u  CQ ci=%u phase=%u  RQ head=%u tail=%u\n",
-		       sq_pi, cq_ci, ctx.cq_phase, rq_head, ctx.rq_tail);
+		/*
+		 * 已消费的 recv 数 = 已收到的响应数 = 已发的命令数 = sq_pi
+		 * (接管时所有 CPU 侧命令都已完成)。不能用 head - io_queue_size:
+		 * SPDK 补 recv 是批量延迟 flush 的,最后消费的那个常常还没
+		 * post 回去,实际挂着的比 queue size 少一个。
+		 */
+		ctx.rq_tail = sq_pi & 0xffff;
+		rq_posted = (rq_head - sq_pi) & 0xffff;
+		printf("[接管] SQ pi=%u  CQ ci=%u phase=%u  RQ head=%u tail=%u "
+		       "(挂着 %u 个 recv)\n", sq_pi, cq_ci, ctx.cq_phase,
+		       rq_head, ctx.rq_tail, rq_posted);
+		if (g_rounds > rq_posted) {
+			fprintf(stderr, "-r %u 超过挂着的 recv 数 %u(C1 尚不补充)\n",
+				g_rounds, rq_posted);
+			return 1;
+		}
 	}
 
 	/* ---- 跑 ---- */
@@ -947,6 +1034,61 @@ main(int argc, char **argv)
 		}
 		if (ok != g_rounds && !err) {
 			err = -5;
+		}
+	}
+
+	/*
+	 * 响应落在哪块 recv buffer:host 直接扫 rsp 数组找 kernel 的 cid,
+	 * 再从 GPU 视角读同一处核对。只在出了 cid 异常时打印。
+	 */
+	if (sh.cid_bad && rsp_gap) {
+		uint64_t a;
+		unsigned shown = 0;
+
+		printf("[诊断] 主存里 cid 高位为 0x8000 的 recv buffer:\n");
+		for (a = rsp_lo; a + 16 <= rsp_hi; a += rsp_gap) {
+			uint8_t *c = (uint8_t *)a;
+			uint16_t cid = (uint16_t)(c[12] | (c[13] << 8));
+			uint16_t st = (uint16_t)(c[14] | (c[15] << 8));
+
+			if ((cid & GIO_CID_TAG) && shown < 4) {
+				printf("  rsp[%" PRIu64 "] @0x%" PRIx64
+				       " cid=0x%04x status=0x%04x\n",
+				       (a - rsp_lo) / rsp_gap, a, cid, st);
+				shown++;
+			}
+		}
+		if (!shown) {
+			printf("  (没有)\n");
+		}
+		{
+			uint64_t k = ctx.rq_tail & (dvq.rq.wqe_cnt - 1);
+			uint8_t *seg = (uint8_t *)dvq.rq.buf +
+				       (size_t)k * dvq.rq.stride;
+			uint64_t addr;
+			unsigned char g[16];
+			size_t first;
+			long bad;
+			int q;
+
+			memcpy(&addr, seg + 8, 8);
+			addr = be64toh(addr);
+			printf("[诊断] 第 0 条应落在 RQ 槽 %" PRIu64
+			       " -> 0x%" PRIx64 " (rsp[%" PRIu64 "])\n  主存: ",
+			       k, addr, (addr - rsp_lo) / rsp_gap);
+			for (q = 0; q < 16; q++) {
+				printf("%02x ", ((uint8_t *)addr)[q]);
+			}
+			if (gpu_peek((char *)d_rsp + (addr - rsp_map_base),
+				     g, 16) == 0) {
+				printf("\n  GPU : ");
+				for (q = 0; q < 16; q++) {
+					printf("%02x ", g[q]);
+				}
+			}
+			bad = map_selftest((void *)rsp_map_base, d_rsp,
+					   rsp_map_len, &first);
+			printf("\n  运行后映射自检: 不一致 %ld 字节\n", bad);
 		}
 	}
 

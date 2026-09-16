@@ -358,6 +358,21 @@ k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
 	}
 }
 
+/* 从 GPU 视角读一段内存,用来核对 host 注册映射是否对得上 */
+__global__ void
+k_peek(volatile uint8_t *src, uint8_t *dst, uint32_t n)
+{
+	uint32_t i;
+
+	if (threadIdx.x != 0 || blockIdx.x != 0) {
+		return;
+	}
+	__threadfence_system();
+	for (i = 0; i < n; i++) {
+		dst[i] = src[i];
+	}
+}
+
 /* 只敲门铃,用于单独测 MMIO 写的成本 */
 __global__ void
 k_ring_only(volatile uint64_t *bf_reg, uint64_t val, uint32_t n,
@@ -551,6 +566,31 @@ gpu_map_host(void *hptr, size_t len, unsigned int flags, void **dptr)
 		return -1;
 	}
 	return 0;
+}
+
+int
+gpu_peek(void *dev_ptr, unsigned char *out, unsigned int n)
+{
+	uint8_t *d = NULL;
+	int rc = -1;
+
+	if (mcMalloc((void **)&d, n) != mcSuccess) {
+		return -1;
+	}
+	k_peek<<<1, 32>>>((volatile uint8_t *)dev_ptr, d, n);
+	if (mcGetLastError() == mcSuccess &&
+	    mcDeviceSynchronize() == mcSuccess &&
+	    mcMemcpy(out, d, n, mcMemcpyDeviceToHost) == mcSuccess) {
+		rc = 0;
+	}
+	mcFree(d);
+	return rc;
+}
+
+int
+gpu_unmap_host(void *hptr)
+{
+	return mcHostUnregister(hptr) == mcSuccess ? 0 : -1;
 }
 
 int gpu_set_dev(int id)
