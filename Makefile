@@ -266,7 +266,8 @@ $(BIN)/pit7_io_kernel.o: $(PIT7)/pit7_io_kernel.cpp $(PIT7)/pit7_io_ctx.h \
 	$(GPUCC) $(GPUCFLAGS) -I$(PIT7) -c -o $@ $<
 
 $(BIN)/pit7_initiated: $(PIT7)/pit7_initiated.c $(BIN)/pit7_io_kernel.o \
-                       $(PIT7)/pit7_io_ctx.h $(SRC)/blk_pattern.h | $(BIN)
+                       $(PIT7)/pit7_io_ctx.h $(PIT7)/pit7_devx_mkey.h \
+                       $(SRC)/blk_pattern.h | $(BIN)
 	@if [ -z "$(SPDK_LIBS)" ]; then \
 		echo "错误: pkg-config 找不到 SPDK,检查 SPDK_DIR=$(SPDK_DIR)"; exit 1; fi
 	$(CC) $(CFLAGS) -I$(PIT7) -o $@ $(PIT7)/pit7_initiated.c \

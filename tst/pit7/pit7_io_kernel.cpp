@@ -148,6 +148,10 @@ prep_round(struct gpu_io_ctx *c, uint32_t i, uint64_t start_lba, uint64_t *tt)
 		}
 	}
 
+	if (c->fill_mode && c->dev_fence) {
+		__threadfence();
+	}
+
 	tt[1] = clock64();
 
 	/*
@@ -166,6 +170,9 @@ prep_round(struct gpu_io_ctx *c, uint32_t i, uint64_t start_lba, uint64_t *tt)
 			  lba, c->io_bytes / c->sector_size,
 			  blk_addr, c->data_rkey, c->io_bytes);
 
+	if (c->dev_fence) {
+		__threadfence();
+	}
 	tt[2] = clock64();	/* 胶囊耗时 = tt[2] - tt[1] */
 }
 

@@ -34,8 +34,14 @@
  *                          3 = k_prep(写显存)退出 → k_post_poll(门铃+轮询)
  *                          4 = 同 3,两者之间同步
  *   -Z                   轮询每圈 __threadfence_system()(Tutti 的 MACA 写法)
- *   -R <mode>            显存 MR 注册路径:0 = dma-buf(默认),1 = peer_mem
- *                        (ibv_reg_mr 直接传 GPU VA)
+ *   -R <mode>            显存 MR 注册路径:
+ *                          0 = ibv_reg_dmabuf_mr(默认)
+ *                          1 = ibv_reg_mr(GPU VA),peer_mem —— Mooncake IBGDA
+ *                              数据 buffer、MACA perftest 的做法
+ *                          2 = devx umem_reg_ex(DMABUF)+ CREATE_MKEY
+ *                              —— mxshmem IBGDA 队列内存的做法
+ *                          3 = devx umem_reg(GPU VA)+ CREATE_MKEY
+ *   -X                   写完显存后 __threadfence()(IBGDA_MEMBAR 的级别)
  *   -N <ibdev>           -B 注册 MR 用的网卡(默认 mlx5_1)
  *   -D <flag>            数据区用 mcExtMallocWithFlags 分配(默认 0=mcMalloc)
  *   -K                   旧式对照:单块、单字节 pattern、独立 kernel 填充
@@ -66,6 +72,7 @@
 #include <endian.h>
 
 #include "pit7_io_ctx.h"
+#include "pit7_devx_mkey.h"
 #include "blk_pattern.h"
 
 extern int gpu_io_run(struct gpu_io_ctx *, unsigned int, unsigned long long,
@@ -128,6 +135,7 @@ static int	g_bench;		/* -B */
 static int	g_split;		/* -T */
 static int	g_poll_fence;		/* -Z */
 static int	g_reg_mode;		/* -R */
+static int	g_dev_fence;		/* -X */
 static char	g_bench_dev[32] = "mlx5_1";	/* -N */
 static uint64_t	g_start_lba;
 static uint8_t	g_seed = 1;
@@ -172,6 +180,22 @@ reg_gpu_mr(struct ibv_pd *pd, void *va, size_t len, int fd, int acc)
 {
 	struct ibv_mr *mr;
 
+	if (g_reg_mode >= 2) {
+		const char *why;
+
+		mr = pit7_devx_reg_mr(pd, va, len, g_reg_mode == 2 ? fd : -1,
+				      acc & ~IBV_ACCESS_RELAXED_ORDERING, &why);
+		if (!mr) {
+			fprintf(stderr, "[MR] %s 失败: %s (errno=%d %s)\n",
+				g_reg_mode == 2 ? "devx-dmabuf" : "devx-va",
+				why, errno, strerror(errno));
+		} else {
+			printf("[MR] %s  va=%p len=%zu key=0x%x\n",
+			       g_reg_mode == 2 ? "devx-dmabuf" : "devx-va",
+			       va, len, mr->lkey);
+		}
+		return mr;
+	}
 	if (g_reg_mode == 1) {
 		mr = ibv_reg_mr(pd, va, len, acc);
 		if (!mr) {
@@ -310,7 +334,8 @@ static void usage(const char *p)
 	printf("用法: %s -a <ip> -n <nqn> [-g gpu] [-r rounds] [-b bytes]\n"
 	       "      [-L start_lba] [-S seed] [-W 发写] [-I 1|2 kernel 写 payload]\n"
 	       "      [-Y gap_us] [-B 填充微基准] [-T 1..4 拆分 launch] [-Z 轮询 fence]\n"
-	       "      [-R 0|1 MR 注册: dma-buf|peer_mem] [-N ibdev(-B 用)]\n"
+	       "      [-R 0..3 MR 注册: dmabuf|peer|devx-dmabuf|devx-va] [-X]\n"
+	       "      [-N ibdev(-B 用)]\n"
 	       "      [-H 胶囊放显存] [-F cap_flag] [-D data_flag]\n"
 	       "      [-P 涂色] [-V 逐块回读] [-K 旧式单块对照]\n", p);
 }
@@ -365,7 +390,7 @@ static int
 run_bench(int clk_khz, uint32_t bs)
 {
 	static const unsigned flags[3] = { 0, 1, 4 };
-	static const char *rname[3] = { "无", "dmabuf", "peer" };
+	static const char *rname[5] = { "无", "dmabuf", "peer", "devx-db", "devx-va" };
 	static const unsigned modes[4] = { 1, 4, 3, 5 };
 	const unsigned reps = 200;
 	unsigned long long *cyc = calloc(reps, sizeof(*cyc));
@@ -409,7 +434,7 @@ run_bench(int clk_khz, uint32_t bs)
 	}
 
 	printf("\n  ns/字 (p50)          写vol   写plain   读vol   读plain\n");
-	for (rm = 0; rm < 3; rm++) {
+	for (rm = 0; rm < 5; rm++) {
 		if (rm > 0 && !pd) {
 			break;
 		}
@@ -428,14 +453,20 @@ run_bench(int clk_khz, uint32_t bs)
 			}
 			gpu_memset_dev(p, 0, HUGE_2M);
 			gpu_sync();
+			const char *why = "";
+			int devx = rm >= 3;
+
 			if (rm == 1) {
 				mr = ibv_reg_dmabuf_mr(pd, 0, HUGE_2M,
 						       (uint64_t)p, fd, acc);
 			} else if (rm == 2) {
 				mr = ibv_reg_mr(pd, p, HUGE_2M, acc);
+			} else if (devx) {
+				mr = pit7_devx_reg_mr(pd, p, HUGE_2M,
+						      rm == 3 ? fd : -1, acc, &why);
 			}
 			if (rm > 0 && !mr) {
-				printf("注册失败: %s\n", strerror(errno));
+				printf("注册失败: %s %s\n", why, strerror(errno));
 			} else {
 				for (m = 0; m < 4; m++) {
 					if (bench_one(cyc, us, reps, clk_khz,
@@ -447,7 +478,11 @@ run_bench(int clk_khz, uint32_t bs)
 				}
 				printf("\n");
 			}
-			if (mr) ibv_dereg_mr(mr);
+			if (mr && devx) {
+				pit7_devx_dereg_mr(mr);
+			} else if (mr) {
+				ibv_dereg_mr(mr);
+			}
 			if (fd >= 0) close(fd);
 			gpu_free(p);
 		}
@@ -563,7 +598,7 @@ main(int argc, char **argv)
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPVKF:L:S:I:D:Y:BT:ZR:N:")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPVKF:L:S:I:D:Y:BT:ZR:N:X")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -585,6 +620,7 @@ main(int argc, char **argv)
 		case 'T': g_split = atoi(optarg); break;
 		case 'Z': g_poll_fence = 1; break;
 		case 'R': g_reg_mode = atoi(optarg); break;
+		case 'X': g_dev_fence = 1; break;
 		case 'N': snprintf(g_bench_dev, sizeof(g_bench_dev), "%s", optarg); break;
 		case 'D': g_data_flags = (unsigned)strtoul(optarg, NULL, 0); break;
 		default:
@@ -596,8 +632,8 @@ main(int argc, char **argv)
 		usage(argv[0]);
 		return 1;
 	}
-	if (g_reg_mode < 0 || g_reg_mode > 1) {
-		fprintf(stderr, "-R 取 0 或 1\n");
+	if (g_reg_mode < 0 || g_reg_mode > 3) {
+		fprintf(stderr, "-R 取 0..3\n");
 		return 1;
 	}
 	if (g_split < 0 || g_split > 4) {
@@ -884,6 +920,7 @@ main(int argc, char **argv)
 	ctx.fill_mode    = g_fill_in_io == 1;
 	ctx.gap_cycles   = (uint64_t)(g_gap_us * clk_khz / 1000.0);
 	ctx.poll_fence   = (uint8_t)g_poll_fence;
+	ctx.dev_fence    = (uint8_t)g_dev_fence;
 	ctx.seed         = g_seed;
 
 	/*
@@ -1035,7 +1072,12 @@ main(int argc, char **argv)
 		printf(", 轮间空转 %.0f us", g_gap_us);
 	}
 	if (g_reg_mode) {
-		printf(", MR 走 peer_mem");
+		static const char *rn[4] = { "", "peer_mem", "devx-dmabuf",
+					     "devx-va" };
+		printf(", MR 走 %s", rn[g_reg_mode]);
+	}
+	if (g_dev_fence) {
+		printf(", 写显存后 __threadfence()");
 	}
 	if (g_split) {
 		static const char *sm[5] = { "",

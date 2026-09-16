@@ -64,6 +64,12 @@ struct gpu_io_ctx {
 	uint64_t		gap_cycles;
 	/* -Z:轮询每圈做一次 __threadfence_system()(Tutti 的 MACA 写法) */
 	uint8_t			poll_fence;
+	/*
+	 * -X:写完显存(payload / 胶囊)后做一次 __threadfence()。
+	 * mxshmem IBGDA 的 IBGDA_MEMBAR 用的就是这一级 —— 它的队列在显存。
+	 * 我们的 SQ/CQ 在主存,那边仍用 system 级;这里只加在写显存之后。
+	 */
+	uint8_t			dev_fence;
 };
 
 #endif /* PIT7_IO_CTX_H */

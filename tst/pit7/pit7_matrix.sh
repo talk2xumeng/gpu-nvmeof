@@ -96,13 +96,23 @@ case "$MATRIX" in
 	run_write "Q3H 同 Q3 + 胶囊也在普通显存"    -I 1 -D 0 -T 3 -H -F 0
 	;;
 3)
-	# 第三轮:MR 注册路径会不会改变坑 7。全部单 kernel、无同步
-	run_read  "G0 peer_mem 自检:主存胶囊"          -R 1
-	run_read  "G1 dma-buf,普通显存胶囊(=R0)"      -H -F 0
-	run_read  "G2 peer_mem,普通显存胶囊"           -H -F 0 -R 1
-	run_write "G3 dma-buf,kernel写payload"         -I 1 -D 0
-	run_write "G4 peer_mem,kernel写payload"        -I 1 -D 0 -R 1
-	run_write "G5 peer_mem,payload+胶囊都在普通显存" -I 1 -D 0 -H -F 0 -R 1
+	# 第三轮:MR 注册路径 / fence 级别会不会改变坑 7。全部单 kernel、无同步
+	#   -R 1 peer_mem (Mooncake IBGDA 数据 buffer)
+	#   -R 2 devx umem DMABUF + mkey (mxshmem IBGDA 队列)
+	#   -R 3 devx umem VA + mkey
+	#   -X   写显存后 __threadfence()
+	run_read  "S1 自检 -R 1 (主存胶囊)"   -R 1
+	run_read  "S2 自检 -R 2 (主存胶囊)"   -R 2
+	run_read  "S3 自检 -R 3 (主存胶囊)"   -R 3
+	run_read  "G0 胶囊普通显存 dmabuf-MR(=R0)" -H -F 0
+	run_read  "G1 胶囊普通显存 -R 1"      -H -F 0 -R 1
+	run_read  "G2 胶囊普通显存 -R 2"      -H -F 0 -R 2
+	run_read  "G3 胶囊普通显存 -R 3"      -H -F 0 -R 3
+	run_read  "G4 胶囊普通显存 -X"        -H -F 0 -X
+	run_read  "G5 胶囊普通显存 -R 2 -X"   -H -F 0 -R 2 -X
+	run_write "H1 kernel写payload -R 1"    -I 1 -D 0 -R 1
+	run_write "H2 kernel写payload -R 2"    -I 1 -D 0 -R 2
+	run_write "H3 kernel写payload -R 2 -X" -I 1 -D 0 -R 2 -X
 	;;
 esac
 

@@ -66,36 +66,52 @@ poll 之后的同步才可见,poll 会死等 —— 而它实测可用,所以**�
 3. 驱动组提供 kernel 内 flush 原语 —— 现在能给出明确证据:同步能刷新,
    kernel 退出 / fence / sleep 不能
 
-## 第三轮(待跑):MR 注册路径
+## 第三轮(待跑):MR 注册路径 / fence 级别
 
-uncached 的代价主要在读(见下方 bench:写 ×1.5,读 ×1.9)。而 Tutti(snvme
-P2P pin)和 mxshmem IBGDA 的注册方式都和我们(dma-buf)不同,它们不需要
-显式同步。假设:**注册路径决定了这段显存走不走 cached 模式。**
+uncached 的代价主要在读(见下方 bench:写 ×1.5,读 ×1.9)。而两份
+IBGDA 实现都能让 kernel 普通写入的显存被网卡读到,且不需要显式同步,
+它们与我们的差别:
 
-`-R 1` 把显存 MR 换成 peer_mem(`ibv_reg_mr` 直接传 GPU VA),全部单
-kernel、无同步:
+| | 我们 | Mooncake EP IBGDA | mxshmem IBGDA |
+|---|---|---|---|
+| 数据 buffer 注册 | `ibv_reg_dmabuf_mr` | **`ibv_reg_mr`(peer_mem)** | — |
+| 网卡队列内存注册 | (队列在主存) | devx umem(DMABUF 或 GPU VA) | **devx `umem_reg_ex` + DMABUF**,失败回退 VA |
+| 写入 | 普通 store | — | `WRITE_ONCE` |
+| 写后 fence | `__threadfence_system()` | — | **`__threadfence()`** |
+
+来源:Mooncake `mooncake-transfer-engine/src/transport/device/
+ibgda_device_transport.cpp`(`registerMemory` / control region);
+mxshmem `src/transport/ibgda/mlx5/ibgda_mlx5.cpp:322-352`、
+`IBGDA_MEMBAR()`。MACA 版 perftest 也只链了 `ibv_reg_mr`(peer_mem,
+`/sys/kernel/mm/memory_peers/mxcd`)。
+
+`-R 2/3` 用 devx umem 注册后再发 `CREATE_MKEY` 包成 mkey,SPDK 建的
+标准 QP 在同一 PD 下可直接用(`pit7_devx_mkey.h`,字段布局照 DPDK
+`mlx5_prm.h` / `mlx5_devx_cmd_mkey_create()`;Mooncake 那份 `mlx5_ifc.h`
+缺 `mkey_umem_id`)。
 
 | 用例 | 配置 | 判读 |
 |---|---|---|
-| G0 | peer_mem,主存胶囊 | 自检:peer_mem 路径本身能用 |
-| G1 | dma-buf,普通显存胶囊 | = R0,应 100 `R` |
-| G2 | peer_mem,普通显存胶囊 | **全 `.` → 注册路径绕开了坑 7** |
-| G3 | dma-buf,kernel 写 payload | 应 100 `S` |
-| G4 | peer_mem,kernel 写 payload | 同 G2 |
-| G5 | peer_mem,胶囊和 payload 都在普通显存 | 全程普通 `mcMalloc`,无同步 |
+| S1–S3 | 主存胶囊,`-R 1/2/3` | 自检:该注册路径作 DMA target 正常 |
+| G0 | 普通显存胶囊,dma-buf MR | 基线,应 100 `R` |
+| G1 | + `-R 1` | 全 `.` → peer_mem 绕开坑 7 |
+| G2 / G3 | + `-R 2` / `-R 3` | 全 `.` → devx umem 绕开坑 7 |
+| G4 | + `-X` | 全 `.` → 缺的是 thread 级 fence |
+| G5 | + `-R 2 -X` | 完整的 mxshmem 组合 |
+| H1–H3 | kernel 写 payload,`-R 1` / `-R 2` / `-R 2 -X` | payload 上同样判读 |
 
-`make pit7-bench` 同时测"注册之后"的访存代价(无 / dma-buf / peer ×
-flag 0/1/4)。若 peer_mem 让 flag 0 的读写变得和 flag 4 一样慢,说明它是
-通过切到 uncached 生效的,代价与选项 2 相同;若访存代价不变而 G2 成功,
-就是最理想的结果。
+`make pit7-bench` 同时测"注册之后"的访存代价(无 / dmabuf / peer /
+devx-dmabuf / devx-va × flag 0/1/4)。若某条路径让 flag 0 的读写变得
+和 flag 4 一样慢,说明它是通过切到 uncached 生效的,代价与选项 2 相同;
+若访存代价不变而 G 系列成功,就是最理想的结果。volatile / 普通指针
+两列用于判断 152 ns/字这个异常慢的 store 是不是 volatile 访存语义造成的。
 
-还有 volatile / 普通指针两列:判断 152 ns/字这个异常慢的 store 是不是
-volatile 访存语义造成的(真正的 attention kernel 不会这么访存)。
+S2/S3 失败时看打印的 `CREATE_MKEY status/syndrome` 或 `umem_reg` 的
+errno;devx 需要 root,且 dma-buf fd 的 offset 0 必须就是注册起点(坑 6)。
 
 ## 待做
 
 - `make pit7-matrix`(第三轮)+ `make pit7-bench`(注册路径 × 分配 flag)
-- 若 peer_mem 无效:照 mxshmem IBGDA 的注册方式再加一条路径
 - Tutti 侧:确认 SQ ring 的实际分配 flag / P2P 注册后的内存属性
 - `-I 1` 下等待从 5 µs 爬到 14 µs 的原因(`-Y` 空转对照)
 
@@ -130,7 +146,8 @@ $G -S 38 -V                            # ... 另起进程回读
 | `-T 4` | 同上,两个 kernel 之间同步 |
 | `-Z` | 轮询每圈 `__threadfence_system()`(Tutti 的 MACA 写法) |
 | `-Y <us>` | 每轮发命令前空转,不访存 |
-| `-R 0\|1` | 显存 MR 注册:dma-buf(默认)/ peer_mem |
+| `-R 0..3` | 显存 MR 注册:dma-buf(默认)/ peer_mem / devx umem DMABUF + mkey / devx umem VA + mkey |
+| `-X` | 写完显存(payload、胶囊)后 `__threadfence()` |
 | `-N <ibdev>` | `-B` 注册 MR 用的网卡 |
 | `-B` | 填充微基准:只算 / 只写 / 算+写 / 只读 × flag 0/1/4 |
 
