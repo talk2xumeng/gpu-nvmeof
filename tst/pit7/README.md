@@ -12,59 +12,65 @@ host 侧 `pit7_initiated.c`、kernel `pit7_io_kernel.cpp`、上下文
 读到的是旧值。这对 PD 分离是硬约束:KV block 由 attention kernel 写出,
 随后要交给网卡发走。
 
-## 已有结论
+## 结论
+
+> kernel 写普通显存,**只有 host 调 `mcDeviceSynchronize()` 之后**才对网卡
+> 可见。kernel 内的 fence、sleep,kernel 退出,新的 launch,都不触发刷新。
 
 | 现象 | 证据 |
 |---|---|
-| 同一 kernel 内,写入对网卡**始终不可见** | R0 / R3 / W2 全失败;历史上门铃前 sleep 1 µs~1 ms 无效 |
-| `__threadfence_system()` 不触发回写,每圈 fence 也不行 | R3 = R0,W2 = 100 `S` |
-| 不是竞态,是确定性的 | 100/100 块一致失败;单 kernel 跑 ~0.8 ms 后复用槽位仍读到全零 |
-| 写入 kernel 退出(或随后的设备同步)之后,内容可见 | R1/R2/R4 块图见下 |
-| uncached 分配(flag 1 / 4)可以绕开 | payload 100/100 正确,但 4 KiB 填充贵 ~35% |
-| Tutti(本地 NVMe,C500)同样把门铃放在写入 kernel 内,实测可用 | 推测是 SSD 取 SQE 晚于 kernel 退出,赢了竞态;未验证 |
+| 同一 kernel 内始终不可见 | R0 / R3 / W2;历史上门铃前 sleep 1 µs~1 ms 无效 |
+| 每圈 `__threadfence_system()` 无效 | R3 = R0,W2 = 100 `S` |
+| 写入 kernel 退出、另一个 kernel 敲门铃,仍不可见 | P3 / Q3 |
+| 两个 kernel 之间插 `mcDeviceSynchronize`,可见 | P4 / Q4 全 `.` |
+| 确定性,不是竞态 | 所有失败用例块图完全可预测 |
+| uncached 分配(flag 1 / 4)可以绕开 | payload 100/100 正确,4 KiB 填充贵 ~35% |
 
-R1/R2/R4(门铃在写入 kernel 内部,之后退出)的块图:
+块图的解读(R1/R2/R4/P3 相同):
 
 ```
 ....................................RRRRRRRRRRRRRRRRRRRRRRRRRRRR
 RRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRRR
 ```
 
-胶囊槽位按 `i & 0x3f` 复用。第 0–63 轮首次用槽位,网卡读到初始的全零
-→ 全 `R`;第 64–99 轮复用槽位 0–35,网卡读到的是**已经刷下去的**第 0–35
-轮胶囊,于是执行了"读 LBA 0–35 到块 0–35" → 块 0–35 正确。
-R0(单 kernel 从不退出)是 100 `R`:复用槽位时读到的仍是全零。
+胶囊槽位按 `i & 0x3f` 复用。第 0–63 轮首次用槽位,网卡读到初始全零,
+命令非法 → 全 `R`。每轮末尾的 host 同步把本轮胶囊刷下去;第 64–99 轮
+复用槽位 0–35 时,网卡读到的是这些**已刷下去的旧胶囊**,执行了"读 LBA
+0–35 到块 0–35" → 块 0–35 正确。R0(单 kernel,期间无同步)是 100 `R`。
 
-R1 每轮 poll 之后还有一次 host 同步,所以"刷新点是 kernel 退出还是
-设备同步"第一轮分不开 —— 第二轮的 P3 专门回答这个。
+Q3H(胶囊和 payload 都在普通显存)是 36 `.` + 64 `C`:前 64 轮命令非法,
+盘上保持涂色;后 36 轮执行旧胶囊,对应的旧 payload 也已刷下,所以写对了。
 
-## 待验证(第二轮,`make pit7-matrix`)
+**读失败用例的延迟时注意**:非法命令被 target 快速拒绝,P3/Q3H 的
+"等待" p50 只有 2.2 µs,不是真实 I/O。
 
-把门铃挪到写入 kernel **退出之后**的另一个 kernel,不依赖竞态:
+### 代价
 
-| 用例 | 配置 | 判读 |
-|---|---|---|
-| C3 | 主存胶囊,`-T 3` | 自检,必须全 `.` |
-| P3 | 普通显存胶囊,写 \| 门铃,中间不同步 | **全 `.` → kernel 退出即刷新点** |
-| P4 | 同上,中间同步 | 对照 |
-| Q3 | kernel 写 payload,写 \| 门铃 | 生产形态 |
-| Q4 | 同上,中间同步 | 对照 |
-| Q3H | 同 Q3,胶囊也在普通显存 | 全程普通 `mcMalloc` |
+同步本身约 13 µs/轮:P4 host 墙钟 67 µs vs C3 54 µs;Q4 235 µs vs W1 222 µs。
 
-- P3/Q3 成功:正式方案是"写显存的 kernel"与"敲门铃的 kernel"分开,
-  不需要 uncached,不需要 host 同步,代价是每批一次 launch
-- P3 失败、P4 成功:刷新点在设备同步,每批要付一次同步
-- 都失败:与 debug-notes 里"拆 kernel + 同步有效"矛盾,先查拆分实现
+### 对 Tutti 的推论
 
-结果出来后:结论回填到本文件和 `docs/debug-notes.md` 坑 7,
-正式机制在 `src/` 里按正式代码实现。
+P3 否定了"SSD 取 SQE 晚于 kernel 退出"。按上述模型,Tutti 的 SQE 要到
+poll 之后的同步才可见,poll 会死等 —— 而它实测可用,所以**它那条路的
+内存本身不受这个缓存影响**。最可能是 snvme 对显存做 P2P pin/映射后,
+这段内存进入了 uncached / PCIe 映射模式,相当于我们的 flag 4
+`MapPcieDefault`。待在 Tutti 侧确认(cu-bridge 的 `cudaMalloc` 实际 flag,
+或 snvme 注册前后的内存属性)。
 
-## Tutti 侧建议的反向实验
+### 生产形态的选项
 
-在 `snvme_smoke_gpu.cu` 里把 `k_poll_one` 的轮询并进 `k_submit_rw`
-(敲完门铃不退出,原地轮询)。按上面的模型,SSD 应读到旧 SQE,表现为
-cid 不匹配或超时。若仍然成功,说明 snvme 的 P2P 映射和 dma-buf MR
-不是同一类页,值得单独查。
+1. 批量流水线:attention kernel → `mcDeviceSynchronize` → 发送 kernel。
+   每批一次同步,host 每批参与一次调用,不碰数据
+2. 面向网卡的 buffer 用 uncached 分配:无需同步;写贵 ~35%,**读代价
+   未测**(`make pit7-bench`),attention 读 KV 对此敏感
+3. 驱动组提供 kernel 内 flush 原语 —— 现在能给出明确证据:同步能刷新,
+   kernel 退出 / fence / sleep 不能
+
+## 待做
+
+- `make pit7-bench`:uncached 的读/写代价,决定选项 1 还是 2
+- Tutti 侧:确认 SQ ring 的实际分配 flag / P2P 注册后的内存属性
+- `-I 1` 下等待从 5 µs 爬到 14 µs 的原因(`-Y` 空转对照)
 
 ## 复现
 
@@ -129,3 +135,14 @@ $G -S 38 -V                            # ... 另起进程回读
 
 `-I 1` 下等待从第 4~8 轮起由 5 µs 爬到 14 µs,每圈轮询 640→900 ns,
 uncached 下同样出现(所以不是 L2 积压)。原因未查,`-Y` 空转对照待跑。
+
+### 第二轮(2026-09-16,4 KiB × 100,真盘)
+
+| 用例 | 配置 | 块图 | 总计 p50 | 等待 p50 | host 墙钟 p50 |
+|---|---|---|---|---|---|
+| C3 | 主存胶囊 `-T 3` | 100 `.` | 17.8 | 12.0 | 54 |
+| P3 | 普通显存胶囊,写 \| 门铃 | 36 `.` 64 `R` | 8.5 | 2.2 | 41 |
+| P4 | 普通显存胶囊,写 \| 同步 \| 门铃 | 100 `.` | 19.4 | 13.5 | 67 |
+| Q3 | kernel 写 payload,写 \| 门铃 | 100 `S` | 132.6 | 11.3 | 319 |
+| Q4 | kernel 写 payload,写 \| 同步 \| 门铃 | 100 `.` | 132.9 | 11.9 | 235 |
+| Q3H | Q3 + 普通显存胶囊 | 36 `.` 64 `C` | 125.7 | 2.2 | 214 |

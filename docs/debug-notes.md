@@ -135,6 +135,17 @@ mcExtMallocWithFlags(&ptr, len, flag);   /* 而不是 mcMalloc */
 胶囊就让每轮往返从 ~50 µs 涨到 ~110 µs(p50)。MB 级的 payload
 必须走普通 `mcMalloc`,否则带宽没法看。
 
+### 刷新点是 host 同步(`tst/pit7` 定论)
+
+写入只有在 host 调 `mcDeviceSynchronize()` 之后才对网卡可见。
+kernel 内 fence(含每圈 fence)、sleep、kernel 退出、新的 launch 都不行。
+上面"拆 kernel + 设备同步"之所以有效,起作用的是同步,不是拆 kernel。
+
+Tutti(本地 NVMe,C500 实测可用)的 SQ ring 是普通 `cudaMalloc`,
+kernel 写 SQE 后在同一 kernel 里敲门铃。按上述模型它不该工作,推测是
+snvme 的 P2P 映射让那段显存进入了 uncached 模式,不是时序原因。
+实验、块图解读、生产形态选项见 `tst/pit7/README.md`。
+
 ## 坑 6:MACA 的 dma-buf 导出粒度
 
 `mcMemGetHandleForAddressRange` 导出的 dma-buf,**offset 0 是底层分配的
