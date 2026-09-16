@@ -199,6 +199,20 @@ target 拒掉的命令照样 `完成 N/N`,dbrec 增量也全对,只有数据没�
   "NVMe 成功";status SCT=0 SC=0x02(Invalid Field)多半就是这个
 - 以前 `gds_nvmeof` 的 1 MiB 数据,底层同样是 128 KiB 一段发的
 
+## 坑 10:并发角色不能放在同一个 block 的不同线程里
+
+C1 第一版:`<<<1, 32>>>`,thread 0 当 poller、thread 1 当 submitter。
+结果 submitter 发出第一条命令后空等 1.25 s 超时,poller 才开始跑 ——
+**一圈、命中一次**就看到 abort 退出了,而 CQ 里 SEND 完成和响应都早已
+躺着。
+
+同一 block 的线程锁步执行,分支不同时被串行化。一个线程在自旋等
+另一个线程,就等于死等。改成一个角色一个 block(`<<<QD+1, 32>>>`,
+按 blockIdx 分角色,每个 block 只有 thread 0 干活)。
+
+判据:poller 的轮询圈数极小、submitter 报等待超时、CQ 里有没被消费的
+有效 CQE。
+
 ## 有用的观测手段
 
 **target 侧**(SPDK 需 `./configure --enable-debug` 重编):

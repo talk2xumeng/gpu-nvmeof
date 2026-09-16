@@ -381,8 +381,8 @@ main(int argc, char **argv)
 		fprintf(stderr, "-b 必须是 8 的倍数,-r 必须 > 0\n");
 		return 1;
 	}
-	if (g_qd == 0 || g_qd > 255) {
-		fprintf(stderr, "-Q 取 1..255\n");
+	if (g_qd == 0 || g_qd > 127) {
+		fprintf(stderr, "-Q 取 1..127\n");
 		return 1;
 	}
 	if (g_qd > g_rounds) {
@@ -736,7 +736,7 @@ main(int argc, char **argv)
 			}
 			prev = addr;
 		}
-		printf("[RQ] wqe_cnt=%u stride=%u head=%u posted=%u "
+		printf("[RQ] wqe_cnt=%u stride=%u head(准备前)=%u posted=%u "
 		       "(io_queue_size=%u) lkey=0x%x 异常槽=%u\n",
 		       dvq.rq.wqe_cnt, dvq.rq.stride, head, rq_posted,
 		       qopts.io_queue_size, lkey0, bad);
@@ -764,7 +764,6 @@ main(int argc, char **argv)
 		ctx.rq_buf        = (volatile uint8_t *)d_rq;
 		ctx.rq_wqe_cnt    = dvq.rq.wqe_cnt;
 		ctx.rq_stride     = dvq.rq.stride;
-		ctx.rq_tail       = (head - rq_posted) & 0xffff;
 		ctx.rsp_host_base = base;
 		ctx.rsp_len       = end - base;
 		ctx.rsp_dev       = (volatile uint8_t *)d_rsp;
@@ -876,11 +875,18 @@ main(int argc, char **argv)
 		uint32_t sq_pi = be32toh(qdb[1]) & 0xffff;
 		uint32_t cq_ci = be32toh(cdb[0]) & 0xffffff;
 
+		uint32_t rq_head = be32toh(qdb[0]) & 0xffff;
+
 		ctx.sq_pi = (uint16_t)sq_pi;
 		ctx.cq_ci = cq_ci;
 		ctx.cq_phase = (uint8_t)((cq_ci / dvc.cqe_cnt) & 1);
-		printf("[接管] SQ pi=%u  CQ ci=%u phase=%u\n",
-		       sq_pi, cq_ci, ctx.cq_phase);
+		/*
+		 * RQ 的快照也必须在这里拍:上面的预写/涂色会推进 RQ head
+		 * (SPDK 每消费一个 recv 就补一个)。
+		 */
+		ctx.rq_tail = (rq_head - rq_posted) & 0xffff;
+		printf("[接管] SQ pi=%u  CQ ci=%u phase=%u  RQ head=%u tail=%u\n",
+		       sq_pi, cq_ci, ctx.cq_phase, rq_head, ctx.rq_tail);
 	}
 
 	/* ---- 跑 ---- */
@@ -1055,7 +1061,8 @@ main(int argc, char **argv)
 	printf("[结果] 完成 %u / %u", done, g_rounds);
 	if (err) {
 		printf(", 错误码 %d (%s)", err,
-		       err == GIO_E_TIMEOUT ? "超时" :
+		       err == GIO_E_TIMEOUT ? "poller 等不到新 CQE" :
+		       err == GIO_E_WAIT ? "submitter 等不到自己的完成" :
 		       err == GIO_E_CQE ? "CQE 报错" :
 		       err == GIO_E_CID ? "响应 cid 对不上" :
 		       err == GIO_E_RSP_ADDR ? "recv buffer 地址越界" :

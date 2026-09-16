@@ -1,12 +1,17 @@
 /*
  * gpu_io_kernel.cpp  --  kernel 内完成 NVMe-oF 读写的全流程
  *
- * 稳态下 CPU 完全不参与。一次 launch,QD + 1 个线程:
+ * 稳态下 CPU 完全不参与。一次 launch,QD + 1 个 block,每个 block 只有
+ * thread 0 干活,角色由 blockIdx 决定:
  *
- *   thread 0      poller:独占 CQ。收 RESP → 从 recv buffer 读出 cid 和
+ *   block 0       poller:独占 CQ。收 RESP → 从 recv buffer 读出 cid 和
  *                 NVMe status → 按 cid 找到 tag,置完成
- *   thread 1..QD  submitter:领任务 → 写胶囊 → 抢锁写 WQE/dbrec/门铃 →
+ *   block 1..QD   submitter:领任务 → 写胶囊 → 抢锁写 WQE/dbrec/门铃 →
  *                 等自己的 tag 完成
+ *
+ * 角色不能放在同一个 block 的不同线程里:同一 block 的线程锁步执行,
+ * 分支不同时会被串行化 —— submitter 会独占着空等到超时,poller 一圈
+ * 都转不了。
  *
  * 设计见 docs/concurrency-design.md。WQE / 胶囊布局在 wqe_build.h,
  * 已和 SPDK 实际提交的逐字节比对过。
@@ -312,7 +317,7 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 				break;
 			}
 			if (clock64() - t2 > GIO_TIMEOUT) {
-				set_abort(sh, GIO_E_TIMEOUT);
+				set_abort(sh, GIO_E_WAIT);
 				break;
 			}
 		}
@@ -340,9 +345,9 @@ k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
 	 uint64_t *c_wait, uint64_t *c_spin, uint64_t *c_lock,
 	 uint32_t *c_stat)
 {
-	uint32_t t = threadIdx.x;
+	uint32_t t = blockIdx.x;
 
-	if (blockIdx.x != 0 || t > ctx.qd) {
+	if (threadIdx.x != 0 || t > ctx.qd) {
 		return;
 	}
 	if (t == 0) {
@@ -414,18 +419,9 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	struct gio_tag *d_tags = NULL;
 	size_t sz = ctx->njobs * sizeof(uint64_t);
 	size_t tsz = ctx->qd * sizeof(struct gio_tag);
-	unsigned int nthr = 32;
+	unsigned int nblk = ctx->qd + 1;	/* block 0 = poller */
 	mcError_t e;
 	int rc = -1;
-
-	while (nthr < ctx->qd + 1) {
-		nthr <<= 1;
-	}
-	if (nthr > 256) {
-		fprintf(stderr, "QD %u 太大(单 block 最多 255 个 submitter)\n",
-			ctx->qd);
-		return -1;
-	}
 
 	if (mcMalloc((void **)&d_cap, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_sub, sz) != mcSuccess ||
@@ -446,8 +442,8 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	mcMemset(d_stat, 0xff, ctx->njobs * sizeof(uint32_t));
 	mcDeviceSynchronize();
 
-	k_gpu_io<<<1, nthr>>>(*ctx, d_sh, d_tags, start_lba, d_cap, d_sub,
-			      d_wait, d_spin, d_lock, d_stat);
+	k_gpu_io<<<nblk, 32>>>(*ctx, d_sh, d_tags, start_lba, d_cap, d_sub,
+			       d_wait, d_spin, d_lock, d_stat);
 
 	e = mcGetLastError();
 	if (e != mcSuccess) {

@@ -27,11 +27,11 @@ recv buffer,从而:
 
 ## 线程模型
 
-一次 launch,`QD + 1` 个线程:
+一次 launch,`QD + 1` 个 block(每个 block 只用 thread 0):
 
 ```
-thread 0          poller:独占 CQ 和 RQ
-thread 1..QD      submitter:每个线程同一时刻只有一条 I/O 在飞
+block 0           poller:独占 CQ 和 RQ
+block 1..QD       submitter:每个 block 同一时刻只有一条 I/O 在飞
 ```
 
 - QD 就是 submitter 线程数,天然受控,不需要额外的 in-flight 计数
@@ -177,7 +177,12 @@ C1–C3 进 `src/`(替换现有串行 kernel,保留 `-K` 等旧开关的语义);
   锁和领任务用 `atomicCAS`(返回旧值)
 - mlx5 的 RQ 和 SQ 在同一块 buffer 里(RQ 在前),SQ 起点通常不对齐页,
   两者整段一起 `mcHostRegister`
-- `posted` 取 `io_queue_size`(不超过 RQ wqe_cnt);`rq_tail = head - posted`
+- `posted` 取 `io_queue_size`(不超过 RQ wqe_cnt);`rq_tail = head - posted`,
+  **在接管快照处读 head**(预写/涂色会推进它,坑 1 同理)
+- **角色按 block 分,不按线程分**:`<<<QD+1, 32>>>`,blockIdx 0 = poller,
+  1..QD = submitter,每个 block 只有 thread 0 干活。第一版把角色放在同一
+  block 的不同线程里,结果 submitter 独占着空等到超时,poller 一圈没转 ——
+  同一 block 的线程锁步执行,分支不同时被串行化
 - 结果区分"等到响应"和"NVMe 成功",坑 9 根治
 
 ## 上机前要确认的

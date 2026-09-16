@@ -103,9 +103,10 @@ struct gio_tag {
 #define GIO_CID_TAG	0x8000u		/* kernel 的 cid = 0x8000 | tag,和 SPDK 的 0..N-1 分开 */
 
 /* kernel 错误码 */
-#define GIO_E_TIMEOUT	(-1)
+#define GIO_E_TIMEOUT	(-1)		/* poller 长时间没有新 CQE */
 #define GIO_E_CQE	(-2)
 #define GIO_E_CID	(-3)
 #define GIO_E_RSP_ADDR	(-4)
+#define GIO_E_WAIT	(-6)		/* submitter 等自己的完成超时 */
 
 #endif /* GPU_IO_CTX_H */
