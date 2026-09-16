@@ -81,6 +81,7 @@ docs/
   NVMeoF-GPU验证手册.md
   status.md           GPU-initiated 现状与差距
   debug-notes.md      GPU-initiated 排查笔记(先读这个)
+  concurrency-design.md  并发提交 + RQ 自持设计
 scripts/
 ```
 

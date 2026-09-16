@@ -174,7 +174,7 @@ kernel 算出来的。如果 attention 和发送在同一个 kernel 里、中间
    上写入要到 host `mcDeviceSynchronize` 后才对网卡可见，拆 kernel 本身无效。
    生产形态二选一：批量「写 kernel → 同步 → 发送 kernel」，或网卡侧 buffer
    用 uncached 分配；取决于 `make pit7-bench` 测出的 uncached 读写代价
-3. **并发提交** —— 有了 1 和 2 才好验证正确性
+3. **并发提交** —— 进行中，设计见 `docs/concurrency-design.md`
 4. **RQ 自持** —— 和 3 一起做，否则轮数上不去
 5. CQ 进显存 —— 延迟优化，可以晚做
 6. 错误恢复 —— 交付前
