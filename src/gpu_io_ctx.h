@@ -84,6 +84,8 @@ struct gio_shared {
 	uint32_t	resp_inline;	/* poller:scatter-to-CQE 的响应数 */
 	uint64_t	poll_spins;	/* poller */
 	uint64_t	poll_hits;	/* poller:读到有效 CQE 的圈数 */
+	uint64_t	poll_cycles;	/* poller:自己时钟下的总运行时间 */
+	uint64_t	resp_cycles;	/* poller:处理响应(handle_resp)的总耗时 */
 };
 
 /* 每个 tag(= submitter 线程)一项,放显存 */
@@ -93,6 +95,13 @@ struct gio_tag {
 	uint16_t	status;		/* poller:NVMe status 字(含 phase tag 位) */
 	uint16_t	rsvd;
 	uint32_t	rsvd2;
+	/*
+	 * 等待拆分(诊断)。clock64() 可能是每个 block 各自的计数,跨 block
+	 * 相减的结果若离谱,说明不能这么比。
+	 */
+	uint64_t	t_post;		/* submitter:门铃后 */
+	uint64_t	det;		/* poller:发现响应时 now - t_post */
+	uint64_t	t_done;		/* poller:置完成之后 */
 };
 
 #define GIO_ST_IDLE	0

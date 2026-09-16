@@ -132,6 +132,13 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		return;
 	}
 
+	{
+		uint64_t tp;
+
+		__threadfence_system();
+		tp = tags[tag].t_post;
+		tags[tag].det = clock64() - tp;
+	}
 	st_rel16(&tags[tag].status, status);
 	if ((status >> 1) != 0) {
 		if (sh->nvme_err == 0) {
@@ -142,6 +149,8 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	} else {
 		st_rel32(&tags[tag].state, GIO_ST_DONE);
 	}
+	tags[tag].t_done = clock64();
+	__threadfence_system();
 	st_rel32(&sh->done_cnt, sh->done_cnt + 1);
 }
 
@@ -151,8 +160,9 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 	uint32_t ci = c->cq_ci;
 	uint8_t phase = c->cq_phase;
 	uint32_t seq = 0;
-	uint64_t spins = 0, hits = 0;
+	uint64_t spins = 0, hits = 0, rcyc = 0;
 	uint64_t idle_since = clock64();
+	uint64_t pstart = idle_since;
 
 	for (;;) {
 		uint32_t idx = ci & (c->cq_cnt - 1);
@@ -188,9 +198,12 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 			uint16_t wc = (uint16_t)((cqe[c->cqe_size - 4] << 8) |
 						 cqe[c->cqe_size - 3]);
 
+			uint64_t r0 = clock64();
+
 			st_rel32(&sh->cqe_resp, sh->cqe_resp + 1);
 			handle_resp(c, sh, tags, cqe + (c->cqe_size - 64),
 				    op_own, wc, seq);
+			rcyc += clock64() - r0;
 			seq++;
 		} else if (opcode == MLX5_CQE_REQ) {
 			st_rel32(&sh->cqe_req, sh->cqe_req + 1);
@@ -218,6 +231,8 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 	}
 	sh->poll_spins = spins;
 	sh->poll_hits = hits;
+	sh->poll_cycles = clock64() - pstart;
+	sh->resp_cycles = rcyc;
 }
 
 /* ================================================================== */
@@ -296,7 +311,7 @@ __device__ static void
 submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	  uint32_t tag, uint64_t start_lba, uint64_t *c_cap, uint64_t *c_sub,
 	  uint64_t *c_wait, uint64_t *c_spin, uint64_t *c_lock,
-	  uint32_t *c_stat)
+	  uint32_t *c_stat, uint64_t *c_det, uint64_t *c_hand)
 {
 	volatile uint8_t *cap = c->capsule + (size_t)tag * 64;
 	uint64_t cap_addr = c->capsule_addr + (uint64_t)tag * 64;
@@ -324,6 +339,8 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		post_locked(c, sh, cap_addr);
 		sq_unlock(sh);
 		t2 = clock64();
+		tags[tag].t_post = t2;
+		__threadfence_system();
 
 		for (;;) {
 			spins++;
@@ -340,6 +357,14 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 			}
 		}
 		t3 = clock64();
+		if (st >= GIO_ST_DONE) {
+			uint64_t td;
+
+			__threadfence_system();
+			td = tags[tag].t_done;
+			c_det[j] = tags[tag].det;
+			c_hand[j] = t3 - td;
+		}
 
 		c_cap[j]  = t1 - t0;	/* 写 64 字节胶囊 */
 		c_sub[j]  = t2 - t1;	/* 抢锁 + WQE + dbrec + 门铃 */
@@ -361,7 +386,7 @@ __global__ void
 k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
 	 uint64_t start_lba, uint64_t *c_cap, uint64_t *c_sub,
 	 uint64_t *c_wait, uint64_t *c_spin, uint64_t *c_lock,
-	 uint32_t *c_stat)
+	 uint32_t *c_stat, uint64_t *c_det, uint64_t *c_hand)
 {
 	uint32_t t = blockIdx.x;
 
@@ -372,7 +397,7 @@ k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
 		poller(&ctx, sh, tags);
 	} else {
 		submitter(&ctx, sh, tags, t - 1, start_lba, c_cap, c_sub,
-			  c_wait, c_spin, c_lock, c_stat);
+			  c_wait, c_spin, c_lock, c_stat, c_det, c_hand);
 	}
 }
 
@@ -443,10 +468,12 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	   unsigned long long *host_cap, unsigned long long *host_sub,
 	   unsigned long long *host_wait, unsigned long long *host_spin,
 	   unsigned long long *host_lock, unsigned int *host_stat,
+	   unsigned long long *host_det, unsigned long long *host_hand,
 	   struct gio_shared *sh_out)
 {
 	uint64_t *d_cap = NULL, *d_sub = NULL, *d_wait = NULL;
 	uint64_t *d_spin = NULL, *d_lock = NULL;
+	uint64_t *d_det = NULL, *d_hand = NULL;
 	uint32_t *d_stat = NULL;
 	struct gio_shared *d_sh = NULL, sh0;
 	struct gio_tag *d_tags = NULL;
@@ -461,6 +488,8 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	    mcMalloc((void **)&d_wait, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_spin, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_lock, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_det, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_hand, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_stat, ctx->njobs * sizeof(uint32_t)) != mcSuccess ||
 	    mcMalloc((void **)&d_sh, sizeof(*d_sh)) != mcSuccess ||
 	    mcMalloc((void **)&d_tags, tsz) != mcSuccess) {
@@ -475,8 +504,12 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	mcMemset(d_stat, 0xff, ctx->njobs * sizeof(uint32_t));
 	mcDeviceSynchronize();
 
+	mcMemset(d_det, 0, sz);
+	mcMemset(d_hand, 0, sz);
+	mcDeviceSynchronize();
+
 	k_gpu_io<<<nblk, 32>>>(*ctx, d_sh, d_tags, start_lba, d_cap, d_sub,
-			       d_wait, d_spin, d_lock, d_stat);
+			       d_wait, d_spin, d_lock, d_stat, d_det, d_hand);
 
 	e = mcGetLastError();
 	if (e != mcSuccess) {
@@ -494,6 +527,8 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	mcMemcpy(host_wait, d_wait, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_spin, d_spin, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_lock, d_lock, sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_det, d_det, sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_hand, d_hand, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_stat, d_stat, ctx->njobs * sizeof(uint32_t),
 		 mcMemcpyDeviceToHost);
 	mcMemcpy(sh_out, d_sh, sizeof(*sh_out), mcMemcpyDeviceToHost);
@@ -504,6 +539,8 @@ out:
 	if (d_wait) mcFree(d_wait);
 	if (d_spin) mcFree(d_spin);
 	if (d_lock) mcFree(d_lock);
+	if (d_det)  mcFree(d_det);
+	if (d_hand) mcFree(d_hand);
 	if (d_stat) mcFree(d_stat);
 	if (d_sh)   mcFree(d_sh);
 	if (d_tags) mcFree(d_tags);

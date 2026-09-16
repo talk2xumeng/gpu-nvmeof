@@ -53,6 +53,7 @@ extern int gpu_io_run(struct gpu_io_ctx *, unsigned long long,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned int *,
+		      unsigned long long *, unsigned long long *,
 		      struct gio_shared *);
 extern int gpu_alloc_exportable(void **, int *, size_t);
 extern int gpu_alloc_exportable_ex(void **, int *, size_t, unsigned int);
@@ -416,6 +417,7 @@ main(int argc, char **argv)
 	struct gpu_io_ctx ctx;
 	unsigned long long *cycles, *c_cap, *c_sub, *c_wait, *c_spin, *c_lock;
 	unsigned int *c_stat;
+	unsigned long long *c_det, *c_hand;
 	struct gio_shared sh;
 	struct spdk_nvme_io_qpair_opts qopts;
 	void *d_rsp = NULL;
@@ -980,13 +982,15 @@ main(int argc, char **argv)
 	c_spin = calloc(g_rounds, sizeof(*c_spin));
 	c_lock = calloc(g_rounds, sizeof(*c_lock));
 	c_stat = calloc(g_rounds, sizeof(*c_stat));
+	c_det  = calloc(g_rounds, sizeof(*c_det));
+	c_hand = calloc(g_rounds, sizeof(*c_hand));
 	us = calloc(g_rounds, sizeof(*us));
 	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u, %s\n",
 	       g_write ? "WRITE" : "READ", g_rounds, g_io_bytes, g_qd,
 	       ctx.data_step ? "每条一块" : "单块复用");
 
 	if (gpu_io_run(&ctx, g_start_lba, c_cap, c_sub, c_wait, c_spin,
-		       c_lock, c_stat, &sh) != 0) {
+		       c_lock, c_stat, c_det, c_hand, &sh) != 0) {
 		fprintf(stderr, "kernel 执行失败\n");
 		return 1;
 	}
@@ -1329,6 +1333,53 @@ main(int argc, char **argv)
 				if (c_lock[i] > lmax) lmax = c_lock[i];
 			}
 			printf("\n  锁自旋: mean %llu  max %llu", lsum / done, lmax);
+
+		/*
+		 * 等待拆分:门铃 → poller 发现(poller 时钟减 submitter 时钟),
+		 * poller 置完成 → submitter 看到(反过来)。两者之和应接近"等待"。
+		 * 时钟若不能跨 block 比较,这里会出现离谱的值。
+		 */
+		{
+			double *dv = calloc(done, sizeof(*dv));
+			double *hv = calloc(done, sizeof(*hv));
+			unsigned m = 0, weird = 0;
+			double ps = clk_khz / 1000.0;
+
+			for (i = 0; i < g_rounds; i++) {
+				if (c_stat[i] == 0xffffffffu) {
+					continue;
+				}
+				if (c_det[i] > (1ULL << 40) ||
+				    c_hand[i] > (1ULL << 40)) {
+					weird++;
+					continue;
+				}
+				dv[m] = c_det[i] / ps;
+				hv[m] = c_hand[i] / ps;
+				m++;
+			}
+			if (m) {
+				qsort(dv, m, sizeof(double), cmp_d);
+				qsort(hv, m, sizeof(double), cmp_d);
+				printf("\n  等待拆分(us, p50/p90): 门铃→poller 发现 "
+				       "%.1f/%.1f   poller 置完成→submitter 看到 "
+				       "%.1f/%.1f", dv[m / 2],
+				       dv[(unsigned)(m * 0.9)], hv[m / 2],
+				       hv[(unsigned)(m * 0.9)]);
+			}
+			if (weird) {
+				printf("\n  等待拆分:%u 条值离谱 —— 时钟可能不能跨 "
+				       "block 比较", weird);
+			}
+			free(dv);
+			free(hv);
+		}
+		if (sh.poll_spins) {
+			printf("\n  poller: 每圈 %.0f ns, 处理一条响应 %.0f ns",
+			       sh.poll_cycles * 1e6 / clk_khz / sh.poll_spins,
+			       sh.cqe_resp ? sh.resp_cycles * 1e6 / clk_khz /
+					     sh.cqe_resp : 0.0);
+		}
 			printf("\n  等待圈数: mean %llu  min %llu  max %llu",
 			       ssum / done, smin, smax);
 			if (ssum) {
