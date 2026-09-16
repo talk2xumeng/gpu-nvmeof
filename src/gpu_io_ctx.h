@@ -49,8 +49,8 @@ struct gpu_io_ctx {
 	uint32_t		njobs;		/* 本次 launch 的 I/O 总数 */
 
 	/*
-	 * RQ 和 recv buffer。响应胶囊落在 SPDK 预先 post 的 recv buffer 里
-	 * (spdk_nvme_rdma_rsp.cpl,16 字节),poller 靠它拿 cid 和 NVMe status。
+	 * RQ 和 recv buffer。响应胶囊通常内联在 CQE 里(scatter-to-CQE,坑 11);
+	 * 否则落在 SPDK 预先 post 的 recv buffer(spdk_nvme_rdma_rsp.cpl)。
 	 * RESP CQE 的 wqe_counter 是 RQ 消费计数,& (rq_wqe_cnt-1) 即槽位。
 	 */
 	volatile uint8_t	*rq_buf;
@@ -81,7 +81,7 @@ struct gio_shared {
 	uint32_t	cqe_req;	/* poller:SEND 完成数 */
 	uint32_t	cqe_resp;	/* poller:响应数 */
 	uint32_t	err_cqe;	/* poller:错误 CQE 的 (vendor << 8) | syndrome */
-	uint32_t	rsvd;
+	uint32_t	resp_inline;	/* poller:scatter-to-CQE 的响应数 */
 	uint64_t	poll_spins;	/* poller */
 	uint64_t	poll_hits;	/* poller:读到有效 CQE 的圈数 */
 };

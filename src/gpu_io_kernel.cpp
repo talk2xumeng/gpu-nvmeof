@@ -70,7 +70,14 @@ set_abort(struct gio_shared *sh, int err)
 /* ================================================================== */
 
 /*
- * 处理一个 RESP_SEND:定位 recv buffer → 读 NVMe CQE → 置 tag 完成。
+ * 处理一个 RESP_SEND:取到响应胶囊 → 读 NVMe CQE → 置 tag 完成。
+ *
+ * 响应胶囊在哪(见 rdma-core providers/mlx5/cq.c handle_responder):
+ *   op_own & 0x4  MLX5_INLINE_SCATTER_32:数据就在本条 cqe64 的开头
+ *   op_own & 0x8  MLX5_INLINE_SCATTER_64:数据在 cqe64 前面那 64 字节
+ *   否则          网卡 DMA 写进了 RQ 槽指向的 recv buffer
+ * scatter-to-CQE 时网卡不写 recv buffer,是 libmlx5 在 poll_cq 里拷过去的
+ * —— kernel 绕过 libmlx5,所以必须直接读 CQE。坑 11。
  *
  * NVMe CQE(16 字节,小端):
  *   [12..13] cid
@@ -78,30 +85,40 @@ set_abort(struct gio_shared *sh, int err)
  */
 __device__ static void
 handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
-	    uint16_t wqe_counter, uint32_t seq)
+	    volatile uint8_t *cqe64, uint8_t op_own, uint16_t wqe_counter,
+	    uint32_t seq)
 {
-	uint32_t k = wqe_counter & (c->rq_wqe_cnt - 1);
-	volatile uint8_t *seg = c->rq_buf + (size_t)k * c->rq_stride;
-	uint64_t addr = 0;
 	volatile uint8_t *cpl;
 	uint16_t cid, status;
 	uint32_t tag;
-	int b;
 
 	if (((c->rq_tail + seq) & 0xffff) != wqe_counter) {
 		st_rel32(&sh->wc_mismatch, sh->wc_mismatch + 1);
 	}
 
-	/* mlx5_wqe_data_seg:byte_count(4) lkey(4) addr(8),大端 */
-	for (b = 0; b < 8; b++) {
-		addr = (addr << 8) | seg[8 + b];
+	if (op_own & 0x4) {
+		cpl = cqe64;
+		st_rel32(&sh->resp_inline, sh->resp_inline + 1);
+	} else if (op_own & 0x8) {
+		cpl = cqe64 - 64;
+		st_rel32(&sh->resp_inline, sh->resp_inline + 1);
+	} else {
+		uint32_t k = wqe_counter & (c->rq_wqe_cnt - 1);
+		volatile uint8_t *seg = c->rq_buf + (size_t)k * c->rq_stride;
+		uint64_t addr = 0;
+		int b;
+
+		/* mlx5_wqe_data_seg:byte_count(4) lkey(4) addr(8),大端 */
+		for (b = 0; b < 8; b++) {
+			addr = (addr << 8) | seg[8 + b];
+		}
+		if (c->rsp_len == 0 || addr < c->rsp_host_base ||
+		    addr + 16 > c->rsp_host_base + c->rsp_len) {
+			set_abort(sh, GIO_E_RSP_ADDR);
+			return;
+		}
+		cpl = c->rsp_dev + (addr - c->rsp_host_base);
 	}
-	if (addr < c->rsp_host_base ||
-	    addr + 16 > c->rsp_host_base + c->rsp_len) {
-		set_abort(sh, GIO_E_RSP_ADDR);
-		return;
-	}
-	cpl = c->rsp_dev + (addr - c->rsp_host_base);
 	cid = (uint16_t)(cpl[12] | ((uint16_t)cpl[13] << 8));
 	status = (uint16_t)(cpl[14] | ((uint16_t)cpl[15] << 8));
 
@@ -172,7 +189,8 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 						 cqe[c->cqe_size - 3]);
 
 			st_rel32(&sh->cqe_resp, sh->cqe_resp + 1);
-			handle_resp(c, sh, tags, wc, seq);
+			handle_resp(c, sh, tags, cqe + (c->cqe_size - 64),
+				    op_own, wc, seq);
 			seq++;
 		} else if (opcode == MLX5_CQE_REQ) {
 			st_rel32(&sh->cqe_req, sh->cqe_req + 1);

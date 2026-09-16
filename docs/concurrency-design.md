@@ -109,8 +109,9 @@ loop:
       RESP_SEND:
           k    = wqe_counter & rq_mask         ← RESP 的 wqe_counter 是 RQ 消费计数;
                                                   同时和顺序推算核对
-          seg  = RQ[k] 的 data seg → addr
-          cpl  = rsp 设备映射[addr - rsp_host_base]
+          cpl  = op_own & 0x4 ? CQE 开头                ← scatter-to-CQE(坑 11,实际总是)
+               : op_own & 0x8 ? CQE 前 64 字节
+               : rsp 设备映射[RQ[k].addr - rsp_host_base]
           cid  = cpl[12..13];  status = cpl[14..15]   ← 小端
           tag  = cid & 0x7fff                         ← 校验高位是 0x8000
           NVMe 出错 = (status >> 1) != 0              ← bit0 是 phase tag
@@ -128,7 +129,8 @@ loop:
   消费后网卡不清。处理完响应后把同一段原样写到 head,等于把这块
   buffer 还回去。RQ 只靠 dbrec 推进,不用敲门铃。
 - 接管时 `rq_head = be32(dbrec[RQ])`,`rq_tail = rq_head - num_entries`。
-- 必须**先读完 cpl 再重新 post**,否则 buffer 可能被下一条响应覆盖。
+- 必须**先读完 cpl 再重新 post**,否则 buffer 可能被下一条响应覆盖
+  (内联时无此问题,数据在 CQE 里)。
 
 ## 校验
 
@@ -181,8 +183,10 @@ C1–C3 进 `src/`(替换现有串行 kernel,保留 `-K` 等旧开关的语义);
   `head - sq_pi`,**都在接管快照处读**。不能用 `head - io_queue_size`:SPDK
   补 recv 是批量延迟 flush 的,最后消费的那个常常没 post 回去,实测挂着
   127 个而不是 128 个
-- recv buffer 在 DPDK 大页上,映射后先做 GPU/主存逐字节自检,不一致就按
-  2 MiB 对齐重注册
+- **响应内联在 CQE 里**(mlx5 scatter-to-CQE,坑 11),网卡不写 recv
+  buffer。kernel 按 `op_own` 的 0x4/0x8 直接读 CQE;recv buffer 映射只是
+  兜底(DPDK 大页,映射后自检,不一致按 2 MiB 对齐重注册,仍失败则放弃)
+- 因此 C2 的 RQ 自持不需要关心 buffer 内容,只需把槽原样重新 post
 - **角色按 block 分,不按线程分**:`<<<QD+1, 32>>>`,blockIdx 0 = poller,
   1..QD = submitter,每个 block 只有 thread 0 干活。第一版把角色放在同一
   block 的不同线程里,结果 submitter 独占着空等到超时,poller 一圈没转 ——

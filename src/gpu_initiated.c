@@ -277,6 +277,55 @@ map_selftest(void *host, void *dev, size_t len, size_t *first)
 }
 
 /*
+ * 把 SPDK 的 recv buffer 映射给 GPU,返回设备指针;失败返回 NULL。
+ *
+ * 响应一般内联在 CQE 里(坑 11),recv buffer 只是兜底 —— 失败不致命,
+ * 只是碰到非内联响应时 kernel 会报 -4。
+ *
+ * recv buffer 在 DPDK 大页上。若 mcHostRegister 按大页边界对齐了注册
+ * 范围,返回的设备指针可能不对应传入的起点(同坑 6 一类),所以映射后
+ * 做 GPU/主存逐字节自检,不一致就按 2 MiB 对齐重注册再测。
+ */
+static void *
+map_recv_buffers(uint64_t base, uint64_t end, uint64_t lo, uint64_t hi)
+{
+	uint64_t hb = lo & ~(HUGE_2M - 1);
+	uint64_t he = (hi + HUGE_2M - 1) & ~(HUGE_2M - 1);
+	void *d, *d2;
+	size_t first;
+	long bad;
+
+	if (gpu_map_host((void *)base, end - base,
+			 MC_HOST_REGISTER_MAPPED, &d) != 0) {
+		printf("[映射] recv buffer 映射失败,只支持 CQE 内联响应\n");
+		return NULL;
+	}
+	bad = map_selftest((void *)base, d, end - base, &first);
+	printf("[映射] recv buffer 0x%" PRIx64 " +%" PRIu64 " -> %p,"
+	       "自检不一致 %ld 字节\n", base, end - base, d, bad);
+	if (bad == 0) {
+		return d;
+	}
+
+	gpu_unmap_host((void *)base);
+	if (gpu_map_host((void *)hb, he - hb, MC_HOST_REGISTER_MAPPED,
+			 &d2) != 0) {
+		printf("[映射] 按 2 MiB 对齐重注册失败,只支持 CQE 内联响应\n");
+		return NULL;
+	}
+	d = (char *)d2 + (base - hb);
+	bad = map_selftest((void *)base, d, end - base, &first);
+	printf("[映射] 按 2 MiB 对齐重注册 0x%" PRIx64 " -> %p,"
+	       "自检不一致 %ld 字节\n", hb, d2, bad);
+	if (bad != 0) {
+		printf("[映射] recv buffer 的 GPU 视图和主存对不上,"
+		       "只支持 CQE 内联响应\n");
+		return NULL;
+	}
+	return d;
+}
+
+/*
  * 逐块比对并打印。buf 是 n 块连续数据,第 i 块期望 (seed, lba0 + i*nlb)。
  * 返回不一致的块数。
  *
@@ -785,62 +834,13 @@ main(int argc, char **argv)
 		rsp_gap = (gap == ~0ULL) ? 0 : gap;
 		base = amin & ~4095ULL;
 		end = (amax + 16 + 4095) & ~4095ULL;
-		if (gpu_map_host((void *)base, end - base,
-				 MC_HOST_REGISTER_MAPPED, &d_rsp) != 0) {
-			fprintf(stderr, "recv buffer 映射给 GPU 失败(SPDK 大页)。\n"
-				"见 docs/concurrency-design.md「上机前要确认的」第 2 条\n");
-			return 1;
-		}
-		printf("[映射] recv buffer 0x%" PRIx64 " +%" PRIu64 " -> %p\n",
-		       base, end - base, d_rsp);
-
-		/*
-		 * 自检:SPDK 的 recv buffer 在 DPDK 大页上。若 mcHostRegister
-		 * 按大页边界对齐了注册范围,返回的设备指针可能不对应我们传入的
-		 * 起点(同坑 6 一类)。不一致就按 2 MiB 对齐重注册再测。
-		 */
-		{
-			size_t first;
-			long bad = map_selftest((void *)base, d_rsp,
-						end - base, &first);
-
-			printf("[映射自检] 4K 对齐注册: 不一致 %ld 字节", bad);
-			if (bad > 0) {
-				printf(" (首个偏移 0x%zx)", first);
-			}
-			printf("\n");
-			if (bad != 0) {
-				uint64_t hb = amin & ~(HUGE_2M - 1);
-				uint64_t he = (amax + 16 + HUGE_2M - 1) &
-					      ~(HUGE_2M - 1);
-				void *d2;
-
-				gpu_unmap_host((void *)base);
-				if (gpu_map_host((void *)hb, he - hb,
-						 MC_HOST_REGISTER_MAPPED,
-						 &d2) != 0) {
-					fprintf(stderr, "按 2 MiB 对齐重注册失败\n");
-					return 1;
-				}
-				d_rsp = (char *)d2 + (base - hb);
-				bad = map_selftest((void *)base, d_rsp,
-						   end - base, &first);
-				printf("[映射自检] 2M 对齐注册 0x%" PRIx64
-				       " +%" PRIu64 " -> %p: 不一致 %ld 字节\n",
-				       hb, he - hb, d2, bad);
-				if (bad != 0) {
-					fprintf(stderr, "recv buffer 的 GPU 视图和主存"
-						"对不上,不能继续\n");
-					return 1;
-				}
-			}
-		}
+		d_rsp = map_recv_buffers(base, end, amin, amax + 16);
 
 		ctx.rq_buf        = (volatile uint8_t *)d_rq;
 		ctx.rq_wqe_cnt    = dvq.rq.wqe_cnt;
 		ctx.rq_stride     = dvq.rq.stride;
 		ctx.rsp_host_base = base;
-		ctx.rsp_len       = end - base;
+		ctx.rsp_len       = d_rsp ? end - base : 0;
 		ctx.rsp_dev       = (volatile uint8_t *)d_rsp;
 	}
 
@@ -1021,8 +1021,10 @@ main(int argc, char **argv)
 		if (sh.cid_bad) {
 			printf(" (首个 0x%04x)", sh.first_bad_cid);
 		}
-		printf(";wqe_counter 不连续 %u;轮询 %llu 圈, 命中 %llu\n",
-		       sh.wc_mismatch, (unsigned long long)sh.poll_spins,
+		printf(";wqe_counter 不连续 %u;响应内联在 CQE %u/%u"
+		       ";轮询 %llu 圈, 命中 %llu\n",
+		       sh.wc_mismatch, sh.resp_inline, sh.cqe_resp,
+		       (unsigned long long)sh.poll_spins,
 		       (unsigned long long)sh.poll_hits);
 		if (sh.err_cqe) {
 			printf("[poller] 错误 CQE syndrome=0x%02x vendor=0x%02x\n",

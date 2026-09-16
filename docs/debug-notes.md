@@ -213,6 +213,31 @@ C1 第一版:`<<<1, 32>>>`,thread 0 当 poller、thread 1 当 submitter。
 判据:poller 的轮询圈数极小、submitter 报等待超时、CQ 里有没被消费的
 有效 CQE。
 
+## 坑 11:小响应内联在 CQE 里,网卡根本不写 recv buffer
+
+C1 的 poller 按 `wqe_counter` 找到 RQ 槽、读 recv buffer 里的 NVMe
+CQE,读出来全零;整个 2 MiB 大页里都找不到 kernel 的 cid。映射自检
+一致,`wqe_counter` 也对得上 —— 响应就在 **CQE 本身的前 16 字节**:
+
+```
+00 00 00 00 | 00 00 00 00 | 67 00 | 00 00 | 00 80 | 00 00
+  cdw0          cdw1        sqhd    sqid    cid     status
+```
+
+这是 mlx5 的 scatter-to-CQE:`op_own & 0x4`(`MLX5_INLINE_SCATTER_32`)
+表示 ≤32 字节的接收数据放在 cqe64 开头,`0x8`(`_64`)表示放在 cqe64
+前面那 64 字节。网卡不 DMA 写 recv buffer,是 **libmlx5 在 `poll_cq` 里
+拷过去的**(rdma-core `providers/mlx5/cq.c` `handle_responder` →
+`mlx5_copy_to_recv_wqe`)。SPDK 看得到是因为它走 libmlx5;kernel 绕过
+libmlx5,就没人拷。
+
+- kernel 先看 `op_own` 的 0x4/0x8,有就直接读 CQE;没有才去 recv buffer
+- `op_own=0x24` 这种值不是"owner 位怪",是 opcode 2 + INLINE_SCATTER_32
+- NVMe 的响应永远是 16 字节,所以实际总是内联。recv buffer 映射(DPDK
+  大页)保留成兜底,失败不致命
+- 顺带确认:RQ 槽 = `wqe_counter & (wqe_cnt-1)`,和 rdma-core 一致;
+  槽里的 buffer 并不是按 `rsp[k]` 顺序排的,不要依赖这个
+
 ## 有用的观测手段
 
 **target 侧**(SPDK 需 `./configure --enable-debug` 重编):
