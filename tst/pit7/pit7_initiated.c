@@ -762,6 +762,25 @@ main(int argc, char **argv)
 		return 1;
 	}
 
+	/*
+	 * kernel 一次发一条 keyed SGL,不会像 SPDK 主机驱动那样按最大传输
+	 * 长度自动拆分。超过 target 的 max_io_size,命令会被拒,而 kernel
+	 * 目前不看响应里的 NVMe 状态 —— 表现为"完成 N/N"但数据一块没动。
+	 * 见 debug-notes 坑 9。-P/-V 走 SPDK 路径,会自动拆,不受限。
+	 */
+	if (!g_paint && !g_verify) {
+		uint32_t mx = spdk_nvme_ctrlr_get_max_xfer_size(g_ctrlr);
+
+		if (g_io_bytes > mx) {
+			fprintf(stderr,
+				"-b %u 超过控制器最大传输长度 %u。\n"
+				"target 需要更大的 max_io_size,例如:\n"
+				"  rpc.py nvmf_create_transport -t RDMA -c 512 "
+				"-u 131072 -i 1048576\n", g_io_bytes, mx);
+			return 1;
+		}
+	}
+
 	/* ---- -P / -V:纯 CPU 路径,做完就退。范围 [L, L+r) ---- */
 	if (g_paint || g_verify) {
 		void *b = spdk_dma_zmalloc(g_io_bytes, 4096, NULL);

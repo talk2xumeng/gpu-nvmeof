@@ -181,6 +181,23 @@ Invalid NVMf I/O Command SGL:  Type 0xa, Subtype 0xa
 块图字符:`.` 一致,`R` 0xBB 未落地,`C` 0xCC 未写,`W` 0x5A 旧式,
 `Z` 全零,`F` 其他单字节,`X` 串块,`O` 残留,`?` 乱码。
 
+## 坑 9:kernel 不看 NVMe 状态,被拒的命令也算"完成"
+
+kernel 目前只认"收到一个 RESP_SEND",不读响应胶囊里的 NVMe status。
+target 拒掉的命令照样 `完成 N/N`,dbrec 增量也全对,只有数据没动
+(读是 `R`,写是 `C`),而且"等待"异常短。
+
+实例:1 MiB I/O,target `max_io_size` 默认 128 KiB。CPU 路径(预写、
+涂色、`-V`)全成功 —— SPDK 主机驱动按最大传输长度**自动拆分**;kernel
+发的是单条 1 MiB keyed SGL,直接被拒。线索是接管时 `SQ pi=809`:
+100 块 × 8 段 + 预热 8 段 + 1,每块被拆成了 8 条。
+
+- 现在 host 侧会检查 `spdk_nvme_ctrlr_get_max_xfer_size`,超了直接退出
+- target 要测大块:`nvmf_create_transport -t RDMA -c 512 -u 131072 -i 1048576`
+  (`io_unit_size` 必须 ≥ `max_io_size / 16`)
+- 根治:kernel 读响应胶囊里的 status(并发设计 C1 会做)
+- 以前 `gds_nvmeof` 的 1 MiB 数据,底层同样是 128 KiB 一段发的
+
 ## 有用的观测手段
 
 **target 侧**(SPDK 需 `./configure --enable-debug` 重编):
