@@ -371,8 +371,7 @@ main(int argc, char **argv)
 	struct spdk_nvme_io_qpair_opts qopts;
 	void *d_rsp = NULL;
 	uint32_t rq_posted = 0;
-	uint64_t rsp_lo = 0, rsp_hi = 0, rsp_gap = 0, rsp_map_base = 0;
-	size_t rsp_map_len = 0;
+	uint64_t rsp_lo = 0, rsp_gap = 0;
 	double *us;
 	uint32_t sector, nlb, nblk;
 	int err = 0, clk_khz = 0, op;
@@ -783,7 +782,6 @@ main(int argc, char **argv)
 		}
 
 		rsp_lo = amin;
-		rsp_hi = amax + 16;
 		rsp_gap = (gap == ~0ULL) ? 0 : gap;
 		base = amin & ~4095ULL;
 		end = (amax + 16 + 4095) & ~4095ULL;
@@ -837,8 +835,6 @@ main(int argc, char **argv)
 				}
 			}
 		}
-		rsp_map_base = base;
-		rsp_map_len = end - base;
 
 		ctx.rq_buf        = (volatile uint8_t *)d_rq;
 		ctx.rq_wqe_cnt    = dvq.rq.wqe_cnt;
@@ -1042,53 +1038,88 @@ main(int argc, char **argv)
 	 * 再从 GPU 视角读同一处核对。只在出了 cid 异常时打印。
 	 */
 	if (sh.cid_bad && rsp_gap) {
-		uint64_t a;
+		uint64_t hb = rsp_lo & ~(HUGE_2M - 1);
+		uint64_t a2;
+		uint32_t k, mask = dvq.rq.wqe_cnt - 1;
 		unsigned shown = 0;
+		unsigned *seen = calloc(512, sizeof(*seen));
 
-		printf("[诊断] 主存里 cid 高位为 0x8000 的 recv buffer:\n");
-		for (a = rsp_lo; a + 16 <= rsp_hi; a += rsp_gap) {
-			uint8_t *c = (uint8_t *)a;
+		/* ① 整个 2 MiB 大页里找 kernel 的响应:cid 高位 0x8000、sqid=1 */
+		printf("[诊断] 大页 0x%" PRIx64 " 内 cid&0x8000 且 sqid=1 的记录:\n",
+		       hb);
+		for (a2 = hb; a2 + 16 <= hb + HUGE_2M; a2 += 8) {
+			uint8_t *c = (uint8_t *)a2;
+			uint16_t sqid = (uint16_t)(c[10] | (c[11] << 8));
 			uint16_t cid = (uint16_t)(c[12] | (c[13] << 8));
-			uint16_t st = (uint16_t)(c[14] | (c[15] << 8));
 
-			if ((cid & GIO_CID_TAG) && shown < 4) {
-				printf("  rsp[%" PRIu64 "] @0x%" PRIx64
-				       " cid=0x%04x status=0x%04x\n",
-				       (a - rsp_lo) / rsp_gap, a, cid, st);
+			if (sqid == 1 && (cid & 0xff00) == 0x8000 && shown < 6) {
+				printf("  @0x%" PRIx64 " (相对 rsp 起点 %+" PRId64
+				       ") cid=0x%04x status=0x%04x sqhd=%u\n",
+				       a2, (int64_t)(a2 - rsp_lo), cid,
+				       (unsigned)(c[14] | (c[15] << 8)),
+				       (unsigned)(c[8] | (c[9] << 8)));
 				shown++;
 			}
 		}
 		if (!shown) {
 			printf("  (没有)\n");
 		}
-		{
-			uint64_t k = ctx.rq_tail & (dvq.rq.wqe_cnt - 1);
+
+		/* ② 128 个槽 -> rsp 下标(相对最小地址 / 间隔) */
+		printf("[诊断] RQ 槽 -> rsp 下标 (tail=%u, 槽 %u 起):\n  ",
+		       ctx.rq_tail, ctx.rq_tail & mask);
+		for (k = 0; k < dvq.rq.wqe_cnt; k++) {
 			uint8_t *seg = (uint8_t *)dvq.rq.buf +
 				       (size_t)k * dvq.rq.stride;
 			uint64_t addr;
-			unsigned char g[16];
-			size_t first;
-			long bad;
-			int q;
+			int64_t idx;
 
 			memcpy(&addr, seg + 8, 8);
 			addr = be64toh(addr);
-			printf("[诊断] 第 0 条应落在 RQ 槽 %" PRIu64
-			       " -> 0x%" PRIx64 " (rsp[%" PRIu64 "])\n  主存: ",
-			       k, addr, (addr - rsp_lo) / rsp_gap);
-			for (q = 0; q < 16; q++) {
-				printf("%02x ", ((uint8_t *)addr)[q]);
+			idx = (int64_t)(addr - rsp_lo) / (int64_t)rsp_gap;
+			printf("%3" PRId64 "%s", idx,
+			       k == (ctx.rq_tail & mask) ? "*" : " ");
+			if (idx >= 0 && idx < 512) {
+				seen[idx]++;
 			}
-			if (gpu_peek((char *)d_rsp + (addr - rsp_map_base),
-				     g, 16) == 0) {
-				printf("\n  GPU : ");
-				for (q = 0; q < 16; q++) {
-					printf("%02x ", g[q]);
-				}
+			if (k % 16 == 15) {
+				printf("\n  ");
 			}
-			bad = map_selftest((void *)rsp_map_base, d_rsp,
-					   rsp_map_len, &first);
-			printf("\n  运行后映射自检: 不一致 %ld 字节\n", bad);
+		}
+		printf("\n  重复的下标:");
+		for (k = 0; k < 512; k++) {
+			if (seen[k] > 1) {
+				printf(" %u(x%u)", k, seen[k]);
+			}
+		}
+		printf("  缺的下标(0..%u):", dvq.rq.wqe_cnt - 1);
+		for (k = 0; k < dvq.rq.wqe_cnt; k++) {
+			if (!seen[k]) {
+				printf(" %u", k);
+			}
+		}
+		printf("\n");
+		free(seen);
+
+		/* ③ 响应 CQE 全量(cqe64:byte_cnt @44,大端) */
+		for (k = 0; k < 2; k++) {
+			uint32_t idx = (ctx.cq_ci + k) & (dvc.cqe_cnt - 1);
+			uint8_t *c = (uint8_t *)dvc.buf +
+				     (size_t)idx * dvc.cqe_size;
+			uint32_t base = dvc.cqe_size - 64, q;
+
+			if ((c[dvc.cqe_size - 1] >> 4) != 2) {
+				continue;
+			}
+			printf("[诊断] RESP CQE[%u] byte_cnt=%u:\n  ", idx,
+			       (unsigned)((c[base + 44] << 24) |
+					  (c[base + 45] << 16) |
+					  (c[base + 46] << 8) | c[base + 47]));
+			for (q = 0; q < 64; q++) {
+				printf("%02x%s", c[base + q],
+				       q % 16 == 15 ? "\n  " : " ");
+			}
+			printf("\n");
 		}
 	}
 
