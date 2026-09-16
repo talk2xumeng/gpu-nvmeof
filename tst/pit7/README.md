@@ -66,9 +66,36 @@ poll 之后的同步才可见,poll 会死等 —— 而它实测可用,所以**�
 3. 驱动组提供 kernel 内 flush 原语 —— 现在能给出明确证据:同步能刷新,
    kernel 退出 / fence / sleep 不能
 
+## 第三轮(待跑):MR 注册路径
+
+uncached 的代价主要在读(见下方 bench:写 ×1.5,读 ×1.9)。而 Tutti(snvme
+P2P pin)和 mxshmem IBGDA 的注册方式都和我们(dma-buf)不同,它们不需要
+显式同步。假设:**注册路径决定了这段显存走不走 cached 模式。**
+
+`-R 1` 把显存 MR 换成 peer_mem(`ibv_reg_mr` 直接传 GPU VA),全部单
+kernel、无同步:
+
+| 用例 | 配置 | 判读 |
+|---|---|---|
+| G0 | peer_mem,主存胶囊 | 自检:peer_mem 路径本身能用 |
+| G1 | dma-buf,普通显存胶囊 | = R0,应 100 `R` |
+| G2 | peer_mem,普通显存胶囊 | **全 `.` → 注册路径绕开了坑 7** |
+| G3 | dma-buf,kernel 写 payload | 应 100 `S` |
+| G4 | peer_mem,kernel 写 payload | 同 G2 |
+| G5 | peer_mem,胶囊和 payload 都在普通显存 | 全程普通 `mcMalloc`,无同步 |
+
+`make pit7-bench` 同时测"注册之后"的访存代价(无 / dma-buf / peer ×
+flag 0/1/4)。若 peer_mem 让 flag 0 的读写变得和 flag 4 一样慢,说明它是
+通过切到 uncached 生效的,代价与选项 2 相同;若访存代价不变而 G2 成功,
+就是最理想的结果。
+
+还有 volatile / 普通指针两列:判断 152 ns/字这个异常慢的 store 是不是
+volatile 访存语义造成的(真正的 attention kernel 不会这么访存)。
+
 ## 待做
 
-- `make pit7-bench`:uncached 的读/写代价,决定选项 1 还是 2
+- `make pit7-matrix`(第三轮)+ `make pit7-bench`(注册路径 × 分配 flag)
+- 若 peer_mem 无效:照 mxshmem IBGDA 的注册方式再加一条路径
 - Tutti 侧:确认 SQ ring 的实际分配 flag / P2P 注册后的内存属性
 - `-I 1` 下等待从 5 µs 爬到 14 µs 的原因(`-Y` 空转对照)
 
@@ -76,8 +103,8 @@ poll 之后的同步才可见,poll 会死等 —— 而它实测可用,所以**�
 
 ```sh
 make                                   # 同时编出 bin/pit7_initiated
-make pit7-matrix                       # 第二轮
-make pit7-matrix MATRIX_V1=1           # 第一轮
+make pit7-matrix                       # 第三轮(MR 注册路径)
+make pit7-matrix MATRIX=1|2            # 前两轮
 make pit7-bench                        # 填充微基准,不需要 target
 ```
 
@@ -103,6 +130,8 @@ $G -S 38 -V                            # ... 另起进程回读
 | `-T 4` | 同上,两个 kernel 之间同步 |
 | `-Z` | 轮询每圈 `__threadfence_system()`(Tutti 的 MACA 写法) |
 | `-Y <us>` | 每轮发命令前空转,不访存 |
+| `-R 0\|1` | 显存 MR 注册:dma-buf(默认)/ peer_mem |
+| `-N <ibdev>` | `-B` 注册 MR 用的网卡 |
 | `-B` | 填充微基准:只算 / 只写 / 算+写 / 只读 × flag 0/1/4 |
 
 块图字符:`.` 一致,`R` 0xBB 未落地,`C` 0xCC 未写,`S` 0xEE 显存旧值,
@@ -146,3 +175,14 @@ uncached 下同样出现(所以不是 L2 积压)。原因未查,`-Y` 空转对�
 | Q3 | kernel 写 payload,写 \| 门铃 | 100 `S` | 132.6 | 11.3 | 319 |
 | Q4 | kernel 写 payload,写 \| 同步 \| 门铃 | 100 `.` | 132.9 | 11.9 | 235 |
 | Q3H | Q3 + 普通显存胶囊 | 36 `.` 64 `C` | 125.7 | 2.2 | 214 |
+
+### 填充微基准(2026-09-16,4 KiB × 200,单线程,volatile 指针,未注册 MR)
+
+| flag | 只算 | 只写 | 算+写 | 只读 |
+|---|---|---|---|---|
+| 0 | 3 ns/字 | 152 | 222 | 120 |
+| 1 | — | 226 | 285 | 220 |
+| 4 | — | 232 | 300 | 235 |
+
+慢在访存不在计算。uncached 写 ×1.5、读 ×1.9。绝对值对 GPU 访问自身显存
+来说异常偏高,可能与 volatile 访存语义有关,第三轮 bench 加了对照。

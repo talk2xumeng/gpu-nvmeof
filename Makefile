@@ -16,7 +16,7 @@
 #   make run-gpu-write-verify   GPU 写 + 另起进程逐块回读
 #
 # 实验(tst/,各目录有 README 记录背景和结论):
-#   make pit7-matrix [MATRIX_V1=1]  坑 7:kernel 写显存对网卡的可见性
+#   make pit7-matrix [MATRIX=1|2|3] 坑 7:kernel 写显存对网卡的可见性
 #   make pit7-bench                 坑 7:kernel 填充微基准
 #
 # 注意:动态库路径必须先 make ldconfig 注册,否则 sudo 下会找不到
@@ -48,6 +48,8 @@ KVBLOCK    ?= 4718592
 GPU_ROUNDS ?= 100
 GPU_BS     ?= 4096
 GPU_LBA    ?= 0
+# pit7-bench 注册 MR 用的网卡(和 GPU 同 NUMA / PCIe switch 的那张)
+IBDEV      ?= mlx5_1
 # pattern seed:每次 make 取一个新值,防止上一轮留在盘上的数据冒充本轮结果。
 # 必须是立即展开(:=),?= 是递归展开,两行 recipe 跨秒会拿到不同的值。
 ifeq ($(origin SEED),undefined)
@@ -276,10 +278,10 @@ tst: $(BIN)/pit7_initiated
 pit7-matrix: $(BIN)/pit7_initiated
 	sudo BIN=$(BIN) TARGET_IP=$(TARGET_IP) NQN=$(NQN) GPU_ID=$(GPU_ID) \
 	     ROUNDS=$(GPU_ROUNDS) BS=$(GPU_BS) LBA=$(GPU_LBA) \
-	     MATRIX_V1=$(MATRIX_V1) $(PIT7)/pit7_matrix.sh
+	     MATRIX=$(MATRIX) $(PIT7)/pit7_matrix.sh
 
 pit7-bench: $(BIN)/pit7_initiated
-	sudo ./$(BIN)/pit7_initiated -g $(GPU_ID) -b $(GPU_BS) -B
+	sudo ./$(BIN)/pit7_initiated -g $(GPU_ID) -b $(GPU_BS) -N $(IBDEV) -B
 
 clean:
 	rm -rf $(BIN)

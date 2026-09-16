@@ -10,8 +10,8 @@
 #
 # 每个用例一个新 seed。完整日志写到 $LOG,屏幕只打摘要。
 #
-# 用法:  make pit7-matrix              第二轮(默认)
-#        make pit7-matrix MATRIX_V1=1  第一轮
+# 用法:  make pit7-matrix              第三轮(默认)
+#        make pit7-matrix MATRIX=1|2   前两轮
 # 参数从 Makefile 传进来;日志默认写到 tst/pit7/logs/
 
 BIN=${BIN:-bin}
@@ -70,7 +70,12 @@ echo
 #
 # 读块图时注意:胶囊槽位按 i&0x3f 复用,"块 0-35 对、其余 R"说明网卡
 # 读到的是上一次刷下去的旧胶囊。
-if [ -n "$MATRIX_V1" ]; then
+# MATRIX=1 / 2 / 3 选轮次,默认 3
+MATRIX=${MATRIX:-3}
+[ -n "$MATRIX_V1" ] && MATRIX=1
+
+case "$MATRIX" in
+1)
 	run_read  "C0 拆分自检"            -T 1
 	run_read  "R0 普通显存胶囊/单kernel" -H -F 0
 	run_read  "R1 +拆分,不同步 (A)"     -H -F 0 -T 1
@@ -80,14 +85,26 @@ if [ -n "$MATRIX_V1" ]; then
 	run_write "W1 kernel写payload+拆分 (A)"  -I 1 -D 0 -T 1
 	run_write "W2 kernel写payload+fence (C)" -I 1 -D 0 -Z
 	run_write "W3 kernel写payload+拆分+fence" -I 1 -D 0 -T 1 -Z
-else
+	;;
+2)
+	# 第二轮:刷新点是 kernel 退出还是 host 同步
 	run_read  "C3 自检:主存胶囊 -T 3"       -T 3
 	run_read  "P3 普通显存胶囊, 写|门铃"     -H -F 0 -T 3
 	run_read  "P4 普通显存胶囊, 写|同步|门铃" -H -F 0 -T 4
 	run_write "Q3 kernel写payload, 写|门铃"     -I 1 -D 0 -T 3
 	run_write "Q4 kernel写payload, 写|同步|门铃" -I 1 -D 0 -T 4
 	run_write "Q3H 同 Q3 + 胶囊也在普通显存"    -I 1 -D 0 -T 3 -H -F 0
-fi
+	;;
+3)
+	# 第三轮:MR 注册路径会不会改变坑 7。全部单 kernel、无同步
+	run_read  "G0 peer_mem 自检:主存胶囊"          -R 1
+	run_read  "G1 dma-buf,普通显存胶囊(=R0)"      -H -F 0
+	run_read  "G2 peer_mem,普通显存胶囊"           -H -F 0 -R 1
+	run_write "G3 dma-buf,kernel写payload"         -I 1 -D 0
+	run_write "G4 peer_mem,kernel写payload"        -I 1 -D 0 -R 1
+	run_write "G5 peer_mem,payload+胶囊都在普通显存" -I 1 -D 0 -H -F 0 -R 1
+	;;
+esac
 
 echo
 echo "完整日志: $LOG"

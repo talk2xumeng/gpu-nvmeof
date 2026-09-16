@@ -34,6 +34,9 @@
  *                          3 = k_prep(写显存)退出 → k_post_poll(门铃+轮询)
  *                          4 = 同 3,两者之间同步
  *   -Z                   轮询每圈 __threadfence_system()(Tutti 的 MACA 写法)
+ *   -R <mode>            显存 MR 注册路径:0 = dma-buf(默认),1 = peer_mem
+ *                        (ibv_reg_mr 直接传 GPU VA)
+ *   -N <ibdev>           -B 注册 MR 用的网卡(默认 mlx5_1)
  *   -D <flag>            数据区用 mcExtMallocWithFlags 分配(默认 0=mcMalloc)
  *   -K                   旧式对照:单块、单字节 pattern、独立 kernel 填充
  *   -P                   把 [L, L+r) 涂成 0xCC 然后退出
@@ -124,6 +127,8 @@ static double	g_gap_us;		/* -Y */
 static int	g_bench;		/* -B */
 static int	g_split;		/* -T */
 static int	g_poll_fence;		/* -Z */
+static int	g_reg_mode;		/* -R */
+static char	g_bench_dev[32] = "mlx5_1";	/* -N */
 static uint64_t	g_start_lba;
 static uint8_t	g_seed = 1;
 static unsigned	g_data_flags;		/* -D */
@@ -154,6 +159,37 @@ hook_get_pd(const struct spdk_nvme_transport_id *t, struct ibv_context *v)
 	return g_pd;
 }
 
+/*
+ * 显存 MR 的两条注册路径(-R)。
+ *   0 dma-buf :mcMemGetHandleForAddressRange 导出 fd + ibv_reg_dmabuf_mr
+ *   1 peer_mem:ibv_reg_mr 直接传 GPU VA,由 MACA 的 peer memory 模块 pin 页
+ * 要回答的问题:注册路径会不会改变这段显存的缓存行为(坑 7)。Tutti 的
+ * snvme 走 P2P pin,mxshmem IBGDA 的注册方式也和我们不同,而它们不需要
+ * 显式同步。
+ */
+static struct ibv_mr *
+reg_gpu_mr(struct ibv_pd *pd, void *va, size_t len, int fd, int acc)
+{
+	struct ibv_mr *mr;
+
+	if (g_reg_mode == 1) {
+		mr = ibv_reg_mr(pd, va, len, acc);
+		if (!mr) {
+			fprintf(stderr, "[MR] peer_mem 注册失败: %s "
+				"(peer memory 模块加载了吗?)\n", strerror(errno));
+		} else {
+			printf("[MR] peer_mem  va=%p len=%zu rkey=0x%x\n",
+			       va, len, mr->rkey);
+		}
+		return mr;
+	}
+	mr = ibv_reg_dmabuf_mr(pd, 0, len, (uint64_t)va, fd, acc);
+	if (!mr) {
+		fprintf(stderr, "[MR] dma-buf 注册失败: %s\n", strerror(errno));
+	}
+	return mr;
+}
+
 static uint64_t
 hook_get_rkey(struct ibv_pd *pd, void *buf, size_t size)
 {
@@ -180,9 +216,8 @@ hook_get_rkey(struct ibv_pd *pd, void *buf, size_t size)
 	if (g_base_gpu && a >= (uint64_t)g_base_gpu &&
 	    a + size <= (uint64_t)g_base_gpu + g_total_len) {
 		if (!g_data_mr) {
-			g_data_mr = ibv_reg_dmabuf_mr(pd, 0, g_total_len,
-						      (uint64_t)g_base_gpu,
-						      g_base_fd, acc);
+			g_data_mr = reg_gpu_mr(pd, g_base_gpu, g_total_len,
+					       g_base_fd, acc);
 		}
 		return g_data_mr ? g_data_mr->rkey : 0;
 	}
@@ -275,6 +310,7 @@ static void usage(const char *p)
 	printf("用法: %s -a <ip> -n <nqn> [-g gpu] [-r rounds] [-b bytes]\n"
 	       "      [-L start_lba] [-S seed] [-W 发写] [-I 1|2 kernel 写 payload]\n"
 	       "      [-Y gap_us] [-B 填充微基准] [-T 1..4 拆分 launch] [-Z 轮询 fence]\n"
+	       "      [-R 0|1 MR 注册: dma-buf|peer_mem] [-N ibdev(-B 用)]\n"
 	       "      [-H 胶囊放显存] [-F cap_flag] [-D data_flag]\n"
 	       "      [-P 涂色] [-V 逐块回读] [-K 旧式单块对照]\n", p);
 }
@@ -296,56 +332,130 @@ now_us(void)
  * 每项跑 reps 次 4 KiB,报 p50/min,单位 us,另给 ns/字。
  */
 static int
+bench_one(unsigned long long *cyc, double *us, unsigned reps, int clk_khz,
+	  void *p, uint32_t bs, unsigned mode, double *p50)
+{
+	unsigned r;
+
+	if (mode == 3 || mode == 5) {
+		gpu_bench(p, bs / 8, 4, 1, cyc);	/* 读之前先写一遍 */
+	}
+	if (gpu_bench(p, bs / 8, reps, mode, cyc) != 0) {
+		return -1;
+	}
+	for (r = 1; r < reps; r++) {			/* 丢掉第一次 */
+		us[r - 1] = cyc[r] / (clk_khz / 1000.0);
+	}
+	qsort(us, reps - 1, sizeof(double), cmp_d);
+	*p50 = us[(reps - 1) / 2];
+	return 0;
+}
+
+/*
+ * 填充微基准。每项 reps 次 × bs 字节,单线程,报 p50 的 ns/字。
+ *
+ *   ① 只算:blk_word 本身的代价(与内存无关,只跑一次)
+ *   ② 写 / 读 × volatile / 普通指针:volatile 访存语义是不是慢的来源
+ *   ③ × 分配 flag 0/1/4 × MR 注册(无 / dma-buf / peer_mem):
+ *      注册路径会不会改变这段显存的访问代价 —— 如果某条路径让 flag 0
+ *      的读写变得和 flag 4 一样慢,说明它把内存切到了 uncached 模式,
+ *      也就是坑 7 在那条路径上不存在的原因
+ */
+static int
 run_bench(int clk_khz, uint32_t bs)
 {
 	static const unsigned flags[3] = { 0, 1, 4 };
-	static const char *mname[4] = { "只算", "只写", "算+写", "只读" };
+	static const char *rname[3] = { "无", "dmabuf", "peer" };
+	static const unsigned modes[4] = { 1, 4, 3, 5 };
 	const unsigned reps = 200;
 	unsigned long long *cyc = calloc(reps, sizeof(*cyc));
 	double *us = calloc(reps, sizeof(*us));
-	unsigned f, m, r;
+	struct ibv_device **dl = NULL;
+	struct ibv_context *vc = NULL;
+	struct ibv_pd *pd = NULL;
+	int ndev = 0, d, rm;
+	unsigned f, m;
+	double v;
 
 	if (!cyc || !us) {
 		return 1;
 	}
-	printf("\n===== 填充微基准:%u 字节 × %u 次,单线程 =====\n", bs, reps);
-	printf("  %-6s %-6s %9s %9s %9s\n", "flag", "操作", "min us", "p50 us",
-	       "ns/字");
-	for (f = 0; f < 3; f++) {
+
+	dl = ibv_get_device_list(&ndev);
+	for (d = 0; dl && d < ndev; d++) {
+		if (strcmp(ibv_get_device_name(dl[d]), g_bench_dev) == 0) {
+			vc = ibv_open_device(dl[d]);
+			break;
+		}
+	}
+	pd = vc ? ibv_alloc_pd(vc) : NULL;
+	if (!pd) {
+		printf("[bench] 打不开 %s,只测不注册的情况\n", g_bench_dev);
+	}
+
+	{
 		void *p = NULL;
 		int fd = -1;
 
-		if (gpu_alloc_exportable_ex(&p, &fd, HUGE_2M, flags[f]) != 0) {
-			printf("  flag %u 分配失败\n", flags[f]);
-			continue;
+		gpu_alloc_exportable_ex(&p, &fd, HUGE_2M, 0);
+		if (p && bench_one(cyc, us, reps, clk_khz, p, bs, 0, &v) == 0) {
+			printf("\n===== 填充微基准:%u 字节 × %u 次,单线程 =====\n",
+			       bs, reps);
+			printf("  只算 blk_word: %.1f us (%.1f ns/字)\n",
+			       v, v * 1000.0 / (bs / 8));
 		}
-		gpu_memset_dev(p, 0, HUGE_2M);
-		gpu_sync();
-		for (m = 0; m < 4; m++) {
-			if (m == 0 && f != 0) {
-				continue;	/* 纯计算与内存无关,只跑一次 */
-			}
-			/* 先写一遍再测读,免得读的是从未触碰的页 */
-			if (m == 3) {
-				gpu_bench(p, bs / 8, 4, 1, cyc);
-			}
-			if (gpu_bench(p, bs / 8, reps, m, cyc) != 0) {
-				printf("  flag %u %s: kernel 失败\n",
-				       flags[f], mname[m]);
+		if (fd >= 0) close(fd);
+		if (p) gpu_free(p);
+	}
+
+	printf("\n  ns/字 (p50)          写vol   写plain   读vol   读plain\n");
+	for (rm = 0; rm < 3; rm++) {
+		if (rm > 0 && !pd) {
+			break;
+		}
+		for (f = 0; f < 3; f++) {
+			void *p = NULL;
+			int fd = -1;
+			struct ibv_mr *mr = NULL;
+			int acc = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+				  IBV_ACCESS_REMOTE_WRITE;
+
+			printf("  %-7s flag %u    ", rname[rm], flags[f]);
+			if (gpu_alloc_exportable_ex(&p, &fd, HUGE_2M,
+						    flags[f]) != 0) {
+				printf("分配失败\n");
 				continue;
 			}
-			/* 丢掉第一次(冷启动) */
-			for (r = 1; r < reps; r++) {
-				us[r - 1] = cyc[r] / (clk_khz / 1000.0);
+			gpu_memset_dev(p, 0, HUGE_2M);
+			gpu_sync();
+			if (rm == 1) {
+				mr = ibv_reg_dmabuf_mr(pd, 0, HUGE_2M,
+						       (uint64_t)p, fd, acc);
+			} else if (rm == 2) {
+				mr = ibv_reg_mr(pd, p, HUGE_2M, acc);
 			}
-			qsort(us, reps - 1, sizeof(double), cmp_d);
-			printf("  %-6u %-6s %9.1f %9.1f %9.0f\n",
-			       flags[f], mname[m], us[0], us[(reps - 1) / 2],
-			       us[(reps - 1) / 2] * 1000.0 / (bs / 8));
+			if (rm > 0 && !mr) {
+				printf("注册失败: %s\n", strerror(errno));
+			} else {
+				for (m = 0; m < 4; m++) {
+					if (bench_one(cyc, us, reps, clk_khz,
+						      p, bs, modes[m], &v) != 0) {
+						printf("   失败 ");
+						continue;
+					}
+					printf("%8.0f", v * 1000.0 / (bs / 8));
+				}
+				printf("\n");
+			}
+			if (mr) ibv_dereg_mr(mr);
+			if (fd >= 0) close(fd);
+			gpu_free(p);
 		}
-		close(fd);
-		gpu_free(p);
 	}
+
+	if (pd) ibv_dealloc_pd(pd);
+	if (vc) ibv_close_device(vc);
+	if (dl) ibv_free_device_list(dl);
 	free(cyc);
 	free(us);
 	return 0;
@@ -453,7 +563,7 @@ main(int argc, char **argv)
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPVKF:L:S:I:D:Y:BT:Z")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPVKF:L:S:I:D:Y:BT:ZR:N:")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -474,6 +584,8 @@ main(int argc, char **argv)
 		case 'B': g_bench = 1; break;
 		case 'T': g_split = atoi(optarg); break;
 		case 'Z': g_poll_fence = 1; break;
+		case 'R': g_reg_mode = atoi(optarg); break;
+		case 'N': snprintf(g_bench_dev, sizeof(g_bench_dev), "%s", optarg); break;
 		case 'D': g_data_flags = (unsigned)strtoul(optarg, NULL, 0); break;
 		default:
 			usage(argv[0]);
@@ -482,6 +594,10 @@ main(int argc, char **argv)
 	}
 	if (!g_bench && (!g_traddr[0] || !g_nqn[0])) {
 		usage(argv[0]);
+		return 1;
+	}
+	if (g_reg_mode < 0 || g_reg_mode > 1) {
+		fprintf(stderr, "-R 取 0 或 1\n");
 		return 1;
 	}
 	if (g_split < 0 || g_split > 4) {
@@ -669,11 +785,10 @@ main(int argc, char **argv)
 
 	/* ---- 胶囊的 MR ---- */
 	if (g_cap_in_hbm && g_cap_flags) {
-		g_cap_mr = ibv_reg_dmabuf_mr(g_pd, 0, CAP_AREA_LEN,
-					     (uint64_t)g_cap_hbm, g_cap_fd,
-					     IBV_ACCESS_LOCAL_WRITE |
-					     IBV_ACCESS_REMOTE_READ |
-					     IBV_ACCESS_REMOTE_WRITE);
+		g_cap_mr = reg_gpu_mr(g_pd, g_cap_hbm, CAP_AREA_LEN, g_cap_fd,
+				      IBV_ACCESS_LOCAL_WRITE |
+				      IBV_ACCESS_REMOTE_READ |
+				      IBV_ACCESS_REMOTE_WRITE);
 		if (!g_cap_mr) {
 			fprintf(stderr, "胶囊注册失败: %s\n", strerror(errno));
 			return 1;
@@ -918,6 +1033,9 @@ main(int argc, char **argv)
 	       g_fill_in_io == 2 ? ", payload 由独立 kernel 预写" : "");
 	if (ctx.gap_cycles) {
 		printf(", 轮间空转 %.0f us", g_gap_us);
+	}
+	if (g_reg_mode) {
+		printf(", MR 走 peer_mem");
 	}
 	if (g_split) {
 		static const char *sm[5] = { "",

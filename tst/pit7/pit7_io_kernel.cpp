@@ -562,11 +562,15 @@ k_fill_blocks(volatile uint64_t *base, uint32_t nblk, uint32_t bs,
  *   mode 1  store 常量(k)                         -> 纯写
  *   mode 2  算 + 写(= -I 1 的填充段)
  *   mode 3  只读(累加)                           -> 读,attention 读 KV 的样子
+ *   mode 4  同 1,但普通指针(非 volatile)
+ *   mode 5  同 3,但普通指针(非 volatile)
+ * 4/5 用来判断 1/3 的慢是不是 volatile 访存语义造成的。
  */
 __global__ void
 k_bench(volatile uint64_t *buf, uint32_t words, uint32_t reps, uint32_t mode,
 	uint64_t *out)
 {
+	uint64_t *pb = (uint64_t *)buf;
 	uint32_t r, k;
 
 	if (threadIdx.x != 0 || blockIdx.x != 0) {
@@ -576,6 +580,23 @@ k_bench(volatile uint64_t *buf, uint32_t words, uint32_t reps, uint32_t mode,
 		uint64_t t0 = clock64();
 		volatile uint64_t acc = 0;
 
+		if (mode == 4) {
+			for (k = 0; k < words; k++) {
+				pb[k] = k ^ r;
+			}
+			out[r] = clock64() - t0;
+			continue;
+		}
+		if (mode == 5) {
+			uint64_t sum = 0;
+
+			for (k = 0; k < words; k++) {
+				sum += pb[k];
+			}
+			acc = sum;
+			out[r] = clock64() - t0;
+			continue;
+		}
 		for (k = 0; k < words; k++) {
 			switch (mode) {
 			case 0:
