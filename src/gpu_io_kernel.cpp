@@ -50,13 +50,6 @@ st_rel32(uint32_t *p, uint32_t v)
 	__threadfence_system();
 }
 
-__device__ static inline void
-st_rel16(uint16_t *p, uint16_t v)
-{
-	*(volatile uint16_t *)p = v;
-	__threadfence_system();
-}
-
 __device__ static void
 set_abort(struct gio_shared *sh, int err)
 {
@@ -92,16 +85,20 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	uint16_t cid, status;
 	uint32_t tag;
 
+	/*
+	 * 计数器只有 poller 写、host 在同步后读,不用 fence。
+	 * 跨 block 可见的只有 tag 状态,最后统一 fence 一次。
+	 */
 	if (((c->rq_tail + seq) & 0xffff) != wqe_counter) {
-		st_rel32(&sh->wc_mismatch, sh->wc_mismatch + 1);
+		sh->wc_mismatch++;
 	}
 
 	if (op_own & 0x4) {
 		cpl = cqe64;
-		st_rel32(&sh->resp_inline, sh->resp_inline + 1);
+		sh->resp_inline++;
 	} else if (op_own & 0x8) {
 		cpl = cqe64 - 64;
-		st_rel32(&sh->resp_inline, sh->resp_inline + 1);
+		sh->resp_inline++;
 	} else {
 		uint32_t k = wqe_counter & (c->rq_wqe_cnt - 1);
 		volatile uint8_t *seg = c->rq_buf + (size_t)k * c->rq_stride;
@@ -125,33 +122,32 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	tag = cid & ~GIO_CID_TAG;
 	if ((cid & GIO_CID_TAG) == 0 || tag >= c->qd) {
 		if (sh->cid_bad == 0) {
-			st_rel16(&sh->first_bad_cid, cid);
+			sh->first_bad_cid = cid;
 		}
-		st_rel32(&sh->cid_bad, sh->cid_bad + 1);
+		sh->cid_bad++;
 		set_abort(sh, GIO_E_CID);
 		return;
 	}
 
 	{
-		uint64_t tp;
+		volatile struct gio_tag *vt = (volatile struct gio_tag *)&tags[tag];
+		uint64_t now = clock64();
 
-		__threadfence_system();
-		tp = tags[tag].t_post;
-		tags[tag].det = clock64() - tp;
-	}
-	st_rel16(&tags[tag].status, status);
-	if ((status >> 1) != 0) {
-		if (sh->nvme_err == 0) {
-			st_rel16(&sh->first_status, status);
+		vt->det = now - vt->t_post;	/* t_post 早已 fence 过 */
+		vt->status = status;
+		if ((status >> 1) != 0) {
+			if (sh->nvme_err == 0) {
+				sh->first_status = status;
+			}
+			sh->nvme_err++;
+			vt->state = GIO_ST_NVME_ERR;
+		} else {
+			vt->state = GIO_ST_DONE;
 		}
-		st_rel32(&sh->nvme_err, sh->nvme_err + 1);
-		st_rel32(&tags[tag].state, GIO_ST_NVME_ERR);
-	} else {
-		st_rel32(&tags[tag].state, GIO_ST_DONE);
+		vt->t_done = clock64();
+		__threadfence_system();
 	}
-	tags[tag].t_done = clock64();
-	__threadfence_system();
-	st_rel32(&sh->done_cnt, sh->done_cnt + 1);
+	sh->done_cnt++;
 }
 
 __device__ static void
@@ -177,8 +173,11 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		 * 恰好等于首圈的 phase(0) —— 只判 owner 会把空条目当 CQE 消费掉。
 		 */
 		if ((op_own & 1) != (phase & 1) || opcode == MLX5_CQE_INVALID) {
-			if (ld_acq32(&sh->done_cnt) >= c->njobs ||
-			    ld_acq32(&sh->abort)) {
+			if ((c->opt & 2) && (spins & 0xff) != 0) {
+				continue;
+			}
+			/* done_cnt 只有 poller 自己写,不用 fence */
+			if (sh->done_cnt >= c->njobs || ld_acq32(&sh->abort)) {
 				break;
 			}
 			if (clock64() - idle_since > GIO_TIMEOUT) {
@@ -200,20 +199,20 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 
 			uint64_t r0 = clock64();
 
-			st_rel32(&sh->cqe_resp, sh->cqe_resp + 1);
+			sh->cqe_resp++;
 			handle_resp(c, sh, tags, cqe + (c->cqe_size - 64),
 				    op_own, wc, seq);
 			rcyc += clock64() - r0;
 			seq++;
 		} else if (opcode == MLX5_CQE_REQ) {
-			st_rel32(&sh->cqe_req, sh->cqe_req + 1);
+			sh->cqe_req++;
 		} else if (opcode == MLX5_CQE_REQ_ERR ||
 			   opcode == MLX5_CQE_RESP_ERR) {
 			/* cqe64 在条目末尾;syndrome 在其 offset 55,vendor_err 在 54 */
 			uint32_t base = c->cqe_size - 64;
 
-			st_rel32(&sh->err_cqe, ((uint32_t)cqe[base + 54] << 8) |
-					       cqe[base + 55]);
+			sh->err_cqe = ((uint32_t)cqe[base + 54] << 8) |
+				      cqe[base + 55];
 			set_abort(sh, GIO_E_CQE);
 		}
 
@@ -344,6 +343,14 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 
 		for (;;) {
 			spins++;
+			if ((c->opt & 1) && (spins & 0xf) != 0) {
+				/* 不 fence,直接读:可能读到旧值,每 16 圈 fence 一次兜底 */
+				st = *(volatile uint32_t *)&tags[tag].state;
+				if (st >= GIO_ST_DONE) {
+					break;
+				}
+				continue;
+			}
 			st = ld_acq32(&tags[tag].state);
 			if (st >= GIO_ST_DONE) {
 				break;

@@ -46,6 +46,12 @@ struct gpu_io_ctx {
 
 	/* ---- 并发(docs/concurrency-design.md) ---- */
 	uint32_t		qd;		/* submitter 线程数 = 同时在飞的 I/O 数 */
+	/*
+	 * 等待/轮询的 fence 密度(-O,调优用):
+	 *   bit0  submitter 等待时每 16 圈才 fence 一次
+	 *   bit1  poller 空转时每 256 圈才检查一次 done/abort
+	 */
+	uint32_t		opt;
 	uint32_t		njobs;		/* 本次 launch 的 I/O 总数 */
 
 	/*

@@ -14,6 +14,8 @@
  *   -g <id>              GPU 编号
  *   -r <n> -b <bytes>    I/O 总数、每条字节数
  *   -Q <qd>              同时在飞的 I/O 数(submitter 线程数,默认 1)
+ *   -O <bits>            fence 密度调优(诊断):bit0 submitter 稀疏 fence,
+ *                        bit1 poller 空转稀疏检查
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -92,6 +94,7 @@ static char	g_traddr[64], g_nqn[224], g_trsvcid[16] = "4420";
 static int	g_gpu_id = 4;
 static uint32_t	g_rounds = 100;
 static uint32_t	g_qd = 1;
+static uint32_t	g_opt;
 static uint32_t	g_io_bytes = 4096;
 static int	g_write, g_cap_in_hbm, g_paint, g_verify;
 static int	g_fill_by_kernel;	/* -K: 源数据由 kernel 写,不用 mcMemset */
@@ -433,7 +436,7 @@ main(int argc, char **argv)
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:Q:WHPVKF:L:S:")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:Q:O:WHPVKF:L:S:")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -442,6 +445,7 @@ main(int argc, char **argv)
 		case 'r': g_rounds = (unsigned)atoi(optarg); break;
 		case 'b': g_io_bytes = (unsigned)atoi(optarg); break;
 		case 'Q': g_qd = (unsigned)atoi(optarg); break;
+		case 'O': g_opt = (unsigned)strtoul(optarg, NULL, 0); break;
 		case 'W': g_write = 1; break;
 		case 'H': g_cap_in_hbm = 1; break;
 		case 'P': g_paint = 1; break;
@@ -859,6 +863,7 @@ main(int argc, char **argv)
 		printf("[QD] 超过 queue size,降为 %u\n", g_qd);
 	}
 	ctx.qd = g_qd;
+	ctx.opt = g_opt;
 	ctx.njobs = g_rounds;
 
 	/* ---- 准备源数据 / 盘上底色 ---- */
@@ -985,9 +990,9 @@ main(int argc, char **argv)
 	c_det  = calloc(g_rounds, sizeof(*c_det));
 	c_hand = calloc(g_rounds, sizeof(*c_hand));
 	us = calloc(g_rounds, sizeof(*us));
-	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u, %s\n",
+	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u, %s, -O %u\n",
 	       g_write ? "WRITE" : "READ", g_rounds, g_io_bytes, g_qd,
-	       ctx.data_step ? "每条一块" : "单块复用");
+	       ctx.data_step ? "每条一块" : "单块复用", g_opt);
 
 	if (gpu_io_run(&ctx, g_start_lba, c_cap, c_sub, c_wait, c_spin,
 		       c_lock, c_stat, c_det, c_hand, &sh) != 0) {
