@@ -81,7 +81,7 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	    volatile uint8_t *cqe64, uint8_t op_own, uint16_t wqe_counter,
 	    uint32_t seq)
 {
-	volatile uint8_t *cpl;
+	uint64_t w;		/* NVMe CQE 的第 8..15 字节:sqhd sqid cid status */
 	uint16_t cid, status;
 	uint32_t tag;
 
@@ -93,31 +93,33 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		sh->wc_mismatch++;
 	}
 
+	/*
+	 * 主存上每次 volatile 读都是一次 PCIe 往返(~0.7 us),逐字节读 6 次
+	 * 就是 4 us。整字读:CQE、recv buffer、RQ 槽都按 8 字节对齐。
+	 */
 	if (op_own & 0x4) {
-		cpl = cqe64;
+		w = *(volatile uint64_t *)(cqe64 + 8);
 		sh->resp_inline++;
 	} else if (op_own & 0x8) {
-		cpl = cqe64 - 64;
+		w = *(volatile uint64_t *)(cqe64 - 64 + 8);
 		sh->resp_inline++;
 	} else {
 		uint32_t k = wqe_counter & (c->rq_wqe_cnt - 1);
 		volatile uint8_t *seg = c->rq_buf + (size_t)k * c->rq_stride;
-		uint64_t addr = 0;
-		int b;
-
 		/* mlx5_wqe_data_seg:byte_count(4) lkey(4) addr(8),大端 */
-		for (b = 0; b < 8; b++) {
-			addr = (addr << 8) | seg[8 + b];
-		}
+		uint64_t addr = wqe_hto_be64(*(volatile uint64_t *)(seg + 8));
+
 		if (c->rsp_len == 0 || addr < c->rsp_host_base ||
 		    addr + 16 > c->rsp_host_base + c->rsp_len) {
 			set_abort(sh, GIO_E_RSP_ADDR);
 			return;
 		}
-		cpl = c->rsp_dev + (addr - c->rsp_host_base);
+		w = *(volatile uint64_t *)(c->rsp_dev +
+					   (addr - c->rsp_host_base) + 8);
 	}
-	cid = (uint16_t)(cpl[12] | ((uint16_t)cpl[13] << 8));
-	status = (uint16_t)(cpl[14] | ((uint16_t)cpl[15] << 8));
+	/* NVMe CQE 小端:[8]sqhd [10]sqid [12]cid [14]status */
+	cid = (uint16_t)(w >> 32);
+	status = (uint16_t)(w >> 48);
 
 	tag = cid & ~GIO_CID_TAG;
 	if ((cid & GIO_CID_TAG) == 0 || tag >= c->qd) {
@@ -153,17 +155,31 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 /*
  * 处理一个已确认有效的 CQE(调用方已 fence)。返回处理响应的耗时。
  */
+/*
+ * cqe64 的最后 8 字节整字读出(小端装载):
+ *   byte 56-59 sop_drop_qpn,60-61 wqe_counter(大端),62 signature,63 op_own
+ */
+#define TAIL_OP_OWN(t)	((uint8_t)((t) >> 56))
+#define TAIL_WQE_CTR(t)	((uint16_t)((((t) >> 32) & 0xff) << 8 | (((t) >> 40) & 0xff)))
+
+__device__ static inline uint64_t
+cqe_tail(struct gpu_io_ctx *c, volatile uint8_t *cqe)
+{
+	return *(volatile uint64_t *)(cqe + c->cqe_size - 8);
+}
+
 __device__ static uint64_t
 consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
-	    volatile uint8_t *cqe, uint8_t op_own, uint32_t *seq)
+	    volatile uint8_t *cqe, uint32_t *seq)
 {
+	/* 调用方 fence 过了;owner 确认前读到的尾部字不一定是终值,重读一次 */
+	uint64_t tail = cqe_tail(c, cqe);
+	uint8_t op_own = TAIL_OP_OWN(tail);
 	uint8_t opcode = op_own >> 4;
 	uint64_t r = 0;
 
 	if (opcode == MLX5_CQE_RESP_SEND) {
-		/* wqe_counter:cqe64 offset 60,大端 */
-		uint16_t wc = (uint16_t)((cqe[c->cqe_size - 4] << 8) |
-					 cqe[c->cqe_size - 3]);
+		uint16_t wc = TAIL_WQE_CTR(tail);
 		uint64_t r0 = clock64();
 
 		sh->cqe_resp++;
@@ -210,7 +226,8 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 	for (;;) {
 		uint32_t idx = ci & (c->cq_cnt - 1);
 		volatile uint8_t *cqe = c->cq_buf + (size_t)idx * c->cqe_size;
-		uint8_t op_own = cqe[c->cqe_size - 1];
+		uint64_t tail = cqe_tail(c, cqe);
+		uint8_t op_own = TAIL_OP_OWN(tail);
 		uint8_t opcode = op_own >> 4;
 
 		spins++;
@@ -239,7 +256,7 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		hits++;
 		idle_since = clock64();
 
-		rcyc += consume_one(c, sh, tags, cqe, op_own, &seq);
+		rcyc += consume_one(c, sh, tags, cqe, &seq);
 		advance_ci(c, &ci, &phase);
 
 		if (ld_acq32(&sh->abort)) {
@@ -274,7 +291,8 @@ poll_step(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 	for (n = 0; n < 32; n++) {
 		uint32_t idx = ci & (c->cq_cnt - 1);
 		volatile uint8_t *cqe = c->cq_buf + (size_t)idx * c->cqe_size;
-		uint8_t op_own = cqe[c->cqe_size - 1];
+		uint64_t tail = cqe_tail(c, cqe);
+		uint8_t op_own = TAIL_OP_OWN(tail);
 
 		if ((op_own & 1) != (phase & 1) ||
 		    (op_own >> 4) == MLX5_CQE_INVALID) {
@@ -282,7 +300,7 @@ poll_step(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		}
 		__threadfence_system();
 		sh->poll_hits++;
-		rc += consume_one(c, sh, tags, cqe, op_own, &seq);
+		rc += consume_one(c, sh, tags, cqe, &seq);
 		advance_ci(c, &ci, &phase);
 	}
 	if (n) {
