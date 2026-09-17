@@ -14,8 +14,9 @@
  *   -g <id>              GPU 编号
  *   -r <n> -b <bytes>    I/O 总数、每条字节数
  *   -Q <qd>              同时在飞的 I/O 数(submitter 线程数,默认 1)
- *   -O <bits>            fence 密度调优(诊断):bit0 submitter 稀疏 fence,
- *                        bit1 poller 空转稀疏检查
+ *   -O <bits>            调优/诊断:bit0 submitter 稀疏 fence(每 16 圈),
+ *                        bit1 poller 空转稀疏检查,bit2 配合 bit0 改为 1024 圈,
+ *                        bit4(=16) 自轮询:不要独立 poller
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -1379,7 +1380,13 @@ main(int argc, char **argv)
 			free(dv);
 			free(hv);
 		}
-		if (sh.poll_spins) {
+		if (g_opt & 0x10) {
+			printf("\n  自轮询: 收割 %llu 次, 命中 %llu, 处理一条响应 %.0f ns",
+			       (unsigned long long)sh.poll_spins,
+			       (unsigned long long)sh.poll_hits,
+			       sh.cqe_resp ? sh.resp_cycles * 1e6 / clk_khz /
+					     sh.cqe_resp : 0.0);
+		} else if (sh.poll_spins) {
 			printf("\n  poller: 每圈 %.0f ns, 处理一条响应 %.0f ns",
 			       sh.poll_cycles * 1e6 / clk_khz / sh.poll_spins,
 			       sh.cqe_resp ? sh.resp_cycles * 1e6 / clk_khz /

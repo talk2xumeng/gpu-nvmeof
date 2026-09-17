@@ -50,6 +50,8 @@ struct gpu_io_ctx {
 	 * 等待/轮询的 fence 密度(-O,调优用):
 	 *   bit0  submitter 等待时每 16 圈才 fence 一次
 	 *   bit1  poller 空转时每 256 圈才检查一次 done/abort
+	 *   bit2  配合 bit0,改成每 1024 圈(检验 system fence 是否全局同步点)
+	 *   bit4  自轮询:不要独立 poller,submitter 等待时抢 CQ 锁自己收割
 	 */
 	uint32_t		opt;
 	uint32_t		njobs;		/* 本次 launch 的 I/O 总数 */
@@ -91,6 +93,11 @@ struct gio_shared {
 	uint64_t	poll_spins;	/* poller */
 	uint64_t	poll_hits;	/* poller:读到有效 CQE 的圈数 */
 	uint64_t	poll_cycles;	/* poller:自己时钟下的总运行时间 */
+	/* 自轮询(opt bit4):持 cq_lock 的 submitter 才能读写下面四个 */
+	uint32_t	cq_lock;
+	uint32_t	sp_ci;
+	uint32_t	sp_phase;
+	uint32_t	sp_seq;
 	uint64_t	resp_cycles;	/* poller:处理响应(handle_resp)的总耗时 */
 };
 

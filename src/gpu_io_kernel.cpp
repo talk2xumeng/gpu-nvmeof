@@ -150,6 +150,53 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	sh->done_cnt++;
 }
 
+/*
+ * 处理一个已确认有效的 CQE(调用方已 fence)。返回处理响应的耗时。
+ */
+__device__ static uint64_t
+consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
+	    volatile uint8_t *cqe, uint8_t op_own, uint32_t *seq)
+{
+	uint8_t opcode = op_own >> 4;
+	uint64_t r = 0;
+
+	if (opcode == MLX5_CQE_RESP_SEND) {
+		/* wqe_counter:cqe64 offset 60,大端 */
+		uint16_t wc = (uint16_t)((cqe[c->cqe_size - 4] << 8) |
+					 cqe[c->cqe_size - 3]);
+		uint64_t r0 = clock64();
+
+		sh->cqe_resp++;
+		handle_resp(c, sh, tags, cqe + (c->cqe_size - 64), op_own,
+			    wc, *seq);
+		r = clock64() - r0;
+		(*seq)++;
+	} else if (opcode == MLX5_CQE_REQ) {
+		sh->cqe_req++;
+	} else if (opcode == MLX5_CQE_REQ_ERR ||
+		   opcode == MLX5_CQE_RESP_ERR) {
+		/* cqe64 在条目末尾;syndrome 在其 offset 55,vendor_err 在 54 */
+		uint32_t base = c->cqe_size - 64;
+
+		sh->err_cqe = ((uint32_t)cqe[base + 54] << 8) |
+			      cqe[base + 55];
+		set_abort(sh, GIO_E_CQE);
+	}
+	return r;
+}
+
+/* 消费一个 CQE 后推进 ci,并立刻还给网卡(出错也要还,否则 CQ 会溢出) */
+__device__ static void
+advance_ci(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase)
+{
+	(*ci)++;
+	if ((*ci & (c->cq_cnt - 1)) == 0) {
+		*phase ^= 1;
+	}
+	c->cq_dbrec[0] = wqe_hto_be32(*ci & 0xffffff);
+	WQE_FENCE_DB();
+}
+
 __device__ static void
 poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 {
@@ -192,37 +239,8 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		hits++;
 		idle_since = clock64();
 
-		if (opcode == MLX5_CQE_RESP_SEND) {
-			/* wqe_counter:cqe64 offset 60,大端 */
-			uint16_t wc = (uint16_t)((cqe[c->cqe_size - 4] << 8) |
-						 cqe[c->cqe_size - 3]);
-
-			uint64_t r0 = clock64();
-
-			sh->cqe_resp++;
-			handle_resp(c, sh, tags, cqe + (c->cqe_size - 64),
-				    op_own, wc, seq);
-			rcyc += clock64() - r0;
-			seq++;
-		} else if (opcode == MLX5_CQE_REQ) {
-			sh->cqe_req++;
-		} else if (opcode == MLX5_CQE_REQ_ERR ||
-			   opcode == MLX5_CQE_RESP_ERR) {
-			/* cqe64 在条目末尾;syndrome 在其 offset 55,vendor_err 在 54 */
-			uint32_t base = c->cqe_size - 64;
-
-			sh->err_cqe = ((uint32_t)cqe[base + 54] << 8) |
-				      cqe[base + 55];
-			set_abort(sh, GIO_E_CQE);
-		}
-
-		ci++;
-		if ((ci & (c->cq_cnt - 1)) == 0) {
-			phase ^= 1;
-		}
-		/* 已消费的 CQE 立刻还给网卡,出错也要还,否则 CQ 会溢出 */
-		c->cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
-		WQE_FENCE_DB();
+		rcyc += consume_one(c, sh, tags, cqe, op_own, &seq);
+		advance_ci(c, &ci, &phase);
 
 		if (ld_acq32(&sh->abort)) {
 			break;
@@ -232,6 +250,47 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 	sh->poll_hits = hits;
 	sh->poll_cycles = clock64() - pstart;
 	sh->resp_cycles = rcyc;
+}
+
+/*
+ * 自轮询(opt bit4):调用方已持 cq_lock。把已经到了的 CQE 最多收 32 个,
+ * 别人的完成也按 cid 分发。ci/phase/seq 在共享区里,换人持锁时靠
+ * 进出各一次 fence 交接;计数器也只有持锁者写,同样被这两次 fence 覆盖。
+ * 不在这里 fence 收尾 —— 调用方释放锁时统一 fence。
+ */
+__device__ static void
+poll_step(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
+{
+	uint32_t ci, seq, n;
+	uint8_t phase;
+	uint64_t rc = 0;
+
+	__threadfence_system();
+	ci = sh->sp_ci;
+	phase = (uint8_t)sh->sp_phase;
+	seq = sh->sp_seq;
+	sh->poll_spins++;
+
+	for (n = 0; n < 32; n++) {
+		uint32_t idx = ci & (c->cq_cnt - 1);
+		volatile uint8_t *cqe = c->cq_buf + (size_t)idx * c->cqe_size;
+		uint8_t op_own = cqe[c->cqe_size - 1];
+
+		if ((op_own & 1) != (phase & 1) ||
+		    (op_own >> 4) == MLX5_CQE_INVALID) {
+			break;
+		}
+		__threadfence_system();
+		sh->poll_hits++;
+		rc += consume_one(c, sh, tags, cqe, op_own, &seq);
+		advance_ci(c, &ci, &phase);
+	}
+	if (n) {
+		*(volatile uint32_t *)&sh->sp_ci = ci;
+		*(volatile uint32_t *)&sh->sp_phase = phase;
+		*(volatile uint32_t *)&sh->sp_seq = seq;
+		sh->resp_cycles += rc;
+	}
 }
 
 /* ================================================================== */
@@ -343,7 +402,13 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 
 		for (;;) {
 			spins++;
-			if ((c->opt & 1) && (spins & 0xf) != 0) {
+			if (c->opt & 0x10) {
+				if (atomicCAS(&sh->cq_lock, 0u, 1u) == 0u) {
+					poll_step(c, sh, tags);
+					st_rel32(&sh->cq_lock, 0u);
+				}
+			} else if ((c->opt & 1) &&
+				   (spins & ((c->opt & 4) ? 0x3ff : 0xf)) != 0) {
 				/* 不 fence,直接读:可能读到旧值,每 16 圈 fence 一次兜底 */
 				st = *(volatile uint32_t *)&tags[tag].state;
 				if (st >= GIO_ST_DONE) {
@@ -401,7 +466,9 @@ k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
 		return;
 	}
 	if (t == 0) {
-		poller(&ctx, sh, tags);
+		if ((ctx.opt & 0x10) == 0) {
+			poller(&ctx, sh, tags);
+		}
 	} else {
 		submitter(&ctx, sh, tags, t - 1, start_lba, c_cap, c_sub,
 			  c_wait, c_spin, c_lock, c_stat, c_det, c_hand);
@@ -506,6 +573,8 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 
 	memset(&sh0, 0, sizeof(sh0));
 	sh0.sq_pi = ctx->sq_pi;
+	sh0.sp_ci = ctx->cq_ci;
+	sh0.sp_phase = ctx->cq_phase;
 	mcMemcpy(d_sh, &sh0, sizeof(sh0), mcMemcpyHostToDevice);
 	mcMemset(d_tags, 0, tsz);
 	mcMemset(d_stat, 0xff, ctx->njobs * sizeof(uint32_t));
