@@ -238,6 +238,14 @@ libmlx5,就没人拷。
 - 顺带确认:RQ 槽 = `wqe_counter & (wqe_cnt-1)`,和 rdma-core 一致;
   槽里的 buffer 并不是按 `rsp[k]` 顺序排的,不要依赖这个
 
+## 观测:kernel 访问主存每次 ~0.7 us
+
+CQ、SQ、胶囊、recv buffer 都在主存,GPU kernel 每次 volatile 读写都是
+一次 PCIe 往返,实测 0.6–0.9 us(串行轮询每圈 596 ns 就是一次读)。
+逐字节读一个 16 字节结构能花掉好几 us —— 能整字读就整字读(CQE、
+data seg、NVMe CQE 都按 8 字节对齐)。这也是 CQ 进显存(status 第 5 项)
+的主要收益来源。
+
 ## 有用的观测手段
 
 **target 侧**(SPDK 需 `./configure --enable-debug` 重编):
