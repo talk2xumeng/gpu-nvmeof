@@ -52,6 +52,10 @@ struct gpu_io_ctx {
 	 *   bit1  poller 空转时每 256 圈才检查一次 done/abort
 	 *   bit2  配合 bit0,改成每 1024 圈(检验 system fence 是否全局同步点)
 	 *   bit4  自轮询:不要独立 poller,submitter 等待时抢 CQ 锁自己收割
+	 *   bit5  串行快路径(仅 QD=1):submitter 门铃后直接轮询 CQ,ci 在本地,
+	 *         空转每圈只读一次主存 —— 和旧串行 kernel 同形
+	 *   bit6  不启动 poller 的 block,只启动 QD 个 submitter block
+	 *         (须配 bit4 或 bit5)
 	 */
 	uint32_t		opt;
 	uint32_t		njobs;		/* 本次 launch 的 I/O 总数 */

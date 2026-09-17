@@ -375,6 +375,9 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	uint64_t cap_addr = c->capsule_addr + (uint64_t)tag * 64;
 	uint32_t nlb = c->io_bytes / c->sector_size;
 	uint32_t j;
+	/* 串行快路径(opt bit5)的本地 CQ 状态 */
+	uint32_t my_ci = c->cq_ci, my_seq = 0;
+	uint8_t my_phase = c->cq_phase;
 
 	while (claim_job(sh, c->njobs, &j)) {
 		uint64_t lba = start_lba + (uint64_t)j * nlb;
@@ -402,6 +405,37 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 
 		for (;;) {
 			spins++;
+			if (c->opt & 0x20) {
+				uint32_t idx = my_ci & (c->cq_cnt - 1);
+				volatile uint8_t *cqe = c->cq_buf +
+					(size_t)idx * c->cqe_size;
+				uint8_t oo = TAIL_OP_OWN(cqe_tail(c, cqe));
+
+				if ((oo & 1) != (my_phase & 1) ||
+				    (oo >> 4) == MLX5_CQE_INVALID) {
+					if ((spins & 0x3ff) == 0 &&
+					    clock64() - t2 > GIO_TIMEOUT) {
+						set_abort(sh, GIO_E_WAIT);
+						st = GIO_ST_POSTED;
+						break;
+					}
+					continue;
+				}
+				__threadfence_system();
+				sh->poll_hits++;
+				sh->resp_cycles += consume_one(c, sh, tags, cqe,
+							       &my_seq);
+				advance_ci(c, &my_ci, &my_phase);
+				/* handle_resp 在本 block 里已 fence 过,直接读 */
+				st = *(volatile uint32_t *)&tags[tag].state;
+				if (st >= GIO_ST_DONE) {
+					break;
+				}
+				if (ld_acq32(&sh->abort)) {
+					break;
+				}
+				continue;
+			}
 			if (c->opt & 0x10) {
 				if (atomicCAS(&sh->cq_lock, 0u, 1u) == 0u) {
 					poll_step(c, sh, tags);
@@ -462,11 +496,14 @@ k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
 {
 	uint32_t t = blockIdx.x;
 
+	if (ctx.opt & 0x40) {
+		t++;		/* 没有 poller block:block i 就是 submitter i */
+	}
 	if (threadIdx.x != 0 || t > ctx.qd) {
 		return;
 	}
 	if (t == 0) {
-		if ((ctx.opt & 0x10) == 0) {
+		if ((ctx.opt & 0x30) == 0) {
 			poller(&ctx, sh, tags);
 		}
 	} else {
@@ -553,7 +590,8 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	struct gio_tag *d_tags = NULL;
 	size_t sz = ctx->njobs * sizeof(uint64_t);
 	size_t tsz = ctx->qd * sizeof(struct gio_tag);
-	unsigned int nblk = ctx->qd + 1;	/* block 0 = poller */
+	/* block 0 = poller;opt bit6 时不启动它 */
+	unsigned int nblk = (ctx->opt & 0x40) ? ctx->qd : ctx->qd + 1;
 	mcError_t e;
 	int rc = -1;
 

@@ -16,7 +16,9 @@
  *   -Q <qd>              同时在飞的 I/O 数(submitter 线程数,默认 1)
  *   -O <bits>            调优/诊断:bit0 submitter 稀疏 fence(每 16 圈),
  *                        bit1 poller 空转稀疏检查,bit2 配合 bit0 改为 1024 圈,
- *                        bit4(=16) 自轮询:不要独立 poller
+ *                        bit4(=16) 自轮询:不要独立 poller,
+ *                        bit5(=32) 串行快路径(仅 QD=1),
+ *                        bit6(=64) 不启动 poller block(配 16 或 32)
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -474,6 +476,14 @@ main(int argc, char **argv)
 	}
 	if (g_qd > g_rounds) {
 		g_qd = g_rounds;
+	}
+	if ((g_opt & 0x20) && g_qd != 1) {
+		fprintf(stderr, "-O 32(串行快路径)只能配 -Q 1\n");
+		return 1;
+	}
+	if ((g_opt & 0x40) && !(g_opt & 0x30)) {
+		fprintf(stderr, "-O 64 必须配 16 或 32,否则没人收割 CQ\n");
+		return 1;
 	}
 
 	printf("=========================================================\n");
@@ -1380,7 +1390,7 @@ main(int argc, char **argv)
 			free(dv);
 			free(hv);
 		}
-		if (g_opt & 0x10) {
+		if (g_opt & 0x30) {
 			printf("\n  自轮询: 收割 %llu 次, 命中 %llu, 处理一条响应 %.0f ns",
 			       (unsigned long long)sh.poll_spins,
 			       (unsigned long long)sh.poll_hits,
