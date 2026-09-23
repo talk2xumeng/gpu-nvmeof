@@ -377,10 +377,14 @@ sq_unlock(struct gio_shared *sh)
  * BlueFlame 内联:整个 WQE(32 字节)写进 BF 寄存器。只写 8 字节也行
  * (网卡回 SQ 取),这里沿用跑通时的形态。
  */
+/*
+ * 写 WQE → dbrec → BlueFlame 门铃。pi 由调用方给:
+ *   正常路径 锁内从共享 sq_pi 取,用完写回(带 fence)
+ *   精简路径(opt bit8) 本地算,门铃之后不再写任何东西
+ */
 __device__ static void
-post_locked(struct gpu_io_ctx *c, struct gio_shared *sh, uint64_t cap_addr)
+post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr)
 {
-	uint16_t pi = (uint16_t)ld_acq32(&sh->sq_pi);
 	uint32_t slot = pi & (c->sq_wqe_cnt - 1);
 	volatile uint8_t *sq_slot = c->sq_buf + (size_t)slot * c->sq_stride;
 	volatile uint64_t *bfp = c->bf_reg;
@@ -400,6 +404,14 @@ post_locked(struct gpu_io_ctx *c, struct gio_shared *sh, uint64_t cap_addr)
 	}
 	WQE_FENCE_DB();
 
+}
+
+__device__ static void
+post_locked(struct gpu_io_ctx *c, struct gio_shared *sh, uint64_t cap_addr)
+{
+	uint16_t pi = (uint16_t)ld_acq32(&sh->sq_pi);
+
+	post_wqe(c, pi, cap_addr);
 	st_rel32(&sh->sq_pi, (uint32_t)pi + 1);
 }
 
@@ -435,12 +447,19 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		st_rel32(&tags[tag].job, j);
 		st_rel32(&tags[tag].state, GIO_ST_POSTED);
 
-		lspins = sq_lock(sh);
-		post_locked(c, sh, cap_addr);
-		sq_unlock(sh);
-		t2 = clock64();
-		tags[tag].t_post = t2;
-		__threadfence_system();
+		if (c->opt & 0x100) {
+			/* 门铃之后一个带 fence 的写都没有,同旧串行 kernel */
+			post_wqe(c, (uint16_t)(c->sq_pi + j), cap_addr);
+			lspins = 0;
+			t2 = clock64();
+		} else {
+			lspins = sq_lock(sh);
+			post_locked(c, sh, cap_addr);
+			sq_unlock(sh);
+			t2 = clock64();
+			tags[tag].t_post = t2;
+			__threadfence_system();
+		}
 
 		for (;;) {
 			spins++;

@@ -19,7 +19,9 @@
  *                        bit4(=16) 自轮询:不要独立 poller,
  *                        bit5(=32) 串行快路径(仅 QD=1),
  *                        bit6(=64) 不启动 poller block(配 16 或 32),
- *                        bit7(=128) 读 CQE 硬件时间戳
+ *                        bit7(=128) 读 CQE 硬件时间戳,
+ *                        bit8(=256) 精简提交(仅 QD=1,配 32):门铃后不做带
+ *                        fence 的写
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -481,6 +483,10 @@ main(int argc, char **argv)
 	}
 	if ((g_opt & 0x20) && g_qd != 1) {
 		fprintf(stderr, "-O 32(串行快路径)只能配 -Q 1\n");
+		return 1;
+	}
+	if ((g_opt & 0x100) && (!(g_opt & 0x20) || g_qd != 1)) {
+		fprintf(stderr, "-O 256(精简提交)要配 -O 32 且 -Q 1\n");
 		return 1;
 	}
 	if ((g_opt & 0x40) && !(g_opt & 0x30)) {
@@ -1379,6 +1385,9 @@ main(int argc, char **argv)
 				dv[m] = c_det[i] / ps;
 				hv[m] = c_hand[i] / ps;
 				m++;
+			}
+			if (g_opt & 0x100) {
+				m = 0;		/* 精简提交不写 t_post,拆分无意义 */
 			}
 			if (m) {
 				qsort(dv, m, sizeof(double), cmp_d);
