@@ -62,6 +62,13 @@ set_abort(struct gio_shared *sh, int err)
 /* poller                                                              */
 /* ================================================================== */
 
+/* cqe64 offset 48:网卡的自由运行计数器,大端 */
+__device__ static inline uint64_t
+cqe64_ts(volatile uint8_t *cqe64)
+{
+	return wqe_hto_be64(*(volatile uint64_t *)(cqe64 + 48));
+}
+
 /*
  * 处理一个 RESP_SEND:取到响应胶囊 → 读 NVMe CQE → 置 tag 完成。
  *
@@ -136,6 +143,9 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		uint64_t now = clock64();
 
 		vt->det = now - vt->t_post;	/* t_post 早已 fence 过 */
+		if (c->opt & 0x80) {
+			vt->ts_resp = cqe64_ts(cqe64);
+		}
 		vt->status = status;
 		if ((status >> 1) != 0) {
 			if (sh->nvme_err == 0) {
@@ -168,6 +178,12 @@ cqe_tail(struct gpu_io_ctx *c, volatile uint8_t *cqe)
 	return *(volatile uint64_t *)(cqe + c->cqe_size - 8);
 }
 
+__device__ static inline uint64_t
+cqe_ts(struct gpu_io_ctx *c, volatile uint8_t *cqe)
+{
+	return cqe64_ts(cqe + c->cqe_size - 64);
+}
+
 __device__ static uint64_t
 consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	    volatile uint8_t *cqe, uint32_t *seq)
@@ -189,6 +205,10 @@ consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		(*seq)++;
 	} else if (opcode == MLX5_CQE_REQ) {
 		sh->cqe_req++;
+		if (c->opt & 0x80) {
+			sh->last_req_ts = cqe_ts(c, cqe);
+			sh->last_req_at = clock64();
+		}
 	} else if (opcode == MLX5_CQE_REQ_ERR ||
 		   opcode == MLX5_CQE_RESP_ERR) {
 		/* cqe64 在条目末尾;syndrome 在其 offset 55,vendor_err 在 54 */
@@ -387,7 +407,8 @@ __device__ static void
 submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	  uint32_t tag, uint64_t start_lba, uint64_t *c_cap, uint64_t *c_sub,
 	  uint64_t *c_wait, uint64_t *c_spin, uint64_t *c_lock,
-	  uint32_t *c_stat, uint64_t *c_det, uint64_t *c_hand)
+	  uint32_t *c_stat, uint64_t *c_det, uint64_t *c_hand,
+	  uint64_t *c_tsreq, uint64_t *c_tsresp, uint64_t *c_reqat)
 {
 	volatile uint8_t *cap = c->capsule + (size_t)tag * 64;
 	uint64_t cap_addr = c->capsule_addr + (uint64_t)tag * 64;
@@ -490,6 +511,12 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 			c_hand[j] = t3 - td;
 		}
 
+		if (c->opt & 0x80) {
+			c_tsreq[j] = sh->last_req_ts;
+			c_reqat[j] = sh->last_req_at - t2;	/* 门铃→发现 SEND 完成 */
+			c_tsresp[j] = tags[tag].ts_resp;
+		}
+
 		c_cap[j]  = t1 - t0;	/* 写 64 字节胶囊 */
 		c_sub[j]  = t2 - t1;	/* 抢锁 + WQE + dbrec + 门铃 */
 		c_wait[j] = t3 - t2;	/* 网络往返 + target + poller 转交 */
@@ -510,7 +537,8 @@ __global__ void
 k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
 	 uint64_t start_lba, uint64_t *c_cap, uint64_t *c_sub,
 	 uint64_t *c_wait, uint64_t *c_spin, uint64_t *c_lock,
-	 uint32_t *c_stat, uint64_t *c_det, uint64_t *c_hand)
+	 uint32_t *c_stat, uint64_t *c_det, uint64_t *c_hand,
+	 uint64_t *c_tsreq, uint64_t *c_tsresp, uint64_t *c_reqat)
 {
 	uint32_t t = blockIdx.x;
 
@@ -526,7 +554,8 @@ k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
 		}
 	} else {
 		submitter(&ctx, sh, tags, t - 1, start_lba, c_cap, c_sub,
-			  c_wait, c_spin, c_lock, c_stat, c_det, c_hand);
+			  c_wait, c_spin, c_lock, c_stat, c_det, c_hand,
+			  c_tsreq, c_tsresp, c_reqat);
 	}
 }
 
@@ -598,11 +627,13 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	   unsigned long long *host_wait, unsigned long long *host_spin,
 	   unsigned long long *host_lock, unsigned int *host_stat,
 	   unsigned long long *host_det, unsigned long long *host_hand,
-	   struct gio_shared *sh_out)
+	   unsigned long long *host_tsreq, unsigned long long *host_tsresp,
+	   unsigned long long *host_reqat, struct gio_shared *sh_out)
 {
 	uint64_t *d_cap = NULL, *d_sub = NULL, *d_wait = NULL;
 	uint64_t *d_spin = NULL, *d_lock = NULL;
 	uint64_t *d_det = NULL, *d_hand = NULL;
+	uint64_t *d_tsreq = NULL, *d_tsresp = NULL, *d_reqat = NULL;
 	uint32_t *d_stat = NULL;
 	struct gio_shared *d_sh = NULL, sh0;
 	struct gio_tag *d_tags = NULL;
@@ -620,6 +651,9 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	    mcMalloc((void **)&d_lock, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_det, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_hand, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_tsreq, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_tsresp, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_reqat, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_stat, ctx->njobs * sizeof(uint32_t)) != mcSuccess ||
 	    mcMalloc((void **)&d_sh, sizeof(*d_sh)) != mcSuccess ||
 	    mcMalloc((void **)&d_tags, tsz) != mcSuccess) {
@@ -638,10 +672,14 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 
 	mcMemset(d_det, 0, sz);
 	mcMemset(d_hand, 0, sz);
+	mcMemset(d_tsreq, 0, sz);
+	mcMemset(d_tsresp, 0, sz);
+	mcMemset(d_reqat, 0, sz);
 	mcDeviceSynchronize();
 
 	k_gpu_io<<<nblk, 32>>>(*ctx, d_sh, d_tags, start_lba, d_cap, d_sub,
-			       d_wait, d_spin, d_lock, d_stat, d_det, d_hand);
+			       d_wait, d_spin, d_lock, d_stat, d_det, d_hand,
+			       d_tsreq, d_tsresp, d_reqat);
 
 	e = mcGetLastError();
 	if (e != mcSuccess) {
@@ -661,6 +699,9 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	mcMemcpy(host_lock, d_lock, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_det, d_det, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_hand, d_hand, sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_tsreq, d_tsreq, sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_tsresp, d_tsresp, sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_reqat, d_reqat, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_stat, d_stat, ctx->njobs * sizeof(uint32_t),
 		 mcMemcpyDeviceToHost);
 	mcMemcpy(sh_out, d_sh, sizeof(*sh_out), mcMemcpyDeviceToHost);
@@ -673,6 +714,9 @@ out:
 	if (d_lock) mcFree(d_lock);
 	if (d_det)  mcFree(d_det);
 	if (d_hand) mcFree(d_hand);
+	if (d_tsreq) mcFree(d_tsreq);
+	if (d_tsresp) mcFree(d_tsresp);
+	if (d_reqat) mcFree(d_reqat);
 	if (d_stat) mcFree(d_stat);
 	if (d_sh)   mcFree(d_sh);
 	if (d_tags) mcFree(d_tags);

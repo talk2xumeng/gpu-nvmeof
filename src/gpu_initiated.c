@@ -18,7 +18,8 @@
  *                        bit1 poller 空转稀疏检查,bit2 配合 bit0 改为 1024 圈,
  *                        bit4(=16) 自轮询:不要独立 poller,
  *                        bit5(=32) 串行快路径(仅 QD=1),
- *                        bit6(=64) 不启动 poller block(配 16 或 32)
+ *                        bit6(=64) 不启动 poller block(配 16 或 32),
+ *                        bit7(=128) 读 CQE 硬件时间戳
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -59,7 +60,8 @@ extern int gpu_io_run(struct gpu_io_ctx *, unsigned long long,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned int *,
 		      unsigned long long *, unsigned long long *,
-		      struct gio_shared *);
+		      unsigned long long *, unsigned long long *,
+		      unsigned long long *, struct gio_shared *);
 extern int gpu_alloc_exportable(void **, int *, size_t);
 extern int gpu_alloc_exportable_ex(void **, int *, size_t, unsigned int);
 extern int gpu_map_host(void *, size_t, unsigned int, void **);
@@ -423,7 +425,7 @@ main(int argc, char **argv)
 	struct gpu_io_ctx ctx;
 	unsigned long long *cycles, *c_cap, *c_sub, *c_wait, *c_spin, *c_lock;
 	unsigned int *c_stat;
-	unsigned long long *c_det, *c_hand;
+	unsigned long long *c_det, *c_hand, *c_tsreq, *c_tsresp, *c_reqat;
 	struct gio_shared sh;
 	struct spdk_nvme_io_qpair_opts qopts;
 	void *d_rsp = NULL;
@@ -1000,13 +1002,17 @@ main(int argc, char **argv)
 	c_stat = calloc(g_rounds, sizeof(*c_stat));
 	c_det  = calloc(g_rounds, sizeof(*c_det));
 	c_hand = calloc(g_rounds, sizeof(*c_hand));
+	c_tsreq  = calloc(g_rounds, sizeof(*c_tsreq));
+	c_tsresp = calloc(g_rounds, sizeof(*c_tsresp));
+	c_reqat  = calloc(g_rounds, sizeof(*c_reqat));
 	us = calloc(g_rounds, sizeof(*us));
 	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u, %s, -O %u\n",
 	       g_write ? "WRITE" : "READ", g_rounds, g_io_bytes, g_qd,
 	       ctx.data_step ? "每条一块" : "单块复用", g_opt);
 
 	if (gpu_io_run(&ctx, g_start_lba, c_cap, c_sub, c_wait, c_spin,
-		       c_lock, c_stat, c_det, c_hand, &sh) != 0) {
+		       c_lock, c_stat, c_det, c_hand, c_tsreq, c_tsresp,
+		       c_reqat, &sh) != 0) {
 		fprintf(stderr, "kernel 执行失败\n");
 		return 1;
 	}
@@ -1389,6 +1395,58 @@ main(int argc, char **argv)
 			}
 			free(dv);
 			free(hv);
+		}
+		/*
+		 * 网卡侧时间戳(-O 128)。tick 频率未知,用相邻两条 I/O 的 SEND
+		 * 完成时间戳之差 <-> GPU 测到的单条总耗时来自校准。
+		 *
+		 * 这是区分"响应回来得晚"和"我们发现得晚"的关键:
+		 *   网卡侧 SEND→响应 ≈ 5 us,而 GPU 门铃→发现 ≈ 15 us
+		 *     -> 响应早就到了,是检测下限
+		 *   两者都 ≈ 15 us -> 响应确实回来得晚
+		 */
+		if (g_opt & 0x80) {
+			double ticks = 0, gpu_ns = 0;
+			double *rr = calloc(done ? done : 1, sizeof(*rr));
+			double *ra = calloc(done ? done : 1, sizeof(*ra));
+			unsigned m = 0, n2 = 0;
+
+			for (i = 0; i + 1 < g_rounds; i++) {
+				if (c_stat[i] == 0xffffffffu ||
+				    c_stat[i + 1] == 0xffffffffu ||
+				    !c_tsreq[i] || !c_tsreq[i + 1] ||
+				    c_tsreq[i + 1] <= c_tsreq[i]) {
+					continue;
+				}
+				ticks += c_tsreq[i + 1] - c_tsreq[i];
+				gpu_ns += (c_cap[i + 1] + c_sub[i + 1] +
+					   c_wait[i + 1]) * 1e6 / clk_khz;
+				n2++;
+			}
+			for (i = 0; i < g_rounds; i++) {
+				if (c_stat[i] == 0xffffffffu || !c_tsreq[i] ||
+				    c_tsresp[i] <= c_tsreq[i]) {
+					continue;
+				}
+				rr[m] = (double)(c_tsresp[i] - c_tsreq[i]);
+				ra[m] = c_reqat[i] * 1e6 / clk_khz / 1000.0;
+				m++;
+			}
+			if (n2 && m) {
+				double ns_tick = gpu_ns / ticks;
+
+				qsort(rr, m, sizeof(double), cmp_d);
+				qsort(ra, m, sizeof(double), cmp_d);
+				printf("\n  网卡时间戳: 1 tick = %.2f ns(自校准 %u 对)"
+				       "\n    网卡侧 SEND 完成→响应到达 p50 %.1f us"
+				       "\n    GPU 门铃→发现 SEND 完成   p50 %.1f us",
+				       ns_tick, n2, rr[m / 2] * ns_tick / 1000.0,
+				       ra[m / 2]);
+			} else {
+				printf("\n  网卡时间戳: 取不到有效样本(可能没开 rt 时钟)");
+			}
+			free(rr);
+			free(ra);
 		}
 		if (g_opt & 0x30) {
 			printf("\n  自轮询: 收割 %llu 次, 命中 %llu, 处理一条响应 %.0f ns",

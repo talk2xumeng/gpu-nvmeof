@@ -56,6 +56,9 @@ struct gpu_io_ctx {
 	 *         空转每圈只读一次主存 —— 和旧串行 kernel 同形
 	 *   bit6  不启动 poller 的 block,只启动 QD 个 submitter block
 	 *         (须配 bit4 或 bit5)
+	 *   bit7  读 CQE 里的硬件时间戳(cqe64 offset 48,大端):网卡侧看到的
+	 *         SEND 完成与响应到达的间隔,用来和 GPU 侧的发现时刻对比。
+	 *         多一次主存读,默认不开
 	 */
 	uint32_t		opt;
 	uint32_t		njobs;		/* 本次 launch 的 I/O 总数 */
@@ -102,6 +105,8 @@ struct gio_shared {
 	uint32_t	sp_ci;
 	uint32_t	sp_phase;
 	uint32_t	sp_seq;
+	uint64_t	last_req_ts;	/* opt bit7:最近一个 SEND 完成 CQE 的网卡时间戳 */
+	uint64_t	last_req_at;	/* 同上,发现它时的 GPU 时钟 */
 	uint64_t	resp_cycles;	/* poller:处理响应(handle_resp)的总耗时 */
 };
 
@@ -110,6 +115,7 @@ struct gio_tag {
 	uint32_t	state;		/* 0 空闲 1 已提交(submitter) 2 完成 3 NVMe 出错(poller) */
 	uint32_t	job;		/* submitter */
 	uint16_t	status;		/* poller:NVMe status 字(含 phase tag 位) */
+	uint64_t	ts_resp;	/* opt bit7:响应 CQE 的网卡时间戳 */
 	uint16_t	rsvd;
 	uint32_t	rsvd2;
 	/*
