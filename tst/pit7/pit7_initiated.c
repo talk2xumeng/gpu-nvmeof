@@ -80,9 +80,10 @@
 extern int gpu_io_run(struct gpu_io_ctx *, unsigned int, unsigned long long,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned long long *,
+		      unsigned long long *, struct gio_clock *, double *,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned long long *,
-		      unsigned long long *, int *, unsigned int *);
+		      int *, unsigned int *);
 extern int gpu_alloc_exportable(void **, int *, size_t);
 extern int gpu_alloc_exportable_ex(void **, int *, size_t, unsigned int);
 extern int gpu_map_host(void *, size_t, unsigned int, void **);
@@ -592,6 +593,8 @@ main(int argc, char **argv)
 	unsigned long long *cycles, *c_cap, *c_sub, *c_wait, *c_spin;
 	double *us;
 	unsigned long long *c_fill, *c_tsreq, *c_tsresp, *c_reqat;
+	struct gio_clock gclk = { 0, 0 };
+	double wall_us = 0;
 	double *wall = NULL;
 	uint32_t sector, nlb, nblk;
 	int err = 0, clk_khz = 0, op;
@@ -1132,11 +1135,23 @@ main(int argc, char **argv)
 			cycles[i] = c_fill[i] + c_cap[i] + c_sub[i] + c_wait[i];
 		}
 	} else if (gpu_io_run(&ctx, g_rounds, g_start_lba, cycles, c_fill,
-			      c_tsreq, c_tsresp, c_reqat,
+			      c_tsreq, c_tsresp, c_reqat, &gclk, &wall_us,
 			      c_cap, c_sub, c_wait, c_spin, &err,
 			      &done) != 0) {
 		fprintf(stderr, "kernel 执行失败\n");
 		return 1;
+	}
+
+	/* 实测 GPU 时钟:标称值是最大频率,实际随负载变,换算微秒必须用实测值 */
+	if (gclk.k_end > gclk.k_start && wall_us > 0) {
+		int khz = (int)((gclk.k_end - gclk.k_start) / wall_us * 1000.0);
+
+		printf("[GPU 时钟] 标称 %d kHz, 实测 %d kHz (kernel %llu cycles / "
+		       "%.0f us)\n", clk_khz, khz,
+		       gclk.k_end - gclk.k_start, wall_us);
+		if (khz > 100000 && khz < 4000000) {
+			clk_khz = khz;
+		}
 	}
 
 	/*

@@ -113,6 +113,13 @@ struct gio_shared {
 	uint32_t	sp_seq;
 	uint64_t	last_req_ts;	/* opt bit7:最近一个 SEND 完成 CQE 的网卡时间戳 */
 	uint64_t	last_req_at;	/* 同上,发现它时的 GPU 时钟 */
+	/*
+	 * 实测 GPU 时钟用:kernel 自己的起止 clock64()。
+	 * mcGetDeviceProperties 给的是标称最大频率,实际频率随负载变,
+	 * 用标称值换算微秒会系统性偏(两个二进制之间实测差过 1.67 倍)。
+	 */
+	uint64_t	k_start;
+	uint64_t	k_end;
 	uint64_t	resp_cycles;	/* poller:处理响应(handle_resp)的总耗时 */
 };
 

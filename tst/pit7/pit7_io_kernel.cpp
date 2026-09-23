@@ -253,8 +253,8 @@ __global__ void
 k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 	 uint64_t *cycles, uint64_t *c_fill, uint64_t *c_cap, uint64_t *c_sub,
 	 uint64_t *c_wait, uint64_t *c_spin, uint64_t *c_tsreq,
-	 uint64_t *c_tsresp, uint64_t *c_reqat, int *err_out,
-	 uint32_t *done_out)
+	 uint64_t *c_tsresp, uint64_t *c_reqat, struct gio_clock *clk,
+	 int *err_out, uint32_t *done_out)
 {
 	uint32_t i;
 	uint16_t pi;
@@ -266,6 +266,7 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 		return;
 	}
 
+	clk->k_start = clock64();
 	pi = ctx.sq_pi;
 	ci = ctx.cq_ci;
 	phase = ctx.cq_phase;
@@ -305,12 +306,14 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 		if (rc != 0) {
 			*err_out = rc;
 			*done_out = i;
+			clk->k_end = clock64();
 			return;
 		}
 
 		pi++;
 		*done_out = i + 1;
 	}
+	clk->k_end = clock64();
 }
 
 /* 只敲门铃,用于单独测 MMIO 写的成本 */
@@ -697,7 +700,8 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
 	   unsigned long long start_lba, unsigned long long *host_cycles,
 	   unsigned long long *host_fill,
 	   unsigned long long *host_tsreq, unsigned long long *host_tsresp,
-	   unsigned long long *host_reqat,
+	   unsigned long long *host_reqat, struct gio_clock *host_clk,
+	   double *wall_us_out,
 	   unsigned long long *host_cap, unsigned long long *host_sub,
 	   unsigned long long *host_wait, unsigned long long *host_spin,
 	   int *host_err, unsigned int *host_done)
@@ -705,6 +709,7 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
 	uint64_t *d_cycles = NULL, *d_cap = NULL, *d_sub = NULL, *d_wait = NULL;
 	uint64_t *d_spin = NULL, *d_fill = NULL;
 	uint64_t *d_tsreq = NULL, *d_tsresp = NULL, *d_reqat = NULL;
+	struct gio_clock *d_clk = NULL;
 	int *d_err = NULL;
 	uint32_t *d_done = NULL;
 	size_t sz = rounds * sizeof(uint64_t);
@@ -720,6 +725,7 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
 	    mcMalloc((void **)&d_tsreq, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_tsresp, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_reqat, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_clk, sizeof(*d_clk)) != mcSuccess ||
 	    mcMalloc((void **)&d_err, sizeof(int)) != mcSuccess ||
 	    mcMalloc((void **)&d_done, sizeof(uint32_t)) != mcSuccess) {
 		goto out;
@@ -730,9 +736,15 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
 	mcMemset(d_reqat, 0, sz);
 	mcDeviceSynchronize();
 
+	{
+		struct timespec ts;
+
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		*wall_us_out = ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+	}
 	k_gpu_io<<<1, 32>>>(*ctx, rounds, start_lba, d_cycles, d_fill,
 			    d_cap, d_sub, d_wait, d_spin, d_tsreq, d_tsresp,
-			    d_reqat, d_err, d_done);
+			    d_reqat, d_clk, d_err, d_done);
 
 	e = mcGetLastError();
 	if (e != mcSuccess) {
@@ -754,6 +766,13 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
 	mcMemcpy(host_tsreq, d_tsreq, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_tsresp, d_tsresp, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_reqat, d_reqat, sz, mcMemcpyDeviceToHost);
+	{
+		struct timespec ts;
+
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		*wall_us_out = ts.tv_sec * 1e6 + ts.tv_nsec / 1e3 - *wall_us_out;
+	}
+	mcMemcpy(host_clk, d_clk, sizeof(*host_clk), mcMemcpyDeviceToHost);
 	mcMemcpy(host_err, d_err, sizeof(int), mcMemcpyDeviceToHost);
 	mcMemcpy(host_done, d_done, sizeof(uint32_t), mcMemcpyDeviceToHost);
 	rc = 0;
@@ -767,6 +786,7 @@ out:
 	if (d_tsreq)  mcFree(d_tsreq);
 	if (d_tsresp) mcFree(d_tsresp);
 	if (d_reqat)  mcFree(d_reqat);
+	if (d_clk)    mcFree(d_clk);
 	if (d_err)    mcFree(d_err);
 	if (d_done)   mcFree(d_done);
 	return rc;

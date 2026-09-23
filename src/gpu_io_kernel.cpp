@@ -572,6 +572,10 @@ k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
 {
 	uint32_t t = blockIdx.x;
 
+	/* 记 kernel 的起止时钟:由实际干活的第一个 block 记 */
+	if (threadIdx.x == 0 && t == 0) {
+		sh->k_start = clock64();
+	}
 	if (ctx.opt & 0x40) {
 		t++;		/* 没有 poller block:block i 就是 submitter i */
 	}
@@ -586,6 +590,10 @@ k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
 		submitter(&ctx, sh, tags, t - 1, start_lba, c_cap, c_sub,
 			  c_wait, c_spin, c_lock, c_stat, c_det, c_hand,
 			  c_tsreq, c_tsresp, c_reqat);
+	}
+	if (threadIdx.x == 0 && t == (((ctx.opt & 0x30) &&
+				       !(ctx.opt & 0x40)) ? 1u : 0u)) {
+		sh->k_end = clock64();
 	}
 }
 
@@ -658,7 +666,8 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	   unsigned long long *host_lock, unsigned int *host_stat,
 	   unsigned long long *host_det, unsigned long long *host_hand,
 	   unsigned long long *host_tsreq, unsigned long long *host_tsresp,
-	   unsigned long long *host_reqat, struct gio_shared *sh_out)
+	   unsigned long long *host_reqat, double *wall_us_out,
+	   struct gio_shared *sh_out)
 {
 	uint64_t *d_cap = NULL, *d_sub = NULL, *d_wait = NULL;
 	uint64_t *d_spin = NULL, *d_lock = NULL;
@@ -707,6 +716,12 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	mcMemset(d_reqat, 0, sz);
 	mcDeviceSynchronize();
 
+	{
+		struct timespec ts;
+
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		*wall_us_out = ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+	}
 	k_gpu_io<<<nblk, 32>>>(*ctx, d_sh, d_tags, start_lba, d_cap, d_sub,
 			       d_wait, d_spin, d_lock, d_stat, d_det, d_hand,
 			       d_tsreq, d_tsresp, d_reqat);
@@ -722,6 +737,12 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 		goto out;
 	}
 
+	{
+		struct timespec ts;
+
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		*wall_us_out = ts.tv_sec * 1e6 + ts.tv_nsec / 1e3 - *wall_us_out;
+	}
 	mcMemcpy(host_cap,  d_cap,  sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_sub,  d_sub,  sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_wait, d_wait, sz, mcMemcpyDeviceToHost);

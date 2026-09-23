@@ -64,7 +64,7 @@ extern int gpu_io_run(struct gpu_io_ctx *, unsigned long long,
 		      unsigned long long *, unsigned int *,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned long long *,
-		      unsigned long long *, struct gio_shared *);
+		      unsigned long long *, double *, struct gio_shared *);
 extern int gpu_alloc_exportable(void **, int *, size_t);
 extern int gpu_alloc_exportable_ex(void **, int *, size_t, unsigned int);
 extern int gpu_map_host(void *, size_t, unsigned int, void **);
@@ -435,6 +435,7 @@ main(int argc, char **argv)
 	uint32_t rq_posted = 0;
 	uint64_t rsp_lo = 0, rsp_gap = 0;
 	double *us;
+	double wall_us = 0;
 	uint32_t sector, nlb, nblk;
 	int err = 0, clk_khz = 0, op;
 	unsigned int done = 0, i;
@@ -1023,7 +1024,7 @@ main(int argc, char **argv)
 
 	if (gpu_io_run(&ctx, g_start_lba, c_cap, c_sub, c_wait, c_spin,
 		       c_lock, c_stat, c_det, c_hand, c_tsreq, c_tsresp,
-		       c_reqat, &sh) != 0) {
+		       c_reqat, &wall_us, &sh) != 0) {
 		fprintf(stderr, "kernel 执行失败\n");
 		return 1;
 	}
@@ -1159,6 +1160,24 @@ main(int argc, char **argv)
 				       q % 16 == 15 ? "\n  " : " ");
 			}
 			printf("\n");
+		}
+	}
+
+	/*
+	 * 实测 GPU 时钟。标称值是最大频率,实际频率随负载变 —— 用标称值
+	 * 换算微秒会系统性偏(两个二进制之间实测差过 1.67 倍,足以把
+	 * "谁更快"判反)。之后所有微秒换算都用实测值。
+	 */
+	if (sh.k_end > sh.k_start && wall_us > 0) {
+		int khz = (int)((sh.k_end - sh.k_start) / wall_us * 1000.0);
+
+		printf("[GPU 时钟] 标称 %d kHz, 实测 %d kHz (kernel %llu cycles / "
+		       "%.0f us)\n", clk_khz, khz,
+		       (unsigned long long)(sh.k_end - sh.k_start), wall_us);
+		if (khz > 100000 && khz < 4000000) {
+			clk_khz = khz;
+		} else {
+			printf("[GPU 时钟] 实测值不合理,仍用标称值\n");
 		}
 	}
 

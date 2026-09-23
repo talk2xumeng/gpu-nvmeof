@@ -74,4 +74,10 @@ struct gpu_io_ctx {
 	uint8_t			ts_diag;
 };
 
+/* 实测 GPU 时钟用:kernel 自己的起止 clock64()(标称频率是最大值,不准) */
+struct gio_clock {
+	unsigned long long	k_start;
+	unsigned long long	k_end;
+};
+
 #endif /* PIT7_IO_CTX_H */
