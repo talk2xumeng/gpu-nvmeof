@@ -1196,9 +1196,12 @@ main(int argc, char **argv)
 		} else {
 			memcpy(cap, g_cap_host, 64);
 		}
-		printf("\n[胶囊] ");
-		for (k = 0; k < 16; k++) {
+		printf("\n[胶囊] 64 字节:\n  ");
+		for (k = 0; k < 64; k++) {
 			printf("%02x ", cap[k]);
+			if (k % 16 == 15) {
+				printf("\n  ");
+			}
 		}
 		printf("\n  opc=0x%02x cid=0x%04x %s\n", cap[0],
 		       (unsigned)(cap[2] | (cap[3] << 8)),

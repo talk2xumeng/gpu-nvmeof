@@ -128,8 +128,13 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	cid = (uint16_t)(w >> 32);
 	status = (uint16_t)(w >> 48);
 
-	tag = cid & ~GIO_CID_TAG;
-	if ((cid & GIO_CID_TAG) == 0 || tag >= c->qd) {
+	if (c->opt & 0x400) {
+		tag = 0;	/* -O 1024:旧式 cid,只在 QD=1 下用 */
+	} else {
+		tag = cid & ~GIO_CID_TAG;
+	}
+	if ((c->opt & 0x400) ? ((cid & 0xf000) != 0xE000) :
+	    ((cid & GIO_CID_TAG) == 0 || tag >= c->qd)) {
 		if (sh->cid_bad == 0) {
 			sh->first_bad_cid = cid;
 		}
@@ -422,8 +427,6 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	  uint32_t *c_stat, uint64_t *c_det, uint64_t *c_hand,
 	  uint64_t *c_tsreq, uint64_t *c_tsresp, uint64_t *c_reqat)
 {
-	volatile uint8_t *cap = c->capsule + (size_t)tag * 64;
-	uint64_t cap_addr = c->capsule_addr + (uint64_t)tag * 64;
 	uint32_t nlb = c->io_bytes / c->sector_size;
 	uint32_t j;
 	/* 串行快路径(opt bit5)的本地 CQ 状态 */
@@ -431,14 +434,22 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	uint8_t my_phase = c->cq_phase;
 
 	while (claim_job(sh, c->njobs, &j)) {
+		/* -O 512:槽位按 job 轮换,同旧 kernel;默认固定用 tag 号 */
+		uint32_t cslot = (c->opt & 0x200) ? (j & 0x3f) : tag;
+		volatile uint8_t *cap = c->capsule + (size_t)cslot * 64;
+		uint64_t cap_addr = c->capsule_addr + (uint64_t)cslot * 64;
+		/* -O 1024:cid 用旧 kernel 的取值 */
+		uint16_t cid = (c->opt & 0x400) ?
+			       (uint16_t)(0xE000 | (j & 0xfff)) :
+			       (uint16_t)(GIO_CID_TAG | tag);
 		uint64_t lba = start_lba + (uint64_t)j * nlb;
 		uint64_t blk = c->data_addr + (uint64_t)j * c->data_step;
 		uint64_t t0, t1, t2, t3, lspins, spins = 0;
 		uint32_t st;
 
 		t0 = clock64();
-		nvme_build_rw_sqe((struct nvme_sqe *)cap, c->nvme_opc,
-				  (uint16_t)(GIO_CID_TAG | tag), c->nsid,
+		nvme_build_rw_sqe((struct nvme_sqe *)cap, c->nvme_opc, cid,
+				  c->nsid,
 				  lba, nlb, blk, c->data_rkey, c->io_bytes);
 		__threadfence_system();		/* 胶囊在主存,网卡要读 */
 		t1 = clock64();

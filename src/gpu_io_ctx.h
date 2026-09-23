@@ -59,6 +59,9 @@ struct gpu_io_ctx {
 	 *   bit8  精简提交(仅 QD=1,须配 bit5):本地 pi,不抢锁、不写共享 sq_pi、
 	 *         不写 t_post —— 门铃之后不做任何带 fence 的写,和旧串行 kernel
 	 *         的提交路径一致。用来验证门铃后的 fence 是否拖慢网卡
+	 *   bit9  胶囊槽位按 job 轮换(j & 0x3f),而不是固定用 tag 号 ——
+	 *         旧串行 kernel 就是轮换的
+	 *   bit10 cid 用 0xE000 | j(旧 kernel 的取值,仅 QD=1)
 	 *   bit7  读 CQE 里的硬件时间戳(cqe64 offset 48,大端):网卡侧看到的
 	 *         SEND 完成与响应到达的间隔,用来和 GPU 侧的发现时刻对比。
 	 *         多一次主存读,默认不开

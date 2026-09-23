@@ -21,7 +21,8 @@
  *                        bit6(=64) 不启动 poller block(配 16 或 32),
  *                        bit7(=128) 读 CQE 硬件时间戳,
  *                        bit8(=256) 精简提交(仅 QD=1,配 32):门铃后不做带
- *                        fence 的写
+ *                        fence 的写,bit9(=512) 胶囊槽位轮换,
+ *                        bit10(=1024) 旧式 cid 0xE000|j(仅 QD=1)
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -483,6 +484,10 @@ main(int argc, char **argv)
 	}
 	if ((g_opt & 0x20) && g_qd != 1) {
 		fprintf(stderr, "-O 32(串行快路径)只能配 -Q 1\n");
+		return 1;
+	}
+	if ((g_opt & 0x400) && g_qd != 1) {
+		fprintf(stderr, "-O 1024(旧式 cid)只能配 -Q 1\n");
 		return 1;
 	}
 	if ((g_opt & 0x100) && (!(g_opt & 0x20) || g_qd != 1)) {
@@ -1216,9 +1221,12 @@ main(int argc, char **argv)
 		} else {
 			memcpy(cap, g_cap_host, 64);
 		}
-		printf("\n[胶囊] ");
-		for (k = 0; k < 16; k++) {
+		printf("\n[胶囊] 64 字节:\n  ");
+		for (k = 0; k < 64; k++) {
 			printf("%02x ", cap[k]);
+			if (k % 16 == 15) {
+				printf("\n  ");
+			}
 		}
 		printf("\n  opc=0x%02x cid=0x%04x %s\n", cap[0],
 		       (unsigned)(cap[2] | (cap[3] << 8)),
