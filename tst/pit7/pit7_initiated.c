@@ -42,6 +42,8 @@
  *                              —— mxshmem IBGDA 队列内存的做法
  *                          3 = devx umem_reg(GPU VA)+ CREATE_MKEY
  *   -X                   写完显存后 __threadfence()(IBGDA_MEMBAR 的级别)
+ *   -G                   读 CQE 里的网卡时间戳,和 src/ 的 -O 128 同口径:
+ *                        网卡侧 SEND 完成→响应到达的真实间隔
  *   -N <ibdev>           -B 注册 MR 用的网卡(默认 mlx5_1)
  *   -D <flag>            数据区用 mcExtMallocWithFlags 分配(默认 0=mcMalloc)
  *   -K                   旧式对照:单块、单字节 pattern、独立 kernel 填充
@@ -79,7 +81,8 @@ extern int gpu_io_run(struct gpu_io_ctx *, unsigned int, unsigned long long,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned long long *,
-		      int *, unsigned int *);
+		      unsigned long long *, unsigned long long *,
+		      unsigned long long *, int *, unsigned int *);
 extern int gpu_alloc_exportable(void **, int *, size_t);
 extern int gpu_alloc_exportable_ex(void **, int *, size_t, unsigned int);
 extern int gpu_map_host(void *, size_t, unsigned int, void **);
@@ -136,6 +139,7 @@ static int	g_split;		/* -T */
 static int	g_poll_fence;		/* -Z */
 static int	g_reg_mode;		/* -R */
 static int	g_dev_fence;		/* -X */
+static int	g_ts_diag;		/* -G */
 static char	g_bench_dev[32] = "mlx5_1";	/* -N */
 static uint64_t	g_start_lba;
 static uint8_t	g_seed = 1;
@@ -587,7 +591,7 @@ main(int argc, char **argv)
 	struct gpu_io_ctx ctx;
 	unsigned long long *cycles, *c_cap, *c_sub, *c_wait, *c_spin;
 	double *us;
-	unsigned long long *c_fill;
+	unsigned long long *c_fill, *c_tsreq, *c_tsresp, *c_reqat;
 	double *wall = NULL;
 	uint32_t sector, nlb, nblk;
 	int err = 0, clk_khz = 0, op;
@@ -598,7 +602,7 @@ main(int argc, char **argv)
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPVKF:L:S:I:D:Y:BT:ZR:N:X")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:WHPVKF:L:S:I:D:Y:BT:ZR:N:XG")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -621,6 +625,7 @@ main(int argc, char **argv)
 		case 'Z': g_poll_fence = 1; break;
 		case 'R': g_reg_mode = atoi(optarg); break;
 		case 'X': g_dev_fence = 1; break;
+		case 'G': g_ts_diag = 1; break;
 		case 'N': snprintf(g_bench_dev, sizeof(g_bench_dev), "%s", optarg); break;
 		case 'D': g_data_flags = (unsigned)strtoul(optarg, NULL, 0); break;
 		default:
@@ -940,6 +945,7 @@ main(int argc, char **argv)
 	ctx.gap_cycles   = (uint64_t)(g_gap_us * clk_khz / 1000.0);
 	ctx.poll_fence   = (uint8_t)g_poll_fence;
 	ctx.dev_fence    = (uint8_t)g_dev_fence;
+	ctx.ts_diag      = (uint8_t)g_ts_diag;
 	ctx.seed         = g_seed;
 
 	/*
@@ -1081,6 +1087,9 @@ main(int argc, char **argv)
 	c_wait = calloc(g_rounds, sizeof(*c_wait));
 	c_spin = calloc(g_rounds, sizeof(*c_spin));
 	c_fill = calloc(g_rounds, sizeof(*c_fill));
+	c_tsreq  = calloc(g_rounds, sizeof(*c_tsreq));
+	c_tsresp = calloc(g_rounds, sizeof(*c_tsresp));
+	c_reqat  = calloc(g_rounds, sizeof(*c_reqat));
 	us = calloc(g_rounds, sizeof(*us));
 	printf("\n[运行] %s %u 轮, 每轮 %u 字节, %s%s",
 	       g_write ? "WRITE" : "READ", g_rounds, g_io_bytes,
@@ -1123,6 +1132,7 @@ main(int argc, char **argv)
 			cycles[i] = c_fill[i] + c_cap[i] + c_sub[i] + c_wait[i];
 		}
 	} else if (gpu_io_run(&ctx, g_rounds, g_start_lba, cycles, c_fill,
+			      c_tsreq, c_tsresp, c_reqat,
 			      c_cap, c_sub, c_wait, c_spin, &err,
 			      &done) != 0) {
 		fprintf(stderr, "kernel 执行失败\n");
@@ -1306,7 +1316,50 @@ main(int argc, char **argv)
 				ssum += c_spin[i];
 				wsum += c_wait[i] / (clk_khz / 1000.0);
 			}
-			printf("\n  轮询圈数: mean %llu  min %llu  max %llu",
+			/*
+		 * 网卡时间戳(-G):和 src/ 的 -O 128 同口径。tick 频率用相邻两条
+		 * SEND 完成时间戳之差 <-> GPU 测到的单条总耗时自校准。
+		 */
+		if (g_ts_diag && done > 1) {
+			double ticks = 0, gpu_ns = 0;
+			double *rr = calloc(done, sizeof(*rr));
+			double *ra = calloc(done, sizeof(*ra));
+			unsigned m = 0, n2 = 0;
+
+			for (i = 0; i + 1 < done; i++) {
+				if (!c_tsreq[i] || !c_tsreq[i + 1] ||
+				    c_tsreq[i + 1] <= c_tsreq[i]) {
+					continue;
+				}
+				ticks += c_tsreq[i + 1] - c_tsreq[i];
+				gpu_ns += cycles[i + 1] * 1e6 / clk_khz;
+				n2++;
+			}
+			for (i = 0; i < done; i++) {
+				if (!c_tsreq[i] || c_tsresp[i] <= c_tsreq[i]) {
+					continue;
+				}
+				rr[m] = (double)(c_tsresp[i] - c_tsreq[i]);
+				ra[m] = c_reqat[i] * 1e6 / clk_khz / 1000.0;
+				m++;
+			}
+			if (n2 && m) {
+				double ns_tick = gpu_ns / ticks;
+
+				qsort(rr, m, sizeof(double), cmp_d);
+				qsort(ra, m, sizeof(double), cmp_d);
+				printf("\n  网卡时间戳: 1 tick = %.2f ns(自校准 %u 对)"
+				       "\n    网卡侧 SEND 完成→响应到达 p50 %.1f us"
+				       "\n    GPU 门铃→发现 SEND 完成   p50 %.1f us",
+				       ns_tick, n2, rr[m / 2] * ns_tick / 1000.0,
+				       ra[m / 2]);
+			} else {
+				printf("\n  网卡时间戳: 取不到有效样本");
+			}
+			free(rr);
+			free(ra);
+		}
+		printf("\n  轮询圈数: mean %llu  min %llu  max %llu",
 			       ssum / done, smin, smax);
 			if (ssum) {
 				printf("   平均每圈 %.0f ns",

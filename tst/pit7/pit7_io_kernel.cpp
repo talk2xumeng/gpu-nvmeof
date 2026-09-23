@@ -44,7 +44,8 @@
  */
 __device__ static int
 poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
-		  uint64_t timeout_cycles, uint64_t *spins_out)
+		  uint64_t timeout_cycles, uint64_t *spins_out,
+		  uint64_t *ts_req, uint64_t *ts_resp, uint64_t *req_at)
 {
 	uint64_t start = clock64();
 	uint64_t spins = 0;
@@ -96,6 +97,18 @@ poll_for_response(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase,
 		if (opcode == MLX5_CQE_REQ_ERR || opcode == MLX5_CQE_RESP_ERR) {
 			*spins_out = spins;
 			return -2;
+		}
+		if (c->ts_diag) {
+			/* cqe64 offset 48,大端;cqe64 在条目末尾 */
+			uint64_t ts = wqe_hto_be64(*(volatile uint64_t *)
+						   (cqe + c->cqe_size - 16));
+
+			if (opcode == MLX5_CQE_REQ) {
+				*ts_req = ts;
+				*req_at = clock64();
+			} else if (opcode == MLX5_CQE_RESP_SEND) {
+				*ts_resp = ts;
+			}
 		}
 		if (opcode == MLX5_CQE_RESP_SEND) {
 			*spins_out = spins;
@@ -239,7 +252,9 @@ submit_round(struct gpu_io_ctx *c, uint32_t i, uint16_t pi,
 __global__ void
 k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 	 uint64_t *cycles, uint64_t *c_fill, uint64_t *c_cap, uint64_t *c_sub,
-	 uint64_t *c_wait, uint64_t *c_spin, int *err_out, uint32_t *done_out)
+	 uint64_t *c_wait, uint64_t *c_spin, uint64_t *c_tsreq,
+	 uint64_t *c_tsresp, uint64_t *c_reqat, int *err_out,
+	 uint32_t *done_out)
 {
 	uint32_t i;
 	uint16_t pi;
@@ -266,7 +281,11 @@ k_gpu_io(struct gpu_io_ctx ctx, uint32_t rounds, uint64_t start_lba,
 		submit_round(&ctx, i, pi, start_lba, tt);
 		tf = tt[0]; t0 = tt[1]; t1 = tt[2]; t2 = tt[3];
 
-		rc = poll_for_response(&ctx, &ci, &phase, timeout, &spins);
+		rc = poll_for_response(&ctx, &ci, &phase, timeout, &spins,
+				       &c_tsreq[i], &c_tsresp[i], &c_reqat[i]);
+		if (ctx.ts_diag) {
+			c_reqat[i] -= t2;	/* 门铃→发现 SEND 完成 */
+		}
 		t3 = clock64();		/* 等待耗时 = t3 - t2 */
 
 		cycles[i] = t3 - tf;
@@ -401,7 +420,12 @@ k_post_poll(struct gpu_io_ctx ctx, uint32_t i, uint16_t pi,
 	ci = st[0];
 	phase = (uint8_t)st[1];
 	t0 = clock64();
-	rc = poll_for_response(&ctx, &ci, &phase, 2000000000ULL, &spins);
+	{
+		uint64_t ts0 = 0, ts1 = 0, at0 = 0;	/* -T 下不做时间戳诊断 */
+
+		rc = poll_for_response(&ctx, &ci, &phase, 2000000000ULL,
+				       &spins, &ts0, &ts1, &at0);
+	}
 	rec[3] = clock64() - t0;
 	rec[4] = spins;
 	ctx.cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
@@ -426,7 +450,12 @@ k_poll(struct gpu_io_ctx ctx, volatile uint32_t *st, volatile uint64_t *rec)
 	ci = st[0];
 	phase = (uint8_t)st[1];
 	t0 = clock64();
-	rc = poll_for_response(&ctx, &ci, &phase, 2000000000ULL, &spins);
+	{
+		uint64_t ts0 = 0, ts1 = 0, at0 = 0;	/* -T 下不做时间戳诊断 */
+
+		rc = poll_for_response(&ctx, &ci, &phase, 2000000000ULL,
+				       &spins, &ts0, &ts1, &at0);
+	}
 	rec[3] = clock64() - t0;
 	rec[4] = spins;
 	ctx.cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
@@ -667,12 +696,15 @@ int
 gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
 	   unsigned long long start_lba, unsigned long long *host_cycles,
 	   unsigned long long *host_fill,
+	   unsigned long long *host_tsreq, unsigned long long *host_tsresp,
+	   unsigned long long *host_reqat,
 	   unsigned long long *host_cap, unsigned long long *host_sub,
 	   unsigned long long *host_wait, unsigned long long *host_spin,
 	   int *host_err, unsigned int *host_done)
 {
 	uint64_t *d_cycles = NULL, *d_cap = NULL, *d_sub = NULL, *d_wait = NULL;
 	uint64_t *d_spin = NULL, *d_fill = NULL;
+	uint64_t *d_tsreq = NULL, *d_tsresp = NULL, *d_reqat = NULL;
 	int *d_err = NULL;
 	uint32_t *d_done = NULL;
 	size_t sz = rounds * sizeof(uint64_t);
@@ -685,13 +717,22 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
 	    mcMalloc((void **)&d_wait, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_spin, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_fill, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_tsreq, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_tsresp, sz) != mcSuccess ||
+	    mcMalloc((void **)&d_reqat, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_err, sizeof(int)) != mcSuccess ||
 	    mcMalloc((void **)&d_done, sizeof(uint32_t)) != mcSuccess) {
 		goto out;
 	}
 
+	mcMemset(d_tsreq, 0, sz);
+	mcMemset(d_tsresp, 0, sz);
+	mcMemset(d_reqat, 0, sz);
+	mcDeviceSynchronize();
+
 	k_gpu_io<<<1, 32>>>(*ctx, rounds, start_lba, d_cycles, d_fill,
-			    d_cap, d_sub, d_wait, d_spin, d_err, d_done);
+			    d_cap, d_sub, d_wait, d_spin, d_tsreq, d_tsresp,
+			    d_reqat, d_err, d_done);
 
 	e = mcGetLastError();
 	if (e != mcSuccess) {
@@ -710,6 +751,9 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned int rounds,
 	mcMemcpy(host_wait, d_wait, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_spin, d_spin, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_fill, d_fill, sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_tsreq, d_tsreq, sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_tsresp, d_tsresp, sz, mcMemcpyDeviceToHost);
+	mcMemcpy(host_reqat, d_reqat, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_err, d_err, sizeof(int), mcMemcpyDeviceToHost);
 	mcMemcpy(host_done, d_done, sizeof(uint32_t), mcMemcpyDeviceToHost);
 	rc = 0;
@@ -720,6 +764,9 @@ out:
 	if (d_wait)   mcFree(d_wait);
 	if (d_spin)   mcFree(d_spin);
 	if (d_fill)   mcFree(d_fill);
+	if (d_tsreq)  mcFree(d_tsreq);
+	if (d_tsresp) mcFree(d_tsresp);
+	if (d_reqat)  mcFree(d_reqat);
 	if (d_err)    mcFree(d_err);
 	if (d_done)   mcFree(d_done);
 	return rc;

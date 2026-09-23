@@ -70,6 +70,8 @@ struct gpu_io_ctx {
 	 * 我们的 SQ/CQ 在主存,那边仍用 system 级;这里只加在写显存之后。
 	 */
 	uint8_t			dev_fence;
+	/* -G:读 CQE 里的网卡时间戳(cqe64 offset 48),和 src/ 的 -O 128 同口径 */
+	uint8_t			ts_diag;
 };
 
 #endif /* PIT7_IO_CTX_H */
