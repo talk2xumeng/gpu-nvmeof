@@ -37,6 +37,7 @@
  *                        bit18(=0x40000) BlueFlame 只回读 1 次(WQE 在寄存器里构造)
  *                        bit19(=0x80000) BF 写满 64 字节,bit20(=0x100000) BF 两块轮换,
  *                        bit21(=0x200000) 写 BF 前空等 ~3.6 us(这三位配 0x8000/0x40000)
+ *                        bit22(=0x400000) 默认路径的 4 次回读并发发出(不配 0x8000)
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)

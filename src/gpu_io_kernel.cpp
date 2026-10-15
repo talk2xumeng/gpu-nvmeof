@@ -730,8 +730,25 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 	pf_mark(pf, GIO_PF_DBR, pt);
 
 	src = (const uint64_t *)(void *)sq_slot;
-	for (w = 0; w < 4; w++) {
-		bfp[w] = src[w];
+	if (c->opt & GIO_OPT_RBPAR) {
+		/*
+		 * 4 次回读先全部发出、再写门铃。原写法每个读后面紧跟一个
+		 * volatile 写,编译器不能把后面的读提到写之前(可能别名),
+		 * 4 次主存读(~1 us 一次)只能串行。
+		 */
+		uint64_t v0 = ((volatile const uint64_t *)src)[0];
+		uint64_t v1 = ((volatile const uint64_t *)src)[1];
+		uint64_t v2 = ((volatile const uint64_t *)src)[2];
+		uint64_t v3 = ((volatile const uint64_t *)src)[3];
+
+		bfp[0] = v0;
+		bfp[1] = v1;
+		bfp[2] = v2;
+		bfp[3] = v3;
+	} else {
+		for (w = 0; w < 4; w++) {
+			bfp[w] = src[w];
+		}
 	}
 	WQE_FENCE_DB();
 	pf_mark(pf, GIO_PF_BF, pt);
