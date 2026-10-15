@@ -2,8 +2,11 @@
 # QD 扫描:按 (opt, 大小, QD) 跑 gpu_initiated,汇总 IOPS / 带宽 / 延迟。
 # 仓库根目录执行:
 #
-#   scripts/qd_sweep.sh                                  # 默认:4K 读,QD 1/4/16/64,-O 0 和 0xF000 对照
-#   QDS="1 8 32 96" OPTS="0 0x1000 0x3000 0xF000" scripts/qd_sweep.sh
+#   scripts/qd_sweep.sh                                  # 默认:4K 读,QD 1/4/16/64,旧行为(0x10000)和默认(0)对照
+#   QDS="1 8 32 96" OPTS="0x10000 0x11000 0x13000 0" scripts/qd_sweep.sh
+#
+# -O 的值会与默认的 0x7000 按位或;带 0x10000 时不加默认位(旧行为)。
+# 所以 0 = 0x7000,0x10000 = 全关,0x14000 = 只开 0x4000。
 #   EXTRA="-k" NQN=nqn.2024-01.io.test:cnode1 scripts/qd_sweep.sh   # KV Retrieve
 #   EXTRA="-W" scripts/qd_sweep.sh                       # 写
 #
@@ -20,7 +23,7 @@ GPU_ID=${GPU_ID:-4}
 ROUNDS=${ROUNDS:-5000}
 SIZES=${SIZES:-4096}
 QDS=${QDS:-1 4 16 64}
-OPTS=${OPTS:-0 0xF000}
+OPTS=${OPTS:-0x10000 0}
 REPEAT=${REPEAT:-1}
 EXTRA=${EXTRA:-}
 OUT=${OUT:-qd_sweep_$(date +%m%d_%H%M%S)}

@@ -25,10 +25,12 @@
  *                        bit10(=1024) 旧式 cid 0xE000|j(仅 QD=1),
  *                        bit11(=2048) 不补 recv(C1 行为,对照用;
  *                        此时 -r 不能超过挂着的 recv 数 ~127)
- *                        poller 降本(C3 前置,可组合,0xF000 全开):
+ *                        poller 降本(C3 前置,可组合):
  *                        bit12(=0x1000) RQ 批量补,bit13(=0x2000) CQ ci 懒更新,
- *                        bit14(=0x4000) SEND 选择性 signal,
- *                        bit15(=0x8000) WQE 寄存器构造、不回读 SQ 槽
+ *                        bit14(=0x4000) SEND 选择性 signal —— 这三位默认开,
+ *                        -O 的值与 0x7000 按位或;
+ *                        bit15(=0x8000) WQE 寄存器构造、不回读 SQ 槽(实测变慢);
+ *                        bit16(=0x10000) 旧行为:不加默认的 0x7000(对照用)
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -374,7 +376,8 @@ static void usage(const char *p)
 	       "      [-L start_lba] [-S seed] [-W 发写]\n"
 	       "      [-H 胶囊放显存] [-F cap_flag]\n"
 	       "      [-P 涂色] [-V 逐块回读] [-K 旧式单块对照]\n"
-	       "      [-k KV 模式:默认 Retrieve,-W Store,-E Exist,-D Delete]\n", p);
+	       "      [-k KV 模式:默认 Retrieve,-W Store,-E Exist,-D Delete]\n"
+	       "      [-O opt 位,与默认 0x7000 按位或;-O 0x10000 = 不加默认位]\n", p);
 }
 
 /*
@@ -602,6 +605,12 @@ main(int argc, char **argv)
 	}
 	if (g_qd > g_rounds) {
 		g_qd = g_rounds;
+	}
+	/* 0x7000 默认开;带 0x10000 时保持 -O 原样,用来对照旧行为 */
+	if (g_opt & GIO_OPT_LEGACY) {
+		g_opt &= ~GIO_OPT_LEGACY;
+	} else {
+		g_opt |= GIO_OPT_DEFAULT;
 	}
 	if ((g_opt & 0x20) && g_qd != 1) {
 		fprintf(stderr, "-O 32(串行快路径)只能配 -Q 1\n");
@@ -1268,7 +1277,7 @@ main(int argc, char **argv)
 	c_reqat  = calloc(g_rounds, sizeof(*c_reqat));
 	c_dw0    = calloc(g_rounds, sizeof(*c_dw0));
 	us = calloc(g_rounds, sizeof(*us));
-	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u, %s, %s, -O %u\n",
+	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u, %s, %s, -O 0x%x\n",
 	       g_kv ? kv_opc_name(ctx.nvme_opc) : g_write ? "WRITE" : "READ",
 	       g_rounds, g_io_bytes, g_qd,
 	       ctx.data_step ? "每条一块" : "单块复用",

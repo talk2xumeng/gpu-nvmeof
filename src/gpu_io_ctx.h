@@ -161,7 +161,14 @@ struct gio_shared {
  *   0x2000  CQ ci 懒更新:每 GIO_CQ_BATCH 个 CQE 或空闲时才写 CQ dbrec,不 fence
  *   0x4000  SEND 选择性 signal:每 GIO_SIG_EVERY 条才要 CQE
  *   0x8000  WQE 在寄存器里构造,不从主存 SQ 槽回读再写 BlueFlame
+ *
+ * 0x7000 默认开(-O 的值与它按位或)。QD 扫描(4K 读,3 次中位数)里
+ * 0x7000 在 QD4-64 比全关高 60%+,QD1 持平;0x8000 让等待变长,不开。
+ * 要旧行为做对照,给 -O 带 GIO_OPT_LEGACY(0x10000),默认位就不加。
  */
+#define GIO_OPT_DEFAULT	0x7000u
+#define GIO_OPT_LEGACY	0x10000u
+
 #define GIO_RQ_BATCH	16
 #define GIO_CQ_BATCH	32
 #define GIO_SIG_EVERY	32

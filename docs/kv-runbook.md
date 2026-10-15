@@ -126,6 +126,17 @@ make kv-vs-nvm SIZES="4096 16384 65536 131072" REPEAT=5
 - 结果目录:`kv_vs_nvm_<时间>/`,里面有 `summary.md`、`results.csv` 和每次运行的日志。
 - 重点看 `summary.md` 里的「KV - NVM」差值表。
 
+### QD 扫描(IOPS / 带宽)
+
+```bash
+make qd-sweep                                  # 4K 读,QD 1/4/16/64,旧行为 vs 默认,各 3 次
+make qd-sweep OPTS="0" QDS="1 4 8 16 32 64"    # 只跑默认
+make qd-sweep SWEEP_NQN=nqn.2024-01.io.test:cnode1 EXTRA="-k"   # KV Retrieve
+```
+
+`-O` 的值与默认的 0x7000 按位或;`-O 0x10000` 是旧行为(全关)。默认下 QD
+上限是 111(RQ 批量补和 CQ 懒更新要留余量),超过会自动降并打印 `[QD]`。
+
 ---
 
 ## 五、切回普通读写测试

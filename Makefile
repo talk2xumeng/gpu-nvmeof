@@ -281,9 +281,9 @@ run-gpu-kv-delete: $(BIN)/gpu_initiated
 	-sudo ./$(GKV) -D
 	sudo ./$(GKV) -V -D
 
-# QD 扫描。默认对 cnode2(malloc)跑 4K 读,-O 0 与 0xF000 对照
+# QD 扫描。默认对 cnode2(malloc)跑 4K 读,旧行为(-O 0x10000)与默认(-O 0,即 0x7000)对照
 QDS     ?= 1 4 16 64
-OPTS    ?= 0 0xF000
+OPTS    ?= 0x10000 0
 SWEEP_NQN ?= nqn.2024-01.io.test:cnode2
 SWEEP_ROUNDS ?= 5000
 

@@ -215,8 +215,11 @@ KV 的延迟瓶颈和读写完全一样,都在 C1 回退(提交约 8.5 µs)和 C
    `docs/concurrency-design.md`「C1 状态」
 4. ~~**RQ 自持（C2）**~~ 已验收：QD1 下 1000 条、QD16 下 5000 条都通过。
    基线 QD 扫描显示 4K 读在约 75k IOPS 饱和，瓶颈是 poller 处理每条 I/O
-   要约 13 µs。降本的开关（`-O 0x1000` 到 `0x8000`）已加上，用 `make qd-sweep`
-   做对照，见 `docs/concurrency-design.md`。
+   要约 13 µs。
+   **C3 poller 降本**：RQ 批量补 + CQ ci 懒更新 + SEND 选择性 signal
+   （0x7000）已设为默认，4K 读饱和点约 64k → 104k IOPS，QD1 延迟不变。
+   `-O 0x10000` 恢复旧行为做对照。数据见 `docs/concurrency-design.md`。
+   下一步在多 QP 和 CQ 进显存之间选。
 5. CQ 进显存 —— 延迟优化，可以晚做
 6. 错误恢复 —— 交付前
 
