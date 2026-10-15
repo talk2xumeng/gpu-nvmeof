@@ -223,8 +223,9 @@ KV 的延迟瓶颈和读写完全一样,都在 C1 回退(提交约 8.5 µs)和 C
    4 QP 24.2 GB/s，跑满 200G 网卡(target 要 4 核，2 核时卡在 20 GB/s)。
    数据见 `docs/concurrency-design.md`。
    **时延调优**：poller 状态进寄存器后 QD1 18.3 us、单 QP 125k、4 QP 477k；
-   BlueFlame / 回读一系列对照后确认主存方案到底。下一步队列进显存，
-   先跑 `tst/devx_probe`（DevX 回环探针）。
+   BlueFlame / 回读一系列对照后确认主存方案到底。
+   **队列进显存**：DevX 回环探针通过（CQ+SQ 都在显存，单条快 35%）；
+   `-X` 把 NVMe-oF IO 队列换成 DevX 自建 QP，待实机验证。
 5. CQ 进显存 —— 延迟优化，可以晚做
 6. 错误恢复 —— 交付前
 

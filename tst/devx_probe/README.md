@@ -23,7 +23,7 @@
 - GPU 单线程每轮:写 8 字节 payload → 写 RDMA WRITE WQE → dbrec → 门铃 →
   轮询 CQE → 写 CQ dbrec。显存里的队列写完只 `__threadfence()`(同
   mxshmem 的 `IBGDA_MEMBAR`),主存的用 `__threadfence_system()`
-- 结构体偏移来自 DPDK `mlx5_prm.h`(`devx_ifc.h`),rdma-core 的
+- 结构体偏移来自 DPDK `mlx5_prm.h`(`src/devx_ifc.h`,主程序的 DevX 队列也用它),rdma-core 的
   `mlx5_ifc.h` 没有 cqc,内核那份没有 umem_id 字段
 
 ## 跑

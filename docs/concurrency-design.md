@@ -437,9 +437,38 @@ BF 写法对照(QD1,0015/0016 合入后重测;之前一轮 0015 没合入,C–F 
 QD4 106k → 125k,4 QP QD4 401k → 477k。单 QP 的瓶颈从 poller 换成了 SQ 锁:
 QD16 时提交 80 µs、等待不变 —— 锁内 fence + 回读 ~8 µs/条。
 
-下一步:队列进显存(`tst/devx_probe`,DevX + dma-buf umem,IBGDA 做法)。
-先用回环探针量"网卡写显存 CQE、GPU 看见"和"网卡从显存取 WQE"两件事,
-再决定 CQ / SQ 各放哪里。
+### 队列进显存(C3,DevX)
+
+回环探针(`make devx-probe`,8 字节 RDMA WRITE 回环,QD1,普通门铃,µs):
+
+| CQ / SQ | 提交 | 门铃→看见 CQE | 合计 | 每轮轮询圈数 |
+|---|---|---|---|---|
+| 主存 / 主存 | 6.31 | 5.65 | 12.0 | 2.7 |
+| 主存 / 显存 | 3.83 | 4.46 | 8.3 | 3.0 |
+| 显存 / 主存 | 5.01 | 3.56 | 8.6 | 6.0 |
+| 显存 / 显存 | **4.09** | **3.72** | **7.8** | 6.3 |
+
+- 网卡从显存取 WQE 不慢,反而比从主存取快 1.2 µs —— 主存方案里 GPU 写进
+  主存的 WQE 网卡取得慢,正是要靠回读 / BF 绕的那个问题
+- CQE 进显存:每圈 ~0.6 µs(主存 ~2 µs),门铃→看见快 ~2 µs
+- 两者都在显存:比全主存快 35%,只用普通门铃,不需要 BF、不需要回读
+- dma-buf umem(`mcExtMallocWithFlags` flag 1)注册、DevX CREATE_CQ/QP 一次通过
+
+`-X`:NVMe-oF 的 IO 队列换成 DevX 自建 QP(`src/devx_qp.c`):
+
+- SPDK 照旧做 admin 连接和准备(qpair 1);DevX 队列用 qid 2
+  (`num_io_queues` 多要一个)
+- rdma_cm 只做寻址和 CM 握手:不建 verbs QP,`conn_param.qp_num` 填 DevX
+  QP 号,私有数据同 SPDK(qid / hrqsize 128 / hsqsize 127 / cntlid);收到
+  `CONNECT_RESPONSE` 后用 `rdma_init_qp_attr` 拿 RTR/RTS 参数、DevX 下发,
+  再 `rdma_establish`。RoCE 的对端 MAC 从 `/proc/net/arp` 取
+- 一块 2 MiB 显存 umem:CQ 512、CQ dbrec、QP dbrec、RQ 128 × 16、SQ 512 × 64;
+  `cs_res = 1`,响应 scatter 到 CQE
+- 胶囊区、数据区在 DevX 的 PD 上重注册;recv buffer、连接数据在主存
+- Fabrics Connect 由 CPU 在这条 QP 上发:往显存 SQ 拷 WQE、CPU 敲门铃、
+  拷回 CQE 看结果
+- 之后交给现有 kernel:强制寄存器构造 WQE + 只敲 8 字节门铃(DevX 的 UAR
+  是 NC,没有 BF)。fence 仍是 system 级,下一步按队列在显存改成 device 级
 
 (历史)原计划:找出"不回读就慢 2.8 µs"的原因(`-O 0x80000/0x100000/0x200000`
 三个对照:BF 写满 64 字节、BF 两块轮换、空等代替读)。找到后去掉回读,

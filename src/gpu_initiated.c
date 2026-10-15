@@ -14,6 +14,8 @@
  *   -g <id>              GPU 编号
  *   -r <n> -b <bytes>    I/O 总数、每条字节数
  *   -Q <qd>              每个 QP 同时在飞的 I/O 数(submitter 线程数,默认 1)
+ *   -X                   IO 队列改用 DevX 自建的 QP,CQ/SQ/RQ/dbrec 全在显存
+ *                        (src/devx_qp.c)。目前只支持 -q 1、胶囊在主存
  *   -q <n>               QP 数(默认 1,最多 GIO_MAX_QP)。每个 QP 一个 poller、
  *                        QD 个 submitter,总条数按 QP 切成连续段;总在飞 = n × QD
  *   -O <bits>            调优/诊断:bit0 submitter 稀疏 fence(每 16 圈),
@@ -91,6 +93,7 @@
 #include "gpu_io_ctx.h"
 #include "blk_pattern.h"
 #include "wqe_build.h"		/* KV 胶囊构造,CPU 路径和 kernel 共用 */
+#include "devx_qp.h"		/* -X:DevX 自建 IO 队列,队列在显存 */
 
 extern int gpu_io_run(struct gpu_io_ctx *, unsigned int, unsigned long long,
 		      unsigned long long *, unsigned long long *,
@@ -139,6 +142,7 @@ static int	g_gpu_id = 4;
 static uint32_t	g_rounds = 100;
 static uint32_t	g_qd = 1;
 static uint32_t	g_nq = 1;		/* -q: QP 数 */
+static int	g_devx;			/* -X: DevX 自建 IO 队列,队列在显存 */
 static uint32_t	g_opt;
 static uint32_t	g_io_bytes = 4096;
 static int	g_write, g_cap_in_hbm, g_paint, g_verify;
@@ -240,7 +244,8 @@ static bool
 probe_cb(void *c, const struct spdk_nvme_transport_id *t,
 	 struct spdk_nvme_ctrlr_opts *o)
 {
-	o->num_io_queues = g_nq + 1;
+	/* -X 的 DevX 队列用 qid = g_nq + 1,SPDK 不分配它 */
+	o->num_io_queues = g_nq + 1 + (g_devx ? 1 : 0);
 	return true;
 }
 
@@ -388,7 +393,7 @@ static void usage(const char *p)
 	       "      [-L start_lba] [-S seed] [-W 发写]\n"
 	       "      [-H 胶囊放显存] [-F cap_flag]\n"
 	       "      [-P 涂色] [-V 逐块回读] [-K 旧式单块对照]\n"
-	       "      [-q QP 数,默认 1;总在飞 = QP 数 × QD]\n"
+	       "      [-q QP 数,默认 1;总在飞 = QP 数 × QD] [-X 队列在显存(DevX)]\n"
 	       "      [-k KV 模式:默认 Retrieve,-W Store,-E Exist,-D Delete]\n"
 	       "      [-O opt 位,与默认 0x7000 按位或;-O 0x10000 = 不加默认位]\n", p);
 }
@@ -883,7 +888,7 @@ main(int argc, char **argv)
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:Q:q:O:WHPVKF:L:S:kED")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:Q:q:O:WHPVKF:L:S:kEDX")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -893,6 +898,7 @@ main(int argc, char **argv)
 		case 'b': g_io_bytes = (unsigned)atoi(optarg); break;
 		case 'Q': g_qd = (unsigned)atoi(optarg); break;
 		case 'q': g_nq = (unsigned)atoi(optarg); break;
+		case 'X': g_devx = 1; break;
 		case 'O': g_opt = (unsigned)strtoul(optarg, NULL, 0); break;
 		case 'W': g_write = 1; break;
 		case 'H': g_cap_in_hbm = 1; break;
@@ -938,6 +944,10 @@ main(int argc, char **argv)
 		fprintf(stderr, "-O 0x80000 起的 BF 对照位要配 0x8000 或 0x40000\n");
 		return 1;
 	}
+	if (g_devx && (g_nq != 1 || g_cap_in_hbm)) {
+		fprintf(stderr, "-X 目前只支持 -q 1、胶囊在主存(不配 -H)\n");
+		return 1;
+	}
 	if (g_nq > 1 && (g_opt & 0x200)) {
 		fprintf(stderr, "-O 512(胶囊槽轮换)不支持多 QP\n");
 		return 1;
@@ -947,6 +957,16 @@ main(int argc, char **argv)
 		g_opt &= ~GIO_OPT_LEGACY;
 	} else {
 		g_opt |= GIO_OPT_DEFAULT;
+	}
+	/*
+	 * -X:DevX 的 UAR 是普通门铃(NC),没有 BlueFlame,SQ 也不在主存 ——
+	 * 用寄存器构造 WQE、只敲 8 字节门铃,不回读。
+	 */
+	if (g_devx) {
+		g_opt |= 0x8000 | GIO_OPT_DB8;
+		g_opt &= ~(GIO_OPT_BF1 | GIO_OPT_BF64 | GIO_OPT_BFTOG |
+			   GIO_OPT_BFDLY | GIO_OPT_BFSEP | GIO_OPT_BFGAP |
+			   GIO_OPT_RBPAR);
 	}
 	if ((g_opt & 0x20) && g_qd != 1) {
 		fprintf(stderr, "-O 32(串行快路径)只能配 -Q 1\n");
@@ -1287,6 +1307,31 @@ main(int argc, char **argv)
 	}
 
 	hw[0].qpair = g_qpair;
+	if (g_devx) {
+		struct devx_q_cfg dc;
+
+		memset(&dc, 0, sizeof(dc));
+		dc.traddr = g_traddr;
+		dc.trsvcid = g_trsvcid;
+		dc.qid = (uint16_t)(g_nq + 1);
+		dc.qdepth = 128;
+		dc.gpu_flag = CAP_FLAGS_DEFAULT;
+		dc.cap_host = g_cap_host;
+		dc.cap_len = CAP_AREA_LEN;
+		dc.data_gpu = g_base_gpu;
+		dc.data_len = g_total_len;
+		dc.data_fd = g_base_fd;
+		ctxs[0] = ctx;
+		if (devx_q_create(g_ctrlr, &dc, &ctxs[0]) != 0) {
+			fprintf(stderr, "DevX 队列建立失败\n");
+			return 1;
+		}
+		/* 下文 QD 上限的计算沿用单 QP 时的变量 */
+		qp = NULL;
+		rq_posted = 128;
+		dvc.cqe_cnt = ctxs[0].cq_cnt;
+		goto queues_ready;
+	}
 	for (q = 1; q < g_nq; q++) {
 		hw[q].qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_ctrlr, NULL, 0);
 		if (!hw[q].qpair) {
@@ -1309,6 +1354,7 @@ main(int argc, char **argv)
 	rq_posted = hw[0].rq_posted;
 	rsp_lo = hw[0].rsp_lo;
 	rsp_gap = hw[0].rsp_gap;
+queues_ready:
 
 	/*
 	 * QD 仍受 queue size 限制:同时在飞的命令数不能超过 target 端的
@@ -1444,7 +1490,7 @@ main(int argc, char **argv)
 	}
 
 	/* 快照必须在所有 CPU 侧 I/O 之后拍,见 qp_snapshot */
-	for (q = 0; q < g_nq; q++) {
+	for (q = 0; q < g_nq && !g_devx; q++) {
 		if (qp_snapshot(&hw[q], &ctxs[q], q) != 0) {
 			return 1;
 		}
@@ -1550,7 +1596,7 @@ main(int argc, char **argv)
 	 * 响应落在哪块 recv buffer:host 直接扫 rsp 数组找 kernel 的 cid,
 	 * 再从 GPU 视角读同一处核对。只在出了 cid 异常时打印。
 	 */
-	if (sh.cid_bad && rsp_gap) {
+	if (sh.cid_bad && rsp_gap && !g_devx) {
 		uint64_t hb = rsp_lo & ~(HUGE_2M - 1);
 		uint64_t a2;
 		uint32_t k, mask = dvq.rq.wqe_cnt - 1;
@@ -1662,7 +1708,10 @@ main(int argc, char **argv)
 	 * 网卡认为没有新工作)。这种情况下 kernel 收割的是前一条 CPU 命令
 	 * 的 CQE,照样报"完成 N/N",但 target 侧查无此命令。
 	 */
-	for (q = 0; q < g_nq; q++) {
+	if (g_devx) {
+		devx_q_check(&ctxs[0], ctxs[0].njobs, shs[0].cqe_req,
+			     shs[0].cqe_resp, (g_opt & 0x800) != 0);
+	} else for (q = 0; q < g_nq; q++) {
 		volatile uint32_t *qdb = (volatile uint32_t *)hw[q].dvq.dbrec;
 		volatile uint32_t *cdb = (volatile uint32_t *)hw[q].dvc.dbrec;
 		const struct gpu_io_ctx *c = &ctxs[q];
@@ -1709,7 +1758,7 @@ main(int argc, char **argv)
 	 *   胶囊 offset 0   = 0x02 READ / 0x01 WRITE
 	 *   胶囊 offset 2-3 = cid,小端。kernel 的是 0x8000 | tag
 	 */
-	{
+	if (!g_devx) {	/* -X 时 SQ 在显存,不 dump */
 		uint32_t slot = ctx.sq_pi & (dvq.sq.wqe_cnt - 1);
 		uint8_t *w = (uint8_t *)dvq.sq.buf +
 			     (size_t)slot * dvq.sq.stride;
@@ -1754,7 +1803,7 @@ main(int argc, char **argv)
 	 * vendor_err 在 54 —— syndrome 0x05 是 WR_FLUSH_ERR,只是
 	 * 后果,真凶在更早的 CQE 里。
 	 */
-	{
+	if (!g_devx) {	/* -X 时 CQ 在显存,不 dump */
 		unsigned k;
 
 		printf("[CQE] ci=%u 起 4 个 (phase=%u):\n",
@@ -1797,7 +1846,7 @@ main(int argc, char **argv)
 		struct ibv_qp_attr a;
 		struct ibv_qp_init_attr ia;
 
-		if (ibv_query_qp(qp, &a, IBV_QP_STATE, &ia) == 0) {
+		if (qp && ibv_query_qp(qp, &a, IBV_QP_STATE, &ia) == 0) {
 			fprintf(stderr, "QP state=%d (3=RTS 正常, 6=ERROR)\n",
 				a.qp_state);
 		}

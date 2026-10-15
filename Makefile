@@ -149,13 +149,13 @@ $(BIN)/gpu_io_kernel.o: $(SRC)/wqe_build.h $(SRC)/gpu_io_ctx.h $(SRC)/blk_patter
 
 # GPU-initiated 原型。host 侧直接用了 mlx5dv 拿 SQ/CQ/UAR,要显式
 # 链 -lmlx5;kernel 那个 .o 是 C++ 编出来的,要 -lstdc++。
-$(BIN)/gpu_initiated: $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o \
-                      $(SRC)/gpu_io_ctx.h $(SRC)/wqe_build.h \
-                      $(SRC)/blk_pattern.h | $(BIN)
+$(BIN)/gpu_initiated: $(SRC)/gpu_initiated.c $(SRC)/devx_qp.c $(BIN)/gpu_io_kernel.o \
+                      $(SRC)/gpu_io_ctx.h $(SRC)/wqe_build.h $(SRC)/devx_qp.h \
+                      $(SRC)/devx_ifc.h $(SRC)/blk_pattern.h | $(BIN)
 	@if [ -z "$(SPDK_LIBS)" ]; then \
 		echo "错误: pkg-config 找不到 SPDK,检查 SPDK_DIR=$(SPDK_DIR)"; exit 1; fi
-	$(CC) $(CFLAGS) -o $@ $(SRC)/gpu_initiated.c $(BIN)/gpu_io_kernel.o \
-	      $(LDFLAGS) -lmlx5 -lstdc++
+	$(CC) $(CFLAGS) -o $@ $(SRC)/gpu_initiated.c $(SRC)/devx_qp.c \
+	      $(BIN)/gpu_io_kernel.o $(LDFLAGS) -lmlx5 -lstdc++
 	@echo "OK: $@"
 
 # 纯 host 侧:WQE/胶囊布局比对 + host 手工提交。不链 GPU kernel。
@@ -351,7 +351,7 @@ DEVXP := $(TST)/devx_probe
 $(BIN)/devx_probe_kernel.o: $(DEVXP)/devx_probe_kernel.cpp $(DEVXP)/devx_probe.h | $(BIN)
 	$(GPUCC) $(GPUCFLAGS) -I$(DEVXP) -c -o $@ $<
 
-$(BIN)/devx_probe: $(DEVXP)/devx_probe.c $(DEVXP)/devx_probe.h $(DEVXP)/devx_ifc.h \
+$(BIN)/devx_probe: $(DEVXP)/devx_probe.c $(DEVXP)/devx_probe.h $(SRC)/devx_ifc.h \
                    $(BIN)/devx_probe_kernel.o $(BIN)/gpu_io_kernel.o | $(BIN)
 	$(CC) $(CFLAGS) -I$(DEVXP) -o $@ $(DEVXP)/devx_probe.c \
 	      $(BIN)/devx_probe_kernel.o $(BIN)/gpu_io_kernel.o \
