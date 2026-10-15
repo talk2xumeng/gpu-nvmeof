@@ -190,8 +190,14 @@ GPU 侧已支持发 KV 命令。使用 `gpu_initiated -k`,默认发 Retrieve;
   - 全部做了逐块校验。
   - Retrieve 的 DW0 都等于 value 长度。
   - 4 KiB Retrieve 的等待 p50 是 11.7 µs,Store 是 17.3 µs。
+- **和 NVM 读写的对照**:同一个 target、同一条链路,QD 1,4K–128K。
+  - 去掉模拟器的开销后,KV 比 NVM 多 −0.1 到 +1.6 µs,不随大小增长。
+  - GPU 侧唯一的额外开销是 Retrieve 多读一次 DW0,每条响应约 0.85 µs。
 
 数据和胶囊核对见 `tst/kv_target/README.md`「验证记录」。
+
+KV 的延迟瓶颈和读写完全一样,都在 C1 回退(提交约 8.5 µs)和 CQ 位于主存。
+吞吐要等 C2(RQ 自持)做完之后才能测。
 
 ---
 
