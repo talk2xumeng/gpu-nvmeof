@@ -219,7 +219,8 @@ KV 的延迟瓶颈和读写完全一样,都在 C1 回退(提交约 8.5 µs)和 C
    **C3 poller 降本**：RQ 批量补 + CQ ci 懒更新 + SEND 选择性 signal
    （0x7000）已设为默认，4K 读饱和点约 64k → 104k IOPS，QD1 延迟不变。
    `-O 0x10000` 恢复旧行为做对照。数据见 `docs/concurrency-design.md`。
-   下一步在多 QP 和 CQ 进显存之间选。
+   **多 QP**(`-q N`)已实现，待验收；目标是给 GPU 发起的 GDS 扩带宽，
+   设计见 `docs/concurrency-design.md`。CQ 进显存放在其后。
 5. CQ 进显存 —— 延迟优化，可以晚做
 6. 错误恢复 —— 交付前
 

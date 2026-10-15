@@ -47,15 +47,17 @@ def main():
     out = sys.argv[1]
     rows = []
     for path in sorted(glob.glob(os.path.join(out, "*.log"))):
-        m = re.match(r"o(\w+)_b(\d+)_q(\d+)_(\d+)\.log$", os.path.basename(path))
+        # 旧日志没有 _p<QP 数>,按 1 个 QP 算
+        m = re.match(r"o(\w+?)(?:_p(\d+))?_b(\d+)_q(\d+)_(\d+)\.log$",
+                     os.path.basename(path))
         if not m:
             continue
         r = parse(path)
-        r.update(opt=m.group(1), size=int(m.group(2)), qd=int(m.group(3)),
-                 rep=int(m.group(4)))
+        r.update(opt=m.group(1), nq=int(m.group(2) or 1), size=int(m.group(3)),
+                 qd=int(m.group(4)), rep=int(m.group(5)))
         rows.append(r)
 
-    keys = ["opt", "size", "qd", "qd_eff", "rep", "ok", "kernel_us", "iops",
+    keys = ["opt", "nq", "size", "qd", "qd_eff", "rep", "ok", "kernel_us", "iops",
             "mbps", "total", "sub", "wait", "resp_ns", "spin_ns"]
     with open(os.path.join(out, "results.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
@@ -65,7 +67,7 @@ def main():
 
     groups = {}
     for r in rows:
-        groups.setdefault((r["opt"], r["size"], r["qd"]), []).append(r)
+        groups.setdefault((r["opt"], r["nq"], r["size"], r["qd"]), []).append(r)
 
     def med(rs, k):
         v = [x[k] for x in rs if x["ok"] and k in x]
@@ -75,14 +77,15 @@ def main():
         return "-" if x is None else f"{x:,.{nd}f}"
 
     print("# QD 扫描\n")
-    print("多次运行取中位数;延迟为 kernel 内 p50(us),处理一条响应为 ns。\n")
-    print("| -O | 大小 | QD | 实际 QD | 有效 | IOPS | MB/s | 总计 p50 | 提交 p50 | 等待 p50 | 处理一条响应 |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|")
-    for (opt, size, qd) in sorted(groups, key=lambda k: (k[0], k[1], k[2])):
-        rs = groups[(opt, size, qd)]
+    print("多次运行取中位数;延迟为 kernel 内 p50(us),处理一条响应为 ns。")
+    print("QD 是每个 QP 的(实际 QD 是降过之后的),总在飞 = QP × 实际 QD。\n")
+    print("| -O | QP | 大小 | QD | 实际 QD | 有效 | IOPS | MB/s | 总计 p50 | 提交 p50 | 等待 p50 | 处理一条响应 |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    for (opt, nq, size, qd) in sorted(groups):
+        rs = groups[(opt, nq, size, qd)]
         good = sum(1 for x in rs if x["ok"])
         qe = rs[0].get("qd_eff", "-")
-        print(f"| {opt} | {size} | {qd} | {qe} | {good}/{len(rs)} | "
+        print(f"| {opt} | {nq} | {size} | {qd} | {qe} | {good}/{len(rs)} | "
               f"{f(med(rs, 'iops'), 0)} | {f(med(rs, 'mbps'), 0)} | "
               f"{f(med(rs, 'total'))} | {f(med(rs, 'sub'))} | {f(med(rs, 'wait'))} | "
               f"{f(med(rs, 'resp_ns'), 0)} |")
@@ -90,7 +93,7 @@ def main():
     if bad:
         print("\n失败的运行(不计入):")
         for r in bad:
-            print(f"- -O {r['opt']} {r['size']} QD {r['qd']} #{r['rep']}")
+            print(f"- -O {r['opt']} {r['nq']} QP {r['size']} QD {r['qd']} #{r['rep']}")
 
 
 if __name__ == "__main__":

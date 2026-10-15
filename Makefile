@@ -60,6 +60,7 @@ KVBLOCK    ?= 4718592
 GPU_ROUNDS ?= 100
 GPU_BS     ?= 4096
 GPU_QD     ?= 1
+GPU_NQ     ?= 1
 GPU_LBA    ?= 0
 # pit7-bench 注册 MR 用的网卡(和 GPU 同 NUMA / PCIe switch 的那张)
 IBDEV      ?= mlx5_1
@@ -252,7 +253,7 @@ run-gpu-initiated: $(BIN)/gpu_initiated
 
 # 逐块校验。显存按条数分配(每条一块),条数很大时注意显存和盘/malloc 容量。
 GI := $(BIN)/gpu_initiated -a $(TARGET_IP) -n $(NQN) -g $(GPU_ID) \
-      -r $(GPU_ROUNDS) -b $(GPU_BS) -Q $(GPU_QD) -L $(GPU_LBA) -S $(SEED)
+      -r $(GPU_ROUNDS) -b $(GPU_BS) -q $(GPU_NQ) -Q $(GPU_QD) -L $(GPU_LBA) -S $(SEED)
 
 run-gpu-read-verify: $(BIN)/gpu_initiated
 	sudo ./$(GI)
@@ -283,13 +284,14 @@ run-gpu-kv-delete: $(BIN)/gpu_initiated
 
 # QD 扫描。默认对 cnode2(malloc)跑 4K 读,旧行为(-O 0x10000)与默认(-O 0,即 0x7000)对照
 QDS     ?= 1 4 16 64
+NQPS    ?= 1
 OPTS    ?= 0x10000 0
 SWEEP_NQN ?= nqn.2024-01.io.test:cnode2
 SWEEP_ROUNDS ?= 5000
 
 qd-sweep: $(BIN)/gpu_initiated
 	TARGET_IP=$(TARGET_IP) NQN=$(SWEEP_NQN) GPU_ID=$(GPU_ID) \
-	ROUNDS=$(SWEEP_ROUNDS) SIZES="$(GPU_BS)" QDS="$(QDS)" OPTS="$(OPTS)" \
+	ROUNDS=$(SWEEP_ROUNDS) SIZES="$(GPU_BS)" QDS="$(QDS)" NQPS="$(NQPS)" OPTS="$(OPTS)" \
 	REPEAT=$(REPEAT) EXTRA="$(EXTRA)" BIN=./$(BIN)/gpu_initiated scripts/qd_sweep.sh
 
 # 同一个 kv_tgt 上 KV(cnode1)和 malloc(cnode2)各跑一遍,算差值

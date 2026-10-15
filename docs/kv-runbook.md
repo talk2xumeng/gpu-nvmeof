@@ -105,7 +105,8 @@ make run-gpu-kv-delete      # ⑤ GPU Delete,另起进程确认 key 已不存在
 |---|---|
 | `GPU_BS` | value 字节数,8 的倍数,最大 131072 |
 | `GPU_ROUNDS` | key 个数(C2 起不再受 127 限制) |
-| `GPU_QD` | 并发数 |
+| `GPU_QD` | 每个 QP 的并发数 |
+| `GPU_NQ` | QP 数(默认 1),总在飞 = `GPU_NQ × GPU_QD` |
 | `GPU_LBA` | 起始 key 序号 |
 
 示例:
@@ -132,7 +133,12 @@ make kv-vs-nvm SIZES="4096 16384 65536 131072" REPEAT=5
 make qd-sweep                                  # 4K 读,QD 1/4/16/64,旧行为 vs 默认,各 3 次
 make qd-sweep OPTS="0" QDS="1 4 8 16 32 64"    # 只跑默认
 make qd-sweep SWEEP_NQN=nqn.2024-01.io.test:cnode1 EXTRA="-k"   # KV Retrieve
+make qd-sweep OPTS=0 NQPS="1 2 4 8" QDS="4 16"                  # 多 QP
 ```
+
+多 QP 时 target 侧并行度取决于 kv_tgt 的核数(`-m`):每个 QP 落在一个
+reactor 上,`-m 0x3` 只有 2 个。QP 数超过 2 以后 IOPS 不涨,先把 kv_tgt
+换成 `-m 0xF` 或 `-m 0xFF` 重启(不用重编,重启后重跑 setup 脚本)。
 
 `-O` 的值与默认的 0x7000 按位或;`-O 0x10000` 是旧行为(全关)。默认下 QD
 上限是 111(RQ 批量补和 CQ 懒更新要留余量),超过会自动降并打印 `[QD]`。

@@ -1,8 +1,8 @@
 /*
  * gpu_io_kernel.cpp  --  kernel 内完成 NVMe-oF 读写的全流程
  *
- * 稳态下 CPU 完全不参与。一次 launch,QD + 1 个 block,每个 block 只有
- * thread 0 干活,角色由 blockIdx 决定:
+ * 稳态下 CPU 完全不参与。一次 launch,每个 QP 占 QD + 1 个 block(多 QP
+ * 时按 QP 依次排开),每个 block 只有 thread 0 干活,角色由 QP 内序号决定:
  *
  *   block 0       poller:独占 CQ。收 RESP → 从 recv buffer 读出 cid 和
  *                 NVMe status → 按 cid 找到 tag,置完成
@@ -27,6 +27,7 @@
 
 #include <mcr/mc_runtime.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "gpu_io_ctx.h"
 
@@ -596,6 +597,8 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	uint8_t my_phase = c->cq_phase;
 
 	while (claim_job(sh, c->njobs, &j)) {
+		/* 多 QP:j 是本 QP 内的序号,J 是全局序号(LBA/key/块/统计数组) */
+		uint32_t J = c->job_base + j;
 		/* -O 512:槽位按 job 轮换,同旧 kernel;默认固定用 tag 号 */
 		uint32_t cslot = (c->opt & 0x200) ? (j & 0x3f) : tag;
 		volatile uint8_t *cap = c->capsule + (size_t)cslot * 64;
@@ -604,17 +607,17 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		uint16_t cid = (c->opt & 0x400) ?
 			       (uint16_t)(0xE000 | (j & 0xfff)) :
 			       (uint16_t)(GIO_CID_TAG | tag);
-		uint64_t lba = start_lba + (uint64_t)j * nlb;
-		uint64_t blk = c->data_addr + (uint64_t)j * c->data_step;
+		uint64_t lba = start_lba + (uint64_t)J * nlb;
+		uint64_t blk = c->data_addr + (uint64_t)J * c->data_step;
 		uint64_t t0, t1, t2, t3, lspins, spins = 0;
 		uint32_t st;
 
 		t0 = clock64();
 		if (c->kv) {
-			/* KV:第 j 条的 key 由 (seed, start + j) 决定,和 host 侧一致 */
+			/* KV:第 J 条的 key 由 (seed, start + J) 决定,和 host 侧一致 */
 			uint8_t key[NVME_KV_MAX_KEY];
 
-			blk_kv_key(key, c->kv_seed, start_lba + j);
+			blk_kv_key(key, c->kv_seed, start_lba + J);
 			nvme_build_kv_sqe((struct nvme_sqe *)cap, c->nvme_opc, cid,
 					  c->nsid, key, c->kv_klen, c->kv_opts,
 					  blk, c->data_rkey, c->io_bytes);
@@ -710,23 +713,23 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 
 			__threadfence_system();
 			td = tags[tag].t_done;
-			c_det[j] = tags[tag].det;
-			c_hand[j] = t3 - td;
-			c_dw0[j] = tags[tag].dw0;
+			c_det[J] = tags[tag].det;
+			c_hand[J] = t3 - td;
+			c_dw0[J] = tags[tag].dw0;
 		}
 
 		if (c->opt & 0x80) {
-			c_tsreq[j] = sh->last_req_ts;
-			c_reqat[j] = sh->last_req_at - t2;	/* 门铃→发现 SEND 完成 */
-			c_tsresp[j] = tags[tag].ts_resp;
+			c_tsreq[J] = sh->last_req_ts;
+			c_reqat[J] = sh->last_req_at - t2;	/* 门铃→发现 SEND 完成 */
+			c_tsresp[J] = tags[tag].ts_resp;
 		}
 
-		c_cap[j]  = t1 - t0;	/* 写 64 字节胶囊 */
-		c_sub[j]  = t2 - t1;	/* 抢锁 + WQE + dbrec + 门铃 */
-		c_wait[j] = t3 - t2;	/* 网络往返 + target + poller 转交 */
-		c_spin[j] = spins;
-		c_lock[j] = lspins;
-		c_stat[j] = (st >= GIO_ST_DONE) ?
+		c_cap[J]  = t1 - t0;	/* 写 64 字节胶囊 */
+		c_sub[J]  = t2 - t1;	/* 抢锁 + WQE + dbrec + 门铃 */
+		c_wait[J] = t3 - t2;	/* 网络往返 + target + poller 转交 */
+		c_spin[J] = spins;
+		c_lock[J] = lspins;
+		c_stat[J] = (st >= GIO_ST_DONE) ?
 			    ld_acq32((uint32_t *)&tags[tag].status) & 0xffff :
 			    0xffffffffu;	/* 没等到 */
 
@@ -741,24 +744,41 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	}
 }
 
+/*
+ * 多 QP:block b 属于 QP b / per,QP 内序号 b % per(per = 每 QP 的 block 数)。
+ * 每个 QP 的 ctx / 共享区 / tag 各自独立,QP 之间不共享任何状态。
+ * ctx 从显存数组拷到本线程,之后和单 QP 时按值传参的用法一样。
+ */
 __global__ void
-k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
+k_gpu_io(const struct gpu_io_ctx *ctxs, struct gio_shared *shs,
+	 struct gio_tag *tags_all, uint32_t per,
 	 uint64_t start_lba, uint64_t *c_cap, uint64_t *c_sub,
 	 uint64_t *c_wait, uint64_t *c_spin, uint64_t *c_lock,
 	 uint32_t *c_stat, uint64_t *c_det, uint64_t *c_hand,
 	 uint64_t *c_tsreq, uint64_t *c_tsresp, uint64_t *c_reqat,
 	 uint32_t *c_dw0)
 {
-	uint32_t t = blockIdx.x;
+	uint32_t q = blockIdx.x / per;
+	uint32_t t = blockIdx.x % per;
+	struct gpu_io_ctx ctx;
+	struct gio_shared *sh;
+	struct gio_tag *tags;
 
-	/* 记 kernel 的起止时钟:由实际干活的第一个 block 记 */
-	if (threadIdx.x == 0 && t == 0) {
+	if (threadIdx.x != 0) {
+		return;
+	}
+	ctx = ctxs[q];
+	sh = shs + q;
+	tags = tags_all + (size_t)q * ctx.qd;
+
+	/* 记 kernel 的起止时钟:由本 QP 实际干活的第一个 block 记 */
+	if (t == 0) {
 		sh->k_start = clock64();
 	}
 	if (ctx.opt & 0x40) {
 		t++;		/* 没有 poller block:block i 就是 submitter i */
 	}
-	if (threadIdx.x != 0 || t > ctx.qd) {
+	if (t > ctx.qd) {
 		return;
 	}
 	if (t == 0) {
@@ -770,8 +790,7 @@ k_gpu_io(struct gpu_io_ctx ctx, struct gio_shared *sh, struct gio_tag *tags,
 			  c_wait, c_spin, c_lock, c_stat, c_det, c_hand,
 			  c_tsreq, c_tsresp, c_reqat, c_dw0);
 	}
-	if (threadIdx.x == 0 && t == (((ctx.opt & 0x30) &&
-				       !(ctx.opt & 0x40)) ? 1u : 0u)) {
+	if (t == (((ctx.opt & 0x30) && !(ctx.opt & 0x40)) ? 1u : 0u)) {
 		sh->k_end = clock64();
 	}
 }
@@ -835,12 +854,14 @@ extern "C" {
 
 /*
  * 返回 0 表示 kernel 正常跑完(不代表 I/O 全成功,看 sh_out)。
- * 逐 I/O 数组长度 = ctx->njobs;c_stat 是 NVMe status 字,
- * 0xffffffff 表示没等到完成。host_dw0 是 CQE DW0,只在 ctx->kv 时有意义,
- * 可以传 NULL。
+ * ctxs 是 nq 个 QP 的上下文,sh_out 同样 nq 个。各 QP 的 qd / opt 必须
+ * 相同;njobs / job_base 把总条数切成连续段。逐 I/O 数组长度 = 总条数;
+ * c_stat 是 NVMe status 字,0xffffffff 表示没等到完成。host_dw0 是
+ * CQE DW0,只在 kv 时有意义,可以传 NULL。
  */
 int
-gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
+gpu_io_run(struct gpu_io_ctx *ctxs, unsigned int nq,
+	   unsigned long long start_lba,
 	   unsigned long long *host_cap, unsigned long long *host_sub,
 	   unsigned long long *host_wait, unsigned long long *host_spin,
 	   unsigned long long *host_lock, unsigned int *host_stat,
@@ -854,18 +875,36 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	uint64_t *d_det = NULL, *d_hand = NULL;
 	uint64_t *d_tsreq = NULL, *d_tsresp = NULL, *d_reqat = NULL;
 	uint32_t *d_stat = NULL, *d_dw0 = NULL;
-	uint64_t *d_rqs = NULL;		/* C2:RQ 槽的显存影子 */
-	size_t rqs_len = (size_t)ctx->rq_wqe_cnt * ctx->rq_stride;
-	struct gio_shared *d_sh = NULL, sh0;
+	uint64_t *d_rqs[GIO_MAX_QP] = { NULL };	/* C2:每个 QP 的 RQ 显存影子 */
+	struct gio_shared *d_sh = NULL, *sh0 = NULL;
 	struct gio_tag *d_tags = NULL;
-	size_t sz = ctx->njobs * sizeof(uint64_t);
-	size_t tsz = ctx->qd * sizeof(struct gio_tag);
-	/* block 0 = poller;opt bit6 时不启动它 */
-	unsigned int nblk = (ctx->opt & 0x40) ? ctx->qd : ctx->qd + 1;
+	struct gpu_io_ctx *d_ctx = NULL;
+	uint32_t qd = ctxs[0].qd, opt = ctxs[0].opt, njobs = 0;
+	size_t sz, tsz = (size_t)nq * qd * sizeof(struct gio_tag);
+	/* 每个 QP:block 0 = poller;opt bit6 时不启动它 */
+	unsigned int per = (opt & 0x40) ? qd : qd + 1;
+	unsigned int q;
 	mcError_t e;
 	int rc = -1;
 
-	if (mcMalloc((void **)&d_cap, sz) != mcSuccess ||
+	if (nq == 0 || nq > GIO_MAX_QP) {
+		fprintf(stderr, "QP 数 %u 超出 1..%d\n", nq, GIO_MAX_QP);
+		return -1;
+	}
+	for (q = 0; q < nq; q++) {
+		if (ctxs[q].qd != qd || ctxs[q].opt != opt) {
+			fprintf(stderr, "各 QP 的 qd/opt 必须相同\n");
+			return -1;
+		}
+		if (ctxs[q].job_base + ctxs[q].njobs > njobs) {
+			njobs = ctxs[q].job_base + ctxs[q].njobs;
+		}
+	}
+	sz = (size_t)njobs * sizeof(uint64_t);
+	sh0 = (struct gio_shared *)calloc(nq, sizeof(*sh0));
+
+	if (!sh0 ||
+	    mcMalloc((void **)&d_cap, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_sub, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_wait, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_spin, sz) != mcSuccess ||
@@ -875,36 +914,42 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	    mcMalloc((void **)&d_tsreq, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_tsresp, sz) != mcSuccess ||
 	    mcMalloc((void **)&d_reqat, sz) != mcSuccess ||
-	    mcMalloc((void **)&d_stat, ctx->njobs * sizeof(uint32_t)) != mcSuccess ||
-	    mcMalloc((void **)&d_dw0, ctx->njobs * sizeof(uint32_t)) != mcSuccess ||
-	    mcMalloc((void **)&d_sh, sizeof(*d_sh)) != mcSuccess ||
+	    mcMalloc((void **)&d_stat, njobs * sizeof(uint32_t)) != mcSuccess ||
+	    mcMalloc((void **)&d_dw0, njobs * sizeof(uint32_t)) != mcSuccess ||
+	    mcMalloc((void **)&d_sh, nq * sizeof(*d_sh)) != mcSuccess ||
+	    mcMalloc((void **)&d_ctx, nq * sizeof(*d_ctx)) != mcSuccess ||
 	    mcMalloc((void **)&d_tags, tsz) != mcSuccess) {
 		fprintf(stderr, "kernel 工作区分配失败\n");
 		goto out;
 	}
 
-	memset(&sh0, 0, sizeof(sh0));
-	sh0.sq_pi = ctx->sq_pi;
-	sh0.sp_ci = ctx->cq_ci;
-	sh0.sp_phase = ctx->cq_phase;
-	sh0.rq_head = ctx->rq_head;
+	for (q = 0; q < nq; q++) {
+		struct gpu_io_ctx *c = &ctxs[q];
+		size_t rqs_len = (size_t)c->rq_wqe_cnt * c->rq_stride;
 
-	/* C2:接管时的 RQ 内容拷进显存,kernel 补 recv 时从这里取描述符 */
-	ctx->rq_shadow = NULL;
-	if (!(ctx->opt & 0x800) && ctx->rq_host_buf && rqs_len &&
-	    ctx->rq_stride % 8 == 0) {
-		if (mcMalloc((void **)&d_rqs, rqs_len) != mcSuccess ||
-		    mcMemcpy(d_rqs, ctx->rq_host_buf, rqs_len,
-			     mcMemcpyHostToDevice) != mcSuccess) {
-			fprintf(stderr, "RQ 影子分配/拷贝失败\n");
-			goto out;
+		sh0[q].sq_pi = c->sq_pi;
+		sh0[q].sp_ci = c->cq_ci;
+		sh0[q].sp_phase = c->cq_phase;
+		sh0[q].rq_head = c->rq_head;
+
+		/* C2:接管时的 RQ 内容拷进显存,kernel 补 recv 时从这里取描述符 */
+		c->rq_shadow = NULL;
+		if (!(opt & 0x800) && c->rq_host_buf && rqs_len &&
+		    c->rq_stride % 8 == 0) {
+			if (mcMalloc((void **)&d_rqs[q], rqs_len) != mcSuccess ||
+			    mcMemcpy(d_rqs[q], c->rq_host_buf, rqs_len,
+				     mcMemcpyHostToDevice) != mcSuccess) {
+				fprintf(stderr, "QP %u 的 RQ 影子分配/拷贝失败\n", q);
+				goto out;
+			}
+			c->rq_shadow = (volatile uint64_t *)d_rqs[q];
 		}
-		ctx->rq_shadow = (volatile uint64_t *)d_rqs;
 	}
-	mcMemcpy(d_sh, &sh0, sizeof(sh0), mcMemcpyHostToDevice);
+	mcMemcpy(d_ctx, ctxs, nq * sizeof(*d_ctx), mcMemcpyHostToDevice);
+	mcMemcpy(d_sh, sh0, nq * sizeof(*d_sh), mcMemcpyHostToDevice);
 	mcMemset(d_tags, 0, tsz);
-	mcMemset(d_stat, 0xff, ctx->njobs * sizeof(uint32_t));
-	mcMemset(d_dw0, 0, ctx->njobs * sizeof(uint32_t));
+	mcMemset(d_stat, 0xff, njobs * sizeof(uint32_t));
+	mcMemset(d_dw0, 0, njobs * sizeof(uint32_t));
 	mcDeviceSynchronize();
 
 	mcMemset(d_det, 0, sz);
@@ -920,9 +965,9 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 		clock_gettime(CLOCK_MONOTONIC, &ts);
 		*wall_us_out = ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
 	}
-	k_gpu_io<<<nblk, 32>>>(*ctx, d_sh, d_tags, start_lba, d_cap, d_sub,
-			       d_wait, d_spin, d_lock, d_stat, d_det, d_hand,
-			       d_tsreq, d_tsresp, d_reqat, d_dw0);
+	k_gpu_io<<<nq * per, 32>>>(d_ctx, d_sh, d_tags, per, start_lba, d_cap,
+				   d_sub, d_wait, d_spin, d_lock, d_stat, d_det,
+				   d_hand, d_tsreq, d_tsresp, d_reqat, d_dw0);
 
 	e = mcGetLastError();
 	if (e != mcSuccess) {
@@ -951,13 +996,13 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	mcMemcpy(host_tsreq, d_tsreq, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_tsresp, d_tsresp, sz, mcMemcpyDeviceToHost);
 	mcMemcpy(host_reqat, d_reqat, sz, mcMemcpyDeviceToHost);
-	mcMemcpy(host_stat, d_stat, ctx->njobs * sizeof(uint32_t),
+	mcMemcpy(host_stat, d_stat, njobs * sizeof(uint32_t),
 		 mcMemcpyDeviceToHost);
 	if (host_dw0) {
-		mcMemcpy(host_dw0, d_dw0, ctx->njobs * sizeof(uint32_t),
+		mcMemcpy(host_dw0, d_dw0, njobs * sizeof(uint32_t),
 			 mcMemcpyDeviceToHost);
 	}
-	mcMemcpy(sh_out, d_sh, sizeof(*sh_out), mcMemcpyDeviceToHost);
+	mcMemcpy(sh_out, d_sh, nq * sizeof(*sh_out), mcMemcpyDeviceToHost);
 	rc = 0;
 out:
 	if (d_cap)  mcFree(d_cap);
@@ -973,9 +1018,15 @@ out:
 	if (d_stat) mcFree(d_stat);
 	if (d_dw0)  mcFree(d_dw0);
 	if (d_sh)   mcFree(d_sh);
-	if (d_rqs)  mcFree(d_rqs);
-	ctx->rq_shadow = NULL;
+	if (d_ctx)  mcFree(d_ctx);
+	for (q = 0; q < nq && q < GIO_MAX_QP; q++) {
+		if (d_rqs[q]) {
+			mcFree(d_rqs[q]);
+		}
+		ctxs[q].rq_shadow = NULL;
+	}
 	if (d_tags) mcFree(d_tags);
+	free(sh0);
 	return rc;
 }
 

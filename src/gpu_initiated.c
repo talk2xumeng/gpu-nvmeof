@@ -13,7 +13,9 @@
  *   -a <ip> -n <nqn>     必填
  *   -g <id>              GPU 编号
  *   -r <n> -b <bytes>    I/O 总数、每条字节数
- *   -Q <qd>              同时在飞的 I/O 数(submitter 线程数,默认 1)
+ *   -Q <qd>              每个 QP 同时在飞的 I/O 数(submitter 线程数,默认 1)
+ *   -q <n>               QP 数(默认 1,最多 GIO_MAX_QP)。每个 QP 一个 poller、
+ *                        QD 个 submitter,总条数按 QP 切成连续段;总在飞 = n × QD
  *   -O <bits>            调优/诊断:bit0 submitter 稀疏 fence(每 16 圈),
  *                        bit1 poller 空转稀疏检查,bit2 配合 bit0 改为 1024 圈,
  *                        bit4(=16) 自轮询:不要独立 poller,
@@ -82,7 +84,7 @@
 #include "blk_pattern.h"
 #include "wqe_build.h"		/* KV 胶囊构造,CPU 路径和 kernel 共用 */
 
-extern int gpu_io_run(struct gpu_io_ctx *, unsigned long long,
+extern int gpu_io_run(struct gpu_io_ctx *, unsigned int, unsigned long long,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned int *,
@@ -107,6 +109,7 @@ extern int gpu_fill_kernel(void *, int, size_t);
 #define MC_HOST_REGISTER_IO_MEMORY	0x04
 
 #define CAP_AREA_LEN	(2 * 1024 * 1024)
+#define CAP_QP_STRIDE	(64 * 1024)	/* 多 QP:每个 QP 的胶囊槽区,1024 × 64 字节 */
 #define RPAT		BLK_RPAT	/* 读:预填,被 target 覆盖才算落地 */
 #define WPAT		BLK_WPAT	/* -K 旧式写 pattern */
 #define CPAT		BLK_CPAT	/* 盘上涂色 */
@@ -127,6 +130,7 @@ static char	g_traddr[64], g_nqn[224], g_trsvcid[16] = "4420";
 static int	g_gpu_id = 4;
 static uint32_t	g_rounds = 100;
 static uint32_t	g_qd = 1;
+static uint32_t	g_nq = 1;		/* -q: QP 数 */
 static uint32_t	g_opt;
 static uint32_t	g_io_bytes = 4096;
 static int	g_write, g_cap_in_hbm, g_paint, g_verify;
@@ -228,7 +232,7 @@ static bool
 probe_cb(void *c, const struct spdk_nvme_transport_id *t,
 	 struct spdk_nvme_ctrlr_opts *o)
 {
-	o->num_io_queues = 2;
+	o->num_io_queues = g_nq + 1;
 	return true;
 }
 
@@ -376,6 +380,7 @@ static void usage(const char *p)
 	       "      [-L start_lba] [-S seed] [-W 发写]\n"
 	       "      [-H 胶囊放显存] [-F cap_flag]\n"
 	       "      [-P 涂色] [-V 逐块回读] [-K 旧式单块对照]\n"
+	       "      [-q QP 数,默认 1;总在飞 = QP 数 × QD]\n"
 	       "      [-k KV 模式:默认 Retrieve,-W Store,-E Exist,-D Delete]\n"
 	       "      [-O opt 位,与默认 0x7000 按位或;-O 0x10000 = 不加默认位]\n", p);
 }
@@ -533,6 +538,286 @@ report_blocks(const char *tag, const uint8_t *buf, uint32_t n, uint32_t bs,
 	return bad;
 }
 
+/* "[运行]" 行里的 QP 数,单 QP 时不显示 */
+static const char *
+qp_desc(unsigned nq)
+{
+	static char b[32];
+
+	if (nq <= 1) {
+		return "";
+	}
+	snprintf(b, sizeof(b), " × %u QP", nq);
+	return b;
+}
+
+/*
+ * 多 QP 的共享区合计成一份,下文的统计输出照旧用。计数器相加;首个错误
+ * 取最先出现的 QP;时钟起止取 QP 0(时钟只能在同一 block 内相减)。
+ */
+static void
+sh_sum(struct gio_shared *o, const struct gio_shared *s, unsigned nq)
+{
+	unsigned q;
+
+	*o = s[0];
+	for (q = 1; q < nq; q++) {
+		const struct gio_shared *x = &s[q];
+
+		if (!o->err) o->err = x->err;
+		if (!o->nvme_err) o->first_status = x->first_status;
+		if (!o->cid_bad) o->first_bad_cid = x->first_bad_cid;
+		if (!o->err_cqe) o->err_cqe = x->err_cqe;
+		o->done_cnt += x->done_cnt;
+		o->nvme_err += x->nvme_err;
+		o->cid_bad += x->cid_bad;
+		o->wc_mismatch += x->wc_mismatch;
+		o->cqe_req += x->cqe_req;
+		o->cqe_resp += x->cqe_resp;
+		o->resp_inline += x->resp_inline;
+		o->poll_spins += x->poll_spins;
+		o->poll_hits += x->poll_hits;
+		o->poll_cycles += x->poll_cycles;
+		o->resp_cycles += x->resp_cycles;
+		o->rq_reposted += x->rq_reposted;
+		o->rq_flushes += x->rq_flushes;
+		o->cq_db_writes += x->cq_db_writes;
+	}
+}
+
+/* ================================================================== */
+/* 把一个 SPDK qpair 交给 GPU(C3 起每个 QP 各做一遍)                */
+/* ================================================================== */
+
+/* 每个 QP 在 host 侧的硬件对象 */
+struct qp_hw {
+	struct spdk_nvme_qpair	*qpair;
+	struct ibv_qp		*qp;
+	struct ibv_cq		*cq;
+	struct mlx5dv_qp	dvq;
+	struct mlx5dv_cq	dvc;
+	uint32_t		rq_posted;
+	uint64_t		rsp_lo, rsp_gap;
+};
+
+/*
+ * 拿到 qpair 底下的 mlx5 QP/CQ,把 RQ/SQ/CQ/dbrec/UAR 和 recv buffer 映射给
+ * GPU,填 ctx 里和硬件有关的字段。q 只用来打印;q == 0 时输出和单 QP 一样。
+ */
+static int
+qp_attach(struct qp_hw *h, struct gpu_io_ctx *ctx, unsigned q)
+{
+	struct mlx5dv_obj obj;
+	struct spdk_nvme_io_qpair_opts qopts;
+	void *d_sq, *d_rq, *d_q, *d_dbrec, *d_bf, *d_cq, *d_cqdb, *d_rsp;
+	int v = (q == 0);
+
+	memset(&h->dvq, 0, sizeof(h->dvq));
+	memset(&h->dvc, 0, sizeof(h->dvc));
+	h->qp = spdk_nvme_qpair_get_ibv_qp(h->qpair);
+	h->cq = spdk_nvme_qpair_get_ibv_cq(h->qpair);
+	if (!h->qp || !h->cq) {
+		fprintf(stderr, "拿不到 ibv_qp/ibv_cq,SPDK 打过 patch 吗?\n");
+		return -1;
+	}
+	h->dvq.comp_mask = MLX5DV_QP_MASK_UAR_MMAP_OFFSET;
+	obj.qp.in = h->qp; obj.qp.out = &h->dvq;
+	obj.cq.in = h->cq; obj.cq.out = &h->dvc;
+	if (mlx5dv_init_obj(&obj, MLX5DV_OBJ_QP | MLX5DV_OBJ_CQ)) {
+		fprintf(stderr, "mlx5dv_init_obj 失败\n");
+		return -1;
+	}
+	if (v) {
+		printf("\n[QP] qpn=0x%x sq %ux%u  cq %ux%u\n",
+		       h->qp->qp_num, h->dvq.sq.wqe_cnt, h->dvq.sq.stride,
+		       h->dvc.cqe_cnt, h->dvc.cqe_size);
+	} else {
+		printf("[QP%u] qpn=0x%x sq %ux%u  cq %ux%u\n", q,
+		       h->qp->qp_num, h->dvq.sq.wqe_cnt, h->dvq.sq.stride,
+		       h->dvc.cqe_cnt, h->dvc.cqe_size);
+	}
+
+	/*
+	 * mlx5 的 RQ 和 SQ 在同一块 buffer 里(RQ 在前),SQ 起点往往不对齐页,
+	 * 两者可能共用一页。整段一起注册,再按偏移算出各自的设备指针。
+	 */
+	{
+		char *rq_lo = (char *)h->dvq.rq.buf;
+		char *rq_hi = rq_lo + (size_t)h->dvq.rq.wqe_cnt * h->dvq.rq.stride;
+		char *sq_lo = (char *)h->dvq.sq.buf;
+		char *sq_hi = sq_lo + (size_t)h->dvq.sq.wqe_cnt * h->dvq.sq.stride;
+		char *lo = rq_lo < sq_lo ? rq_lo : sq_lo;
+		char *hi = rq_hi > sq_hi ? rq_hi : sq_hi;
+
+		if ((size_t)(hi - lo) > (size_t)((rq_hi - rq_lo) +
+						 (sq_hi - sq_lo)) + 8192) {
+			fprintf(stderr, "RQ %p 与 SQ %p 不相邻,和预期的 mlx5 "
+				"布局不同\n", rq_lo, sq_lo);
+			return -1;
+		}
+		if (gpu_map_host(lo, (size_t)(hi - lo),
+				 MC_HOST_REGISTER_MAPPED, &d_q) != 0) {
+			fprintf(stderr, "映射 RQ+SQ 给 GPU 失败\n");
+			return -1;
+		}
+		d_sq = (char *)d_q + (sq_lo - lo);
+		d_rq = (char *)d_q + (rq_lo - lo);
+	}
+	if (gpu_map_host((void *)h->dvq.dbrec, 64,
+			 MC_HOST_REGISTER_MAPPED, &d_dbrec) ||
+	    gpu_map_host(h->dvc.buf, (size_t)h->dvc.cqe_cnt * h->dvc.cqe_size,
+			 MC_HOST_REGISTER_MAPPED, &d_cq) ||
+	    gpu_map_host((void *)h->dvc.dbrec, 64,
+			 MC_HOST_REGISTER_MAPPED, &d_cqdb) ||
+	    gpu_map_host(h->dvq.bf.reg, h->dvq.bf.size ? h->dvq.bf.size : 4096,
+			 MC_HOST_REGISTER_IO_MEMORY | MC_HOST_REGISTER_MAPPED,
+			 &d_bf)) {
+		fprintf(stderr, "QP %u:映射队列给 GPU 失败\n", q);
+		return -1;
+	}
+	if (v) {
+		printf("[映射] RQ/SQ/CQ/dbrec/UAR 均已交给 GPU\n");
+	}
+
+	ctx->sq_buf       = (volatile uint8_t *)d_sq;
+	ctx->qp_dbrec     = (volatile uint32_t *)d_dbrec;
+	ctx->bf_reg       = (volatile uint64_t *)d_bf;
+	ctx->cq_buf       = (volatile uint8_t *)d_cq;
+	ctx->cq_dbrec     = (volatile uint32_t *)d_cqdb;
+	ctx->sq_wqe_cnt   = h->dvq.sq.wqe_cnt;
+	ctx->sq_stride    = h->dvq.sq.stride;
+	ctx->cq_cnt       = h->dvc.cqe_cnt;
+	ctx->cqe_size     = h->dvc.cqe_size;
+	ctx->qpn          = h->qp->qp_num;
+
+	/*
+	 * ---- RQ 与 recv buffer ----
+	 *
+	 * 响应胶囊落在 SPDK 预先 post 的 recv buffer 里(rsps[i].cpl,连续
+	 * 数组,spdk_zmalloc 大页)。poller 要从里面读 cid 和 NVMe status,
+	 * 所以这段也得映射给 GPU。地址从 RQ 槽里现读,不依赖 SPDK 私有结构。
+	 *
+	 * rdma-core 把 RQ 生产者计数写在 dbrec[0](大端,低 16 位)。SPDK
+	 * 每消费一个就立刻补一个,所以接管时已 post 的数量恒为 queue size,
+	 * 最老那个的计数 = head - posted。RESP CQE 的 wqe_counter 应该从这里
+	 * 开始逐个递增 —— kernel 会核对(wc_mismatch)。
+	 */
+	{
+		volatile uint32_t *qdb = (volatile uint32_t *)h->dvq.dbrec;
+		uint32_t head = be32toh(qdb[0]) & 0xffff;
+		uint32_t mask = h->dvq.rq.wqe_cnt - 1;
+		uint64_t amin = ~0ULL, amax = 0, gap = ~0ULL, prev = 0;
+		uint32_t lkey0 = 0, bad = 0, k;
+		uint64_t base, end;
+
+		spdk_nvme_ctrlr_get_default_io_qpair_opts(g_ctrlr, &qopts,
+							  sizeof(qopts));
+		h->rq_posted = qopts.io_queue_size;
+		if (h->rq_posted > h->dvq.rq.wqe_cnt) {
+			h->rq_posted = h->dvq.rq.wqe_cnt;
+		}
+		for (k = 0; k < h->rq_posted; k++) {
+			uint8_t *seg = (uint8_t *)h->dvq.rq.buf +
+				       (size_t)((head - h->rq_posted + k) & mask) *
+				       h->dvq.rq.stride;
+			uint32_t len, lkey;
+			uint64_t addr;
+
+			memcpy(&len, seg, 4);
+			memcpy(&lkey, seg + 4, 4);
+			memcpy(&addr, seg + 8, 8);
+			len = be32toh(len);
+			lkey = be32toh(lkey);
+			addr = be64toh(addr);
+			if (k == 0) {
+				lkey0 = lkey;
+			}
+			if (len != 16 || lkey != lkey0) {
+				bad++;
+			}
+			if (addr < amin) amin = addr;
+			if (addr > amax) amax = addr;
+			if (k && addr > prev && addr - prev < gap) {
+				gap = addr - prev;
+			}
+			prev = addr;
+		}
+		if (v) {
+			printf("[RQ] wqe_cnt=%u stride=%u head(准备前)=%u posted=%u "
+			       "(io_queue_size=%u) lkey=0x%x 异常槽=%u\n",
+			       h->dvq.rq.wqe_cnt, h->dvq.rq.stride, head,
+			       h->rq_posted, qopts.io_queue_size, lkey0, bad);
+			printf("[RQ] recv buffer 0x%" PRIx64 " .. 0x%" PRIx64
+			       " (跨 %" PRIu64 " 字节, 最小间隔 %" PRIu64 ")\n",
+			       amin, amax + 16, amax + 16 - amin,
+			       gap == ~0ULL ? 0 : gap);
+		}
+		if (bad) {
+			fprintf(stderr, "QP %u:RQ 槽内容和预期不符(len 应为 16、"
+				"lkey 一致),不能继续\n", q);
+			return -1;
+		}
+
+		h->rsp_lo = amin;
+		h->rsp_gap = (gap == ~0ULL) ? 0 : gap;
+		base = amin & ~4095ULL;
+		end = (amax + 16 + 4095) & ~4095ULL;
+		d_rsp = map_recv_buffers(base, end, amin, amax + 16);
+
+		ctx->rq_buf        = (volatile uint8_t *)d_rq;
+		ctx->rq_wqe_cnt    = h->dvq.rq.wqe_cnt;
+		ctx->rq_stride     = h->dvq.rq.stride;
+		ctx->rsp_host_base = base;
+		ctx->rsp_len       = d_rsp ? end - base : 0;
+		ctx->rsp_dev       = (volatile uint8_t *)d_rsp;
+	}
+	return 0;
+}
+
+/*
+ * 接管快照。必须在所有 CPU 侧 I/O 之后拍 —— 预热和涂色都会推进
+ * SQ/CQ/RQ。用过期的 pi,kernel 会写进 SPDK 刚用过的 slot,而且 dbrec
+ * 已经等于 pi+1,网卡认为没有新工作,命令根本发不出去,表现成
+ * "完成 N/N"但 target 侧查无此命令。这个坑踩过两次。
+ */
+static int
+qp_snapshot(struct qp_hw *h, struct gpu_io_ctx *ctx, unsigned q)
+{
+	volatile uint32_t *qdb = (volatile uint32_t *)h->dvq.dbrec;
+	volatile uint32_t *cdb = (volatile uint32_t *)h->dvc.dbrec;
+	uint32_t sq_pi = be32toh(qdb[1]) & 0xffff;
+	uint32_t cq_ci = be32toh(cdb[0]) & 0xffffff;
+	uint32_t rq_head = be32toh(qdb[0]) & 0xffff;
+
+	ctx->sq_pi = (uint16_t)sq_pi;
+	ctx->cq_ci = cq_ci;
+	ctx->cq_phase = (uint8_t)((cq_ci / h->dvc.cqe_cnt) & 1);
+	/*
+	 * 已消费的 recv 数 = 已收到的响应数 = 已发的命令数 = sq_pi
+	 * (接管时所有 CPU 侧命令都已完成)。不能用 head - io_queue_size:
+	 * SPDK 补 recv 是批量延迟 flush 的,最后消费的那个常常还没
+	 * post 回去,实际挂着的比 queue size 少一个。
+	 */
+	ctx->rq_tail = sq_pi & 0xffff;
+	ctx->rq_head = rq_head;
+	ctx->rq_host_buf = h->dvq.rq.buf;	/* gpu_io_run 拷成显存影子 */
+	h->rq_posted = (rq_head - sq_pi) & 0xffff;
+	printf("[接管%s%.0u] SQ pi=%u  CQ ci=%u phase=%u  RQ head=%u tail=%u "
+	       "(挂着 %u 个 recv)\n", q ? " QP" : "", q, sq_pi, cq_ci,
+	       ctx->cq_phase, rq_head, ctx->rq_tail, h->rq_posted);
+	if ((g_opt & 0x800) && ctx->njobs > h->rq_posted) {
+		fprintf(stderr, "QP %u:%u 条超过挂着的 recv 数 %u"
+			"(-O 2048 不补 recv)\n", q, ctx->njobs, h->rq_posted);
+		return -1;
+	}
+	if (!(g_opt & 0x800) && h->dvq.rq.stride % 8) {
+		fprintf(stderr, "RQ stride %u 不是 8 的倍数,补 recv 不支持\n",
+			h->dvq.rq.stride);
+		return -1;
+	}
+	return 0;
+}
+
 /* ================================================================== */
 
 int
@@ -540,32 +825,35 @@ main(int argc, char **argv)
 {
 	struct spdk_env_opts opts;
 	struct spdk_nvme_transport_id trid = {};
+	/*
+	 * 多 QP(-q):hw[q] / ctxs[q] / shs[q] 是第 q 个 QP 的。下文单 QP 时代
+	 * 的诊断输出仍用 qp / dvq / dvc / ctx,它们是 QP 0 的别名;sh 是
+	 * 各 QP 共享区计数器的合计。
+	 */
+	static struct qp_hw hw[GIO_MAX_QP];
+	static struct gpu_io_ctx ctxs[GIO_MAX_QP];
+	static struct gio_shared shs[GIO_MAX_QP];
 	struct ibv_qp *qp;
-	struct ibv_cq *cq;
 	struct mlx5dv_qp dvq;
 	struct mlx5dv_cq dvc;
-	struct mlx5dv_obj obj;
 	struct gpu_io_ctx ctx;
 	unsigned long long *cycles, *c_cap, *c_sub, *c_wait, *c_spin, *c_lock;
 	unsigned int *c_stat, *c_dw0;
 	unsigned long long *c_det, *c_hand, *c_tsreq, *c_tsresp, *c_reqat;
 	struct gio_shared sh;
-	struct spdk_nvme_io_qpair_opts qopts;
-	void *d_rsp = NULL;
 	uint32_t rq_posted = 0;
 	uint64_t rsp_lo = 0, rsp_gap = 0;
 	double *us;
 	double wall_us = 0;
 	uint32_t sector, nlb, nblk;
 	int err = 0, clk_khz = 0, op;
-	unsigned int done = 0, i;
-	void *d_sq, *d_rq, *d_q, *d_dbrec, *d_bf, *d_cq, *d_cqdb;
+	unsigned int done = 0, i, q;
 
 	memset(&dvq, 0, sizeof(dvq));
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:Q:O:WHPVKF:L:S:kED")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:Q:q:O:WHPVKF:L:S:kED")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -574,6 +862,7 @@ main(int argc, char **argv)
 		case 'r': g_rounds = (unsigned)atoi(optarg); break;
 		case 'b': g_io_bytes = (unsigned)atoi(optarg); break;
 		case 'Q': g_qd = (unsigned)atoi(optarg); break;
+		case 'q': g_nq = (unsigned)atoi(optarg); break;
 		case 'O': g_opt = (unsigned)strtoul(optarg, NULL, 0); break;
 		case 'W': g_write = 1; break;
 		case 'H': g_cap_in_hbm = 1; break;
@@ -603,8 +892,19 @@ main(int argc, char **argv)
 		fprintf(stderr, "-Q 取 1..127\n");
 		return 1;
 	}
-	if (g_qd > g_rounds) {
-		g_qd = g_rounds;
+	if (g_nq == 0 || g_nq > GIO_MAX_QP) {
+		fprintf(stderr, "-q 取 1..%d\n", GIO_MAX_QP);
+		return 1;
+	}
+	if (g_nq > g_rounds) {
+		g_nq = g_rounds;
+	}
+	if (g_qd > g_rounds / g_nq) {
+		g_qd = g_rounds / g_nq;
+	}
+	if (g_nq > 1 && (g_opt & 0x200)) {
+		fprintf(stderr, "-O 512(胶囊槽轮换)不支持多 QP\n");
+		return 1;
 	}
 	/* 0x7000 默认开;带 0x10000 时保持 -O 原样,用来对照旧行为 */
 	if (g_opt & GIO_OPT_LEGACY) {
@@ -922,76 +1222,12 @@ main(int argc, char **argv)
 		       g_cap_mr->lkey, g_cap_host, g_cap_dev);
 	}
 
-	/* ---- 把队列交给 GPU ---- */
-	qp = spdk_nvme_qpair_get_ibv_qp(g_qpair);
-	cq = spdk_nvme_qpair_get_ibv_cq(g_qpair);
-	if (!qp || !cq) {
-		fprintf(stderr, "拿不到 ibv_qp/ibv_cq,SPDK 打过 patch 吗?\n");
-		return 1;
-	}
-	dvq.comp_mask = MLX5DV_QP_MASK_UAR_MMAP_OFFSET;
-	obj.qp.in = qp; obj.qp.out = &dvq;
-	obj.cq.in = cq; obj.cq.out = &dvc;
-	if (mlx5dv_init_obj(&obj, MLX5DV_OBJ_QP | MLX5DV_OBJ_CQ)) {
-		fprintf(stderr, "mlx5dv_init_obj 失败\n");
-		return 1;
-	}
-	printf("\n[QP] qpn=0x%x sq %ux%u  cq %ux%u\n",
-	       qp->qp_num, dvq.sq.wqe_cnt, dvq.sq.stride,
-	       dvc.cqe_cnt, dvc.cqe_size);
-
 	/*
-	 * mlx5 的 RQ 和 SQ 在同一块 buffer 里(RQ 在前),SQ 起点往往不对齐页,
-	 * 两者可能共用一页。整段一起注册,再按偏移算出各自的设备指针。
+	 * ---- 把队列交给 GPU ----
+	 * 先填各 QP 共用的字段(胶囊、数据区、命令),再逐个 QP 填硬件相关的。
+	 * QP 0 就是上面预热用的 g_qpair;其余 QP 现在才建,CPU 侧一条 I/O
+	 * 都不走它们。胶囊区按 QP 切开,每个 QP 64 KiB(1024 个槽)。
 	 */
-	{
-		char *rq_lo = (char *)dvq.rq.buf;
-		char *rq_hi = rq_lo + (size_t)dvq.rq.wqe_cnt * dvq.rq.stride;
-		char *sq_lo = (char *)dvq.sq.buf;
-		char *sq_hi = sq_lo + (size_t)dvq.sq.wqe_cnt * dvq.sq.stride;
-		char *lo = rq_lo < sq_lo ? rq_lo : sq_lo;
-		char *hi = rq_hi > sq_hi ? rq_hi : sq_hi;
-
-		if ((size_t)(hi - lo) > (size_t)((rq_hi - rq_lo) +
-						 (sq_hi - sq_lo)) + 8192) {
-			fprintf(stderr, "RQ %p 与 SQ %p 不相邻,和预期的 mlx5 "
-				"布局不同\n", rq_lo, sq_lo);
-			return 1;
-		}
-		if (gpu_map_host(lo, (size_t)(hi - lo),
-				 MC_HOST_REGISTER_MAPPED, &d_q) != 0) {
-			fprintf(stderr, "映射 RQ+SQ 给 GPU 失败\n");
-			return 1;
-		}
-		d_sq = (char *)d_q + (sq_lo - lo);
-		d_rq = (char *)d_q + (rq_lo - lo);
-	}
-	if (gpu_map_host((void *)dvq.dbrec, 64,
-			 MC_HOST_REGISTER_MAPPED, &d_dbrec) ||
-	    gpu_map_host(dvc.buf, (size_t)dvc.cqe_cnt * dvc.cqe_size,
-			 MC_HOST_REGISTER_MAPPED, &d_cq) ||
-	    gpu_map_host((void *)dvc.dbrec, 64,
-			 MC_HOST_REGISTER_MAPPED, &d_cqdb) ||
-	    gpu_map_host(dvq.bf.reg, dvq.bf.size ? dvq.bf.size : 4096,
-			 MC_HOST_REGISTER_IO_MEMORY | MC_HOST_REGISTER_MAPPED,
-			 &d_bf)) {
-		fprintf(stderr, "映射队列给 GPU 失败\n");
-		return 1;
-	}
-	printf("[映射] RQ/SQ/CQ/dbrec/UAR 均已交给 GPU\n");
-
-	ctx.sq_buf       = (volatile uint8_t *)d_sq;
-	ctx.qp_dbrec     = (volatile uint32_t *)d_dbrec;
-	ctx.bf_reg       = (volatile uint64_t *)d_bf;
-	ctx.cq_buf       = (volatile uint8_t *)d_cq;
-	ctx.cq_dbrec     = (volatile uint32_t *)d_cqdb;
-	ctx.sq_wqe_cnt   = dvq.sq.wqe_cnt;
-	ctx.sq_stride    = dvq.sq.stride;
-	ctx.cq_cnt       = dvc.cqe_cnt;
-	ctx.cqe_size     = dvc.cqe_size;
-	ctx.qpn          = qp->qp_num;
-	/* capsule 是 GPU 写用的指针,capsule_addr 是网卡读用的地址。
-	 * 胶囊在主存时两者不同(前者是 mcHostRegister 的 device 指针)。 */
 	ctx.capsule      = (volatile uint8_t *)g_cap_dev;
 	ctx.capsule_addr = g_cap_in_hbm ? (uint64_t)g_cap_hbm
 					: (uint64_t)g_cap_host;
@@ -1014,85 +1250,29 @@ main(int argc, char **argv)
 			       NVME_KV_OPC_RETRIEVE;
 	}
 
-	/*
-	 * ---- RQ 与 recv buffer ----
-	 *
-	 * 响应胶囊落在 SPDK 预先 post 的 recv buffer 里(rsps[i].cpl,连续
-	 * 数组,spdk_zmalloc 大页)。poller 要从里面读 cid 和 NVMe status,
-	 * 所以这段也得映射给 GPU。地址从 RQ 槽里现读,不依赖 SPDK 私有结构。
-	 *
-	 * rdma-core 把 RQ 生产者计数写在 dbrec[0](大端,低 16 位)。SPDK
-	 * 每消费一个就立刻补一个,所以接管时已 post 的数量恒为 queue size,
-	 * 最老那个的计数 = head - posted。RESP CQE 的 wqe_counter 应该从这里
-	 * 开始逐个递增 —— kernel 会核对(wc_mismatch)。
-	 */
-	{
-		volatile uint32_t *qdb = (volatile uint32_t *)dvq.dbrec;
-		uint32_t head = be32toh(qdb[0]) & 0xffff;
-		uint32_t mask = dvq.rq.wqe_cnt - 1;
-		uint64_t amin = ~0ULL, amax = 0, gap = ~0ULL, prev = 0;
-		uint32_t lkey0 = 0, bad = 0, k;
-		uint64_t base, end;
-
-		spdk_nvme_ctrlr_get_default_io_qpair_opts(g_ctrlr, &qopts,
-							  sizeof(qopts));
-		rq_posted = qopts.io_queue_size;
-		if (rq_posted > dvq.rq.wqe_cnt) {
-			rq_posted = dvq.rq.wqe_cnt;
-		}
-		for (k = 0; k < rq_posted; k++) {
-			uint8_t *seg = (uint8_t *)dvq.rq.buf +
-				       (size_t)((head - rq_posted + k) & mask) *
-				       dvq.rq.stride;
-			uint32_t len, lkey;
-			uint64_t addr;
-
-			memcpy(&len, seg, 4);
-			memcpy(&lkey, seg + 4, 4);
-			memcpy(&addr, seg + 8, 8);
-			len = be32toh(len);
-			lkey = be32toh(lkey);
-			addr = be64toh(addr);
-			if (k == 0) {
-				lkey0 = lkey;
-			}
-			if (len != 16 || lkey != lkey0) {
-				bad++;
-			}
-			if (addr < amin) amin = addr;
-			if (addr > amax) amax = addr;
-			if (k && addr > prev && addr - prev < gap) {
-				gap = addr - prev;
-			}
-			prev = addr;
-		}
-		printf("[RQ] wqe_cnt=%u stride=%u head(准备前)=%u posted=%u "
-		       "(io_queue_size=%u) lkey=0x%x 异常槽=%u\n",
-		       dvq.rq.wqe_cnt, dvq.rq.stride, head, rq_posted,
-		       qopts.io_queue_size, lkey0, bad);
-		printf("[RQ] recv buffer 0x%" PRIx64 " .. 0x%" PRIx64
-		       " (跨 %" PRIu64 " 字节, 最小间隔 %" PRIu64 ")\n",
-		       amin, amax + 16, amax + 16 - amin,
-		       gap == ~0ULL ? 0 : gap);
-		if (bad) {
-			fprintf(stderr, "RQ 槽内容和预期不符(len 应为 16、lkey 一致),"
-				"不能继续\n");
+	hw[0].qpair = g_qpair;
+	for (q = 1; q < g_nq; q++) {
+		hw[q].qpair = spdk_nvme_ctrlr_alloc_io_qpair(g_ctrlr, NULL, 0);
+		if (!hw[q].qpair) {
+			fprintf(stderr, "第 %u 个 qpair 建不出来(target 的 "
+				"max_qpairs_per_ctrlr?)\n", q);
 			return 1;
 		}
-
-		rsp_lo = amin;
-		rsp_gap = (gap == ~0ULL) ? 0 : gap;
-		base = amin & ~4095ULL;
-		end = (amax + 16 + 4095) & ~4095ULL;
-		d_rsp = map_recv_buffers(base, end, amin, amax + 16);
-
-		ctx.rq_buf        = (volatile uint8_t *)d_rq;
-		ctx.rq_wqe_cnt    = dvq.rq.wqe_cnt;
-		ctx.rq_stride     = dvq.rq.stride;
-		ctx.rsp_host_base = base;
-		ctx.rsp_len       = d_rsp ? end - base : 0;
-		ctx.rsp_dev       = (volatile uint8_t *)d_rsp;
 	}
+	for (q = 0; q < g_nq; q++) {
+		ctxs[q] = ctx;
+		ctxs[q].capsule      += (size_t)q * CAP_QP_STRIDE;
+		ctxs[q].capsule_addr += (uint64_t)q * CAP_QP_STRIDE;
+		if (qp_attach(&hw[q], &ctxs[q], q) != 0) {
+			return 1;
+		}
+	}
+	qp = hw[0].qp;
+	dvq = hw[0].dvq;
+	dvc = hw[0].dvc;
+	rq_posted = hw[0].rq_posted;
+	rsp_lo = hw[0].rsp_lo;
+	rsp_gap = hw[0].rsp_gap;
 
 	/*
 	 * QD 仍受 queue size 限制:同时在飞的命令数不能超过 target 端的
@@ -1121,9 +1301,20 @@ main(int argc, char **argv)
 		g_qd = (dvc.cqe_cnt - GIO_CQ_BATCH) / 2 - 1;
 		printf("[QD] CQ ci 懒更新(0x2000)要留余量,降为 %u\n", g_qd);
 	}
-	ctx.qd = g_qd;
-	ctx.opt = g_opt;
-	ctx.njobs = g_rounds;
+	/*
+	 * 总条数按 QP 切成连续段。GPU 上同时常驻 QP 数 × (QD + 1) 个 block,
+	 * 全部在自旋 —— 放不下时没被调度的 poller 会让同 QP 的 submitter 超时。
+	 */
+	for (q = 0; q < g_nq; q++) {
+		uint32_t lo = (uint32_t)((uint64_t)g_rounds * q / g_nq);
+		uint32_t hi = (uint32_t)((uint64_t)g_rounds * (q + 1) / g_nq);
+
+		ctxs[q].qd = g_qd;
+		ctxs[q].opt = g_opt;
+		ctxs[q].job_base = lo;
+		ctxs[q].njobs = hi - lo;
+	}
+	ctx = ctxs[0];
 
 	/* ---- 准备源数据 / 盘上底色 ---- */
 	if (g_fill_by_kernel) {
@@ -1216,51 +1407,14 @@ main(int argc, char **argv)
 		       g_start_lba, nblk, CPAT, nfail);
 	}
 
-	/*
-	 * 快照必须在所有 CPU 侧 I/O 之后拍 —— 上面的预热和涂色都会推进
-	 * SQ/CQ。用过期的 pi,kernel 会写进 SPDK 刚用过的 slot,而且 dbrec
-	 * 已经等于 pi+1,网卡认为没有新工作,命令根本发不出去,表现成
-	 * "完成 N/N"但 target 侧查无此命令。这个坑踩过两次。
-	 */
-	{
-		volatile uint32_t *qdb = (volatile uint32_t *)dvq.dbrec;
-		volatile uint32_t *cdb = (volatile uint32_t *)dvc.dbrec;
-		uint32_t sq_pi = be32toh(qdb[1]) & 0xffff;
-		uint32_t cq_ci = be32toh(cdb[0]) & 0xffffff;
-
-		uint32_t rq_head = be32toh(qdb[0]) & 0xffff;
-
-		ctx.sq_pi = (uint16_t)sq_pi;
-		ctx.cq_ci = cq_ci;
-		ctx.cq_phase = (uint8_t)((cq_ci / dvc.cqe_cnt) & 1);
-		/*
-		 * RQ 的快照也必须在这里拍:上面的预写/涂色会推进 RQ head
-		 * (SPDK 每消费一个 recv 就补一个)。
-		 */
-		/*
-		 * 已消费的 recv 数 = 已收到的响应数 = 已发的命令数 = sq_pi
-		 * (接管时所有 CPU 侧命令都已完成)。不能用 head - io_queue_size:
-		 * SPDK 补 recv 是批量延迟 flush 的,最后消费的那个常常还没
-		 * post 回去,实际挂着的比 queue size 少一个。
-		 */
-		ctx.rq_tail = sq_pi & 0xffff;
-		ctx.rq_head = rq_head;
-		ctx.rq_host_buf = dvq.rq.buf;	/* gpu_io_run 拷成显存影子 */
-		rq_posted = (rq_head - sq_pi) & 0xffff;
-		printf("[接管] SQ pi=%u  CQ ci=%u phase=%u  RQ head=%u tail=%u "
-		       "(挂着 %u 个 recv)\n", sq_pi, cq_ci, ctx.cq_phase,
-		       rq_head, ctx.rq_tail, rq_posted);
-		if ((g_opt & 0x800) && g_rounds > rq_posted) {
-			fprintf(stderr, "-r %u 超过挂着的 recv 数 %u(-O 2048 不补 recv)\n",
-				g_rounds, rq_posted);
-			return 1;
-		}
-		if (!(g_opt & 0x800) && dvq.rq.stride % 8) {
-			fprintf(stderr, "RQ stride %u 不是 8 的倍数,补 recv 不支持\n",
-				dvq.rq.stride);
+	/* 快照必须在所有 CPU 侧 I/O 之后拍,见 qp_snapshot */
+	for (q = 0; q < g_nq; q++) {
+		if (qp_snapshot(&hw[q], &ctxs[q], q) != 0) {
 			return 1;
 		}
 	}
+	ctx = ctxs[0];
+	rq_posted = hw[0].rq_posted;
 
 	/* ---- 跑 ---- */
 	cycles = calloc(g_rounds, sizeof(*cycles));
@@ -1277,18 +1431,19 @@ main(int argc, char **argv)
 	c_reqat  = calloc(g_rounds, sizeof(*c_reqat));
 	c_dw0    = calloc(g_rounds, sizeof(*c_dw0));
 	us = calloc(g_rounds, sizeof(*us));
-	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u, %s, %s, -O 0x%x\n",
+	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u%s, %s, %s, -O 0x%x\n",
 	       g_kv ? kv_opc_name(ctx.nvme_opc) : g_write ? "WRITE" : "READ",
-	       g_rounds, g_io_bytes, g_qd,
+	       g_rounds, g_io_bytes, g_qd, qp_desc(g_nq),
 	       ctx.data_step ? "每条一块" : "单块复用",
 	       (g_opt & 0x800) ? "不补 recv" : "补 recv", g_opt);
 
-	if (gpu_io_run(&ctx, g_start_lba, c_cap, c_sub, c_wait, c_spin,
+	if (gpu_io_run(ctxs, g_nq, g_start_lba, c_cap, c_sub, c_wait, c_spin,
 		       c_lock, c_stat, c_det, c_hand, c_tsreq, c_tsresp,
-		       c_reqat, &wall_us, c_dw0, &sh) != 0) {
+		       c_reqat, &wall_us, c_dw0, shs) != 0) {
 		fprintf(stderr, "kernel 执行失败\n");
 		return 1;
 	}
+	sh_sum(&sh, shs, g_nq);
 
 	/*
 	 * done = 等到了响应的条数(不论 NVMe status);ok = status 为 0 的。
@@ -1471,35 +1626,37 @@ main(int argc, char **argv)
 	 * 网卡认为没有新工作)。这种情况下 kernel 收割的是前一条 CPU 命令
 	 * 的 CQE,照样报"完成 N/N",但 target 侧查无此命令。
 	 */
-	{
-		volatile uint32_t *qdb = (volatile uint32_t *)dvq.dbrec;
-		volatile uint32_t *cdb = (volatile uint32_t *)dvc.dbrec;
+	for (q = 0; q < g_nq; q++) {
+		volatile uint32_t *qdb = (volatile uint32_t *)hw[q].dvq.dbrec;
+		volatile uint32_t *cdb = (volatile uint32_t *)hw[q].dvc.dbrec;
+		const struct gpu_io_ctx *c = &ctxs[q];
+		const struct gio_shared *x = &shs[q];
 		uint32_t sq_now = be32toh(qdb[1]) & 0xffff;
 		uint32_t rq_now = be32toh(qdb[0]) & 0xffff;
 		uint32_t cq_now = be32toh(cdb[0]) & 0xffffff;
 
-		printf("[dbrec] SQ %u -> %u (+%u, 期望 +%u)   CQ %u -> %u (+%u)"
-		       "   RQ %u -> %u (+%u, 期望 +%u)\n",
-		       ctx.sq_pi, sq_now, (sq_now - ctx.sq_pi) & 0xffff, g_rounds,
-		       ctx.cq_ci, cq_now, cq_now - ctx.cq_ci,
-		       ctx.rq_head, rq_now, (rq_now - ctx.rq_head) & 0xffff,
-		       (g_opt & 0x800) ? 0 : sh.cqe_resp);
-		if (((sq_now - ctx.sq_pi) & 0xffff) != (g_rounds & 0xffff)) {
+		printf("[dbrec%s%.0u] SQ %u -> %u (+%u, 期望 +%u)   CQ %u -> %u (+%u)"
+		       "   RQ %u -> %u (+%u, 期望 +%u)\n", q ? " QP" : "", q,
+		       c->sq_pi, sq_now, (sq_now - c->sq_pi) & 0xffff, c->njobs,
+		       c->cq_ci, cq_now, cq_now - c->cq_ci,
+		       c->rq_head, rq_now, (rq_now - c->rq_head) & 0xffff,
+		       (g_opt & 0x800) ? 0 : x->cqe_resp);
+		if (((sq_now - c->sq_pi) & 0xffff) != (c->njobs & 0xffff)) {
 			printf("  *** SQ 增量不等于轮数:kernel 的命令没发出去 ***\n");
 		}
 		if (!(g_opt & 0x800) &&
-		    (((rq_now - ctx.rq_head) & 0xffff) != (sh.cqe_resp & 0xffff) ||
-		     sh.rq_reposted != sh.cqe_resp)) {
+		    (((rq_now - c->rq_head) & 0xffff) != (x->cqe_resp & 0xffff) ||
+		     x->rq_reposted != x->cqe_resp)) {
 			printf("  *** RQ 补充数(%u)和响应数(%u)对不上 ***\n",
-			       sh.rq_reposted, sh.cqe_resp);
+			       x->rq_reposted, x->cqe_resp);
 		}
-		if (cq_now != ctx.cq_ci + sh.cqe_req + sh.cqe_resp) {
+		if (cq_now != c->cq_ci + x->cqe_req + x->cqe_resp) {
 			printf("  *** CQ dbrec 没补齐:%u,期望 %u ***\n", cq_now,
-			       ctx.cq_ci + sh.cqe_req + sh.cqe_resp);
+			       c->cq_ci + x->cqe_req + x->cqe_resp);
 		}
-		printf("[dbrec] 推 RQ dbrec %u 次,写 CQ dbrec %u 次;SEND 要了 CQE 的 %u 条\n",
-		       sh.rq_flushes, sh.cq_db_writes, sh.cqe_req);
 	}
+	printf("[dbrec] 推 RQ dbrec %u 次,写 CQ dbrec %u 次;SEND 要了 CQE 的 %u 条\n",
+	       sh.rq_flushes, sh.cq_db_writes, sh.cqe_req);
 
 	/*
 	 * kernel 写完之后,CPU 读回 SQ slot 和胶囊,确认它到底写了什么。
@@ -1877,7 +2034,9 @@ main(int argc, char **argv)
 		free(h);
 	}
 
-	spdk_nvme_ctrlr_free_io_qpair(g_qpair);
+	for (q = 0; q < g_nq; q++) {
+		spdk_nvme_ctrlr_free_io_qpair(hw[q].qpair);
+	}
 	spdk_nvme_detach(g_ctrlr);
 	return (err || done != g_rounds) ? 2 : 0;
 }

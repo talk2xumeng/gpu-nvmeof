@@ -1,7 +1,7 @@
 /*
  * gpu_io_ctx.h  --  host 和 kernel 共享的 I/O 上下文
  *
- * 这个结构是按值传进 kernel 的(k_gpu_io 的第一个参数),所以两侧
+ * 这个结构每个 QP 一份,host 拷进显存数组交给 k_gpu_io,所以两侧
  * 的字段顺序和类型必须严格一致 —— 早先 host 和 device 各抄了一份,
  * 改一处忘另一处就会静默错位,症状是发包之后永远等不到完成,和
  * CQE 判据写错长得一模一样,非常难查。放这儿是为了让它不可能不同步。
@@ -106,6 +106,14 @@ struct gpu_io_ctx {
 	uint32_t		rq_head;
 	volatile uint64_t	*rq_shadow;
 	const void		*rq_host_buf;
+
+	/*
+	 * ---- C3:多 QP ----
+	 * 每个 QP 一份 ctx、一个 poller、qd 个 submitter。总条数按 QP 切成
+	 * 连续段:本 QP 的第 j 条(0..njobs-1)是全局第 job_base + j 条 ——
+	 * LBA / key / 显存块 / 逐条统计数组都按全局序号取。单 QP 时 job_base = 0。
+	 */
+	uint32_t		job_base;
 };
 
 /*
@@ -168,6 +176,9 @@ struct gio_shared {
  */
 #define GIO_OPT_DEFAULT	0x7000u
 #define GIO_OPT_LEGACY	0x10000u
+
+/* 多 QP 上限(-q) */
+#define GIO_MAX_QP	16
 
 #define GIO_RQ_BATCH	16
 #define GIO_CQ_BATCH	32

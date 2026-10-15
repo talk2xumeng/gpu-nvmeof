@@ -279,6 +279,35 @@ QD4 起仍然饱和,瓶颈还是单 poller 串行处理 CQE(约 6.7 µs/条,其�
 读响应约 0.7 µs、fence 若干)。再往上要么多 QP(每 QP 一个 poller,扩带宽),
 要么 CQ 放显存(去掉 PCIe 读,降单条成本)。
 
+回归(0x7000 默认,2026-10-15):读 QD1/QD16、写 QD4 + 回读、`-O 16`、
+`-O 32`、`-O 2048`、QD 127(自动降为 111)、KV Retrieve/Store/Delete 全部
+PASS。`-O 16` 自轮询每约 32 条有一次 ~300 µs 的等待尖刺,改默认前就有,
+自轮询只做对照,未处理。
+
+### 多 QP(C3)
+
+单 poller 每条约 6.9 µs,单 QP 上限约 104k IOPS(4 KiB)。最终目标是
+GPU 发起的 GDS,要的是大块带宽,单 QP 不够,所以先横向扩:
+
+- `-q N` 建 N 个 io qpair。QP 0 是预热 / 准备用的那个,其余接管前一条
+  CPU I/O 都不走。每个 QP 各自一份 ctx(SQ/RQ/CQ/dbrec/UAR/recv buffer
+  映射、接管快照)、一个 `gio_shared`、`qd` 个 tag,QP 之间不共享状态,
+  不加任何跨 QP 的锁。
+- launch `N × (QD + 1)` 个 block,block b 属于 QP `b / (QD + 1)`。ctx 数组
+  放显存,每个线程拷一份到本地,之后和单 QP 一样。
+- 总条数切成 N 段连续区间:QP q 的第 j 条是全局第 `job_base + j` 条,
+  LBA、key、显存块、逐条统计都按全局序号,所以校验、统计代码不用改。
+- 胶囊区每个 QP 64 KiB(1024 槽);`-O 512` 的轮换槽位不跨 QP 隔离,
+  多 QP 时禁用。
+- 统计:共享区计数器合计;dbrec 逐 QP 核对;CQE / SQ dump 只看 QP 0。
+
+约束:
+- 所有 block 必须同时常驻(都在自旋)。放不下时没被调度的 poller 会让同
+  QP 的 submitter 超时(`GIO_E_WAIT`)。
+- target 侧每个 QP 落到一个 reactor,kv_tgt `-m 0x3` 只有 2 个。
+- recv buffer 映射可能和别的 QP 落在同一页而失败,这时那个 QP 只支持
+  CQE 内联响应 —— 目前响应 100% 内联,不影响。
+
 ## C1 状态(2026-09-17 暂停)
 
 ### 已完成
