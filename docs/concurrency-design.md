@@ -308,6 +308,39 @@ GPU 发起的 GDS,要的是大块带宽,单 QP 不够,所以先横向扩:
 - recv buffer 映射可能和别的 QP 落在同一页而失败,这时那个 QP 只支持
   CQE 内联响应 —— 目前响应 100% 内联,不影响。
 
+#### 验收与扩展性(2026-10-15)
+
+功能:`-q 2 -Q 4`、`-q 4 -Q 16` 读,`-q 2` KV Retrieve 全部 PASS,每个 QP
+的 SQ/CQ/RQ dbrec 增量都对得上,单 QP 回归不变。
+
+4 KiB 读,cnode2(malloc),kv_tgt `-m 0x3`,3 次中位数:
+
+| QP | QD4 IOPS | QD16 IOPS | QD4 总计 p50 (µs) |
+|---|---|---|---|
+| 1 | 99k | 101k | 37.8 |
+| 2 | 198k | 202k | 37.4 |
+| 4 | 401k | 395k | 37.3 |
+| 8 | **775k** | 752k | 37.8 |
+
+线性扩展,每个 QP 约 97k(单 poller 约 7 µs/条)。到 8 QP 还没饱和。
+
+128 KiB 读(target 的 max_io_size 上限),QD4:
+
+| QP | kv_tgt `-m 0x3` | kv_tgt `-m 0xF` |
+|---|---|---|
+| 1 | 9.5 GB/s | - |
+| 2 | 18.3 GB/s | 17.9 GB/s |
+| 4 | 19.9 GB/s | **24.2 GB/s** |
+| 8 | 18.9 GB/s | 24.0 GB/s |
+
+- 2 核时卡在约 20 GB/s:malloc 后端每次读要在 target CPU 上 memcpy 128K,
+  单核约 10 GB/s。换 4 核后上限到 24.2 GB/s(≈ 193 Gb/s 净荷),是 200G
+  RoCE 的线速量级。
+- 也就是说,GPU 发起的这条路径在 4 QP × QD4 × 128K 下已经能跑满网卡,
+  initiator 侧不是带宽瓶颈。poller 每条约 6.9 µs,128K 下单 QP 能处理
+  约 145k 条/s,用到的不到一半。
+- 换真盘后,带宽上限看盘和 target 的读路径,不再是 malloc 的 memcpy。
+
 ## C1 状态(2026-09-17 暂停)
 
 ### 已完成

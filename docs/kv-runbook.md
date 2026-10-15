@@ -60,7 +60,7 @@ target 上的 `kv_tgt` 和普通 `nvmf_tgt` 不能同时跑:两个都占 4420 �
 ```bash
 # 容器里,开一个 tmux 窗口专门跑它
 cd /workspace/gpu-nvmeof
-./bin/kv_tgt -m 0x3
+./bin/kv_tgt -m 0xF
 
 # 另开一个窗口
 SPDK_DIR=/workspace/spdk TARGET_IP=172.16.3.8 tst/kv_target/setup_kv_target.sh
@@ -137,8 +137,10 @@ make qd-sweep OPTS=0 NQPS="1 2 4 8" QDS="4 16"                  # 多 QP
 ```
 
 多 QP 时 target 侧并行度取决于 kv_tgt 的核数(`-m`):每个 QP 落在一个
-reactor 上,`-m 0x3` 只有 2 个。QP 数超过 2 以后 IOPS 不涨,先把 kv_tgt
-换成 `-m 0xF` 或 `-m 0xFF` 重启(不用重编,重启后重跑 setup 脚本)。
+reactor 上。测大块带宽要用 `-m 0xF`:`-m 0x3` 时 128K 读卡在约 20 GB/s
+(malloc 每核 memcpy 约 10 GB/s),`-m 0xF` 到 24.2 GB/s。改核数不用重编,
+重启 kv_tgt 后重跑 setup 脚本。核最好和 ens10np0 同 NUMA
+(`cat /sys/class/net/ens10np0/device/numa_node`)。
 
 `-O` 的值与默认的 0x7000 按位或;`-O 0x10000` 是旧行为(全关)。默认下 QD
 上限是 111(RQ 批量补和 CQ 懒更新要留余量),超过会自动降并打印 `[QD]`。
