@@ -23,6 +23,8 @@
 #   make run-gpu-kv-store      GPU Store + 另起进程逐块回读
 #   make run-gpu-kv-exist      GPU Exist(只看状态)
 #   make run-gpu-kv-delete     GPU Delete + 另起进程确认全部不存在
+#   make kv-vs-nvm             KV vs NVM 读写延迟对照(同一 target,QD 1,
+#                              SIZES/REPEAT 可调,见 tst/kv_target/kv_vs_nvm.sh)
 #
 # 实验(tst/,各目录有 README 记录背景和结论):
 #   make pit7-matrix [MATRIX=1|2|3] 坑 7:kernel 写显存对网卡的可见性
@@ -43,7 +45,7 @@ CUDA_DIR   ?= /usr/local/cuda
 MXCC       ?= $(MACA_DIR)/mxgpu_llvm/bin/mxcc
 
 # 测试参数
-TARGET_IP  ?= 172.16.3.3
+TARGET_IP  ?= 172.16.3.8
 NQN        ?= nqn.2024-01.io.test:cnode1
 GPU_ID     ?= 4
 NIC        ?= mlx5_1
@@ -112,7 +114,8 @@ LDFLAGS    := $(SPDK_LIBS) $(SYS_LIBS) $(GPU_LIBS) $(RDMA_LIBS) $(EXTRA_LIBS)
         run-verify run-bw run-host run-latency run-latency-noker sweep-block \
         run-gpu-initiated run-gpu-read-verify run-gpu-write-verify \
         tst pit7-matrix pit7-bench help kv-tgt kv-smoke run-kv-smoke \
-        run-gpu-kv-retrieve run-gpu-kv-store run-gpu-kv-exist run-gpu-kv-delete
+        run-gpu-kv-retrieve run-gpu-kv-store run-gpu-kv-exist run-gpu-kv-delete \
+        kv-vs-nvm
 
 # 实验程序也在 all 里:src/ 改动若让它们编不过,当场就能发现,
 # 而不是等回头复现时才知道(坑 4)。
@@ -276,6 +279,17 @@ run-gpu-kv-exist: $(BIN)/gpu_initiated
 run-gpu-kv-delete: $(BIN)/gpu_initiated
 	-sudo ./$(GKV) -D
 	sudo ./$(GKV) -V -D
+
+# 同一个 kv_tgt 上 KV(cnode1)和 malloc(cnode2)各跑一遍,算差值
+KV_NQN  ?= $(NQN)
+NVM_NQN ?= nqn.2024-01.io.test:cnode2
+SIZES   ?= 4096 65536 131072
+REPEAT  ?= 3
+
+kv-vs-nvm: $(BIN)/gpu_initiated
+	TARGET_IP=$(TARGET_IP) KV_NQN=$(KV_NQN) NVM_NQN=$(NVM_NQN) \
+	GPU_ID=$(GPU_ID) ROUNDS=$(GPU_ROUNDS) SIZES="$(SIZES)" REPEAT=$(REPEAT) \
+	BIN=./$(BIN)/gpu_initiated $(TST)/kv_target/kv_vs_nvm.sh
 
 # ---- KV 模拟 target(tst/kv_target,target 机器上编)----
 kv-tgt:

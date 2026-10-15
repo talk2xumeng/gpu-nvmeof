@@ -76,6 +76,37 @@ make run-gpu-kv-delete             # ⑤ GPU Delete,另起进程 -V -D 确认全
 参数沿用读写模式的含义:`GPU_BS` 是 value 长度,`GPU_ROUNDS` 是 key 个数,
 `GPU_QD` 是并发数,`GPU_LBA` 是起始 key 序号。
 
+## KV vs NVM 延迟对照
+
+`setup_kv_target.sh` 默认在同一个 kv_tgt 上建两个 subsystem:
+
+- cnode1:KV(kv_emu)
+- cnode2:NVM(malloc)
+
+`kv_vs_nvm.sh` 在 QD 1 下把两边各跑一遍,对比:
+
+- Read vs Retrieve
+- Write vs Store
+- Exist(不带数据)作为往返基线
+
+同一个 target 进程、同一条链路、同一个 kernel,只换命令集,所以差值就是
+KV 自己的代价。C1 那个小 I/O 回退两边都有,相减时就抵消了。
+
+```bash
+make kv-vs-nvm                                    # 默认 4K/64K/128K,各 3 次
+make kv-vs-nvm SIZES="4096 16384 65536 131072" REPEAT=5
+```
+
+输出写到 `kv_vs_nvm_<时间>/`:
+
+- 每次运行的完整日志
+- `results.csv`:逐次的 p50
+- `summary.md`:中位数表和差值表
+
+NVMe 没有全部成功,或者校验 FAIL 的运行,不计入统计,并在最后单独列出。
+
+`EXTRA` 会原样加到每条命令后面,比如 `EXTRA="-O 128"` 会打出 CQE 硬件时间戳。
+
 ## kv_emu 实现了什么
 
 | 命令 | 行为 |

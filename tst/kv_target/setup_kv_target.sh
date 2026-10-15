@@ -9,6 +9,10 @@
 #   KV_MB       容量 MiB(key+value 都计入,默认 4096)
 #   KV_MAXVAL   单个 value 上限字节(默认 4 MiB;实际还受传输层 -i 限制)
 #   KV_EDNEK    1 = Delete 不存在的 key 报 87h(默认 0,spec 默认行为)
+#   NVM_NQN     对照用的 NVM subsystem(默认 ...:cnode2,挂 malloc bdev;
+#               设成 none 不建)。和 KV 同一个 target 进程、同一条链路,
+#               kv_vs_nvm.sh 用它测"KV 比读写多花多少"
+#   NVM_MB      malloc 盘大小 MiB(默认 1024)
 set -e
 
 SPDK_DIR=${SPDK_DIR:-/home/metaxadmin/mx/spdk}
@@ -19,6 +23,9 @@ BDEV=${KV_BDEV:-KVEmu0}
 KV_MB=${KV_MB:-4096}
 KV_MAXVAL=${KV_MAXVAL:-4194304}
 KV_EDNEK=${KV_EDNEK:-0}
+NVM_NQN=${NVM_NQN:-nqn.2024-01.io.test:cnode2}
+NVM_BDEV=${NVM_BDEV:-Malloc0}
+NVM_MB=${NVM_MB:-1024}
 
 RPC="$SPDK_DIR/scripts/rpc.py -s $SOCK"
 
@@ -63,16 +70,33 @@ fi
 
 # -i 131072:单条命令最大 128 KiB,和 setup_target.sh 一致;
 # value 更大时要同时调大这里和 initiator 侧的 -b
-$RPC nvmf_create_transport -t RDMA -u 8192 -i 131072 2>/dev/null || true
+$RPC nvmf_create_transport -t RDMA -u 8192 -i 131072 >/dev/null 2>&1 || true
 
 kvrpc bdev_kv_emu_create "{\"name\": \"$BDEV\", \"capacity_mb\": $KV_MB, \
 \"max_value\": $KV_MAXVAL, \"ednek\": $([ "$KV_EDNEK" = 1 ] && echo true || echo false)}" \
     || echo "($BDEV 可能已存在)"
 
-$RPC nvmf_create_subsystem $NQN -a -s SPDK00000000000001 2>/dev/null || true
-$RPC nvmf_subsystem_remove_ns $NQN 1 2>/dev/null || true
-$RPC nvmf_subsystem_add_ns $NQN $BDEV
-$RPC nvmf_subsystem_add_listener $NQN -t rdma -a $TARGET_IP -s 4420 2>/dev/null || true
+# 新建的 subsystem 里没有 ns 1,remove 会报 Invalid parameters(rpc.py 打在
+# stdout 上),属正常 —— 一并静音
+add_subsys() {	# nqn serial bdev
+    $RPC nvmf_create_subsystem $1 -a -s $2 >/dev/null 2>&1 || true
+    $RPC nvmf_subsystem_remove_ns $1 1 >/dev/null 2>&1 || true
+    $RPC nvmf_subsystem_add_ns $1 $3
+    $RPC nvmf_subsystem_add_listener $1 -t rdma -a $TARGET_IP -s 4420 >/dev/null 2>&1 || true
+}
 
-echo "后端: $BDEV (kv_emu, ${KV_MB} MiB, value <= $KV_MAXVAL B)"
-$RPC nvmf_get_subsystems | grep -A4 namespaces
+add_subsys $NQN SPDK00000000000001 $BDEV
+echo "KV : $NQN -> $BDEV (kv_emu, ${KV_MB} MiB, value <= $KV_MAXVAL B)"
+
+if [ "$NVM_NQN" != none ]; then
+    $RPC bdev_malloc_create -b $NVM_BDEV $NVM_MB 512 >/dev/null 2>&1 || true
+    add_subsys $NVM_NQN SPDK00000000000002 $NVM_BDEV
+    echo "NVM: $NVM_NQN -> $NVM_BDEV (malloc, ${NVM_MB} MiB,对照用)"
+fi
+$RPC nvmf_get_subsystems | python3 -c '
+import json, sys
+for s in json.load(sys.stdin):
+    ns = ", ".join(n["bdev_name"] for n in s.get("namespaces", []))
+    if ns:
+        print("  %-36s %s" % (s["nqn"], ns))
+'
