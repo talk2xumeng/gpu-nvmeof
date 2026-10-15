@@ -24,6 +24,7 @@
 #   make run-gpu-kv-exist      GPU Exist(只看状态)
 #   make run-gpu-kv-delete     GPU Delete + 另起进程确认全部不存在
 #   make qd-sweep              QD 扫描(IOPS/带宽/延迟),OPTS 对照,见 scripts/qd_sweep.sh
+#   make devx-probe            队列放主存/显存的 DevX 回环探针(tst/devx_probe)
 #   make kv-vs-nvm             KV vs NVM 读写延迟对照(同一 target,QD 1,
 #                              SIZES/REPEAT 可调,见 tst/kv_target/kv_vs_nvm.sh)
 #
@@ -117,7 +118,7 @@ LDFLAGS    := $(SPDK_LIBS) $(SYS_LIBS) $(GPU_LIBS) $(RDMA_LIBS) $(EXTRA_LIBS)
         run-gpu-initiated run-gpu-read-verify run-gpu-write-verify \
         tst pit7-matrix pit7-bench help kv-tgt kv-smoke run-kv-smoke \
         run-gpu-kv-retrieve run-gpu-kv-store run-gpu-kv-exist run-gpu-kv-delete \
-        kv-vs-nvm qd-sweep
+        kv-vs-nvm qd-sweep devx-probe
 
 # 实验程序也在 all 里:src/ 改动若让它们编不过,当场就能发现,
 # 而不是等回头复现时才知道(坑 4)。
@@ -344,7 +345,30 @@ $(BIN)/pit7_initiated: $(PIT7)/pit7_initiated.c $(BIN)/pit7_io_kernel.o \
 	      $(BIN)/pit7_io_kernel.o $(LDFLAGS) -lmlx5 -lstdc++
 	@echo "OK: $@"
 
-tst: $(BIN)/pit7_initiated
+# ---- 实验:tst/devx_probe(队列进显存的可行性,不需要 target)----
+DEVXP := $(TST)/devx_probe
+
+$(BIN)/devx_probe_kernel.o: $(DEVXP)/devx_probe_kernel.cpp $(DEVXP)/devx_probe.h | $(BIN)
+	$(GPUCC) $(GPUCFLAGS) -I$(DEVXP) -c -o $@ $<
+
+$(BIN)/devx_probe: $(DEVXP)/devx_probe.c $(DEVXP)/devx_probe.h $(DEVXP)/devx_ifc.h \
+                   $(BIN)/devx_probe_kernel.o $(BIN)/gpu_io_kernel.o | $(BIN)
+	$(CC) $(CFLAGS) -I$(DEVXP) -o $@ $(DEVXP)/devx_probe.c \
+	      $(BIN)/devx_probe_kernel.o $(BIN)/gpu_io_kernel.o \
+	      $(GPU_LIBS) -libverbs -lmlx5 -lstdc++ -lpthread
+	@echo "OK: $@"
+
+# 四种组合:CQ/SQ 各放主存(h)或显存(g)
+DEVX_DEV ?= $(IBDEV)
+DEVX_GID ?= 3
+devx-probe: $(BIN)/devx_probe
+	@for c in h g; do for w in h g; do \
+		echo "=== CQ=$$c SQ=$$w ==="; \
+		sudo ./$(BIN)/devx_probe -d $(DEVX_DEV) -g $(GPU_ID) -x $(DEVX_GID) \
+		     -C $$c -W $$w -n 1000 | grep -E "失败|错误|时延|轮询|校验"; \
+	done; done
+
+tst: $(BIN)/pit7_initiated $(BIN)/devx_probe
 
 pit7-matrix: $(BIN)/pit7_initiated
 	sudo BIN=$(BIN) TARGET_IP=$(TARGET_IP) NQN=$(NQN) GPU_ID=$(GPU_ID) \
