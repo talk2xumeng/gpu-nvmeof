@@ -142,7 +142,7 @@ reactor 上。测大块带宽要用 `-m 0xF`:`-m 0x3` 时 128K 读卡在约 20 G
 重启 kv_tgt 后重跑 setup 脚本。核最好和 ens10np0 同 NUMA
 (`cat /sys/class/net/ens10np0/device/numa_node`)。
 
-加 `EXTRA="-X"` 用 DevX 自建队列(队列在显存,目前只支持 1 个 QP)。
+加 `EXTRA="-X"` 用 DevX 自建队列(队列在显存,可配 NQPS 多 QP)。
 
 `-O` 的值与默认的 0x7000 按位或;`-O 0x10000` 是旧行为(全关)。默认下 QD
 上限是 111(RQ 批量补和 CQ 懒更新要留余量),超过会自动降并打印 `[QD]`。

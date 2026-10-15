@@ -17,7 +17,7 @@
  *   -G <cycles>          配 -X:用 BlueFlame,WQE 分 4 个 8 字节写、之间空等 cycles
  *                        个 GPU 时钟(不配 -G 只敲 8 字节门铃,网卡回 SQ 取 WQE)
  *   -X                   IO 队列改用 DevX 自建的 QP,CQ/SQ/RQ/dbrec 全在显存
- *                        (src/devx_qp.c)。目前只支持 -q 1、胶囊在主存
+ *                        (src/devx_qp.c)。配 -q N 建 N 条(qid 2..N+1)
  *   -q <n>               QP 数(默认 1,最多 GIO_MAX_QP)。每个 QP 一个 poller、
  *                        QD 个 submitter,总条数按 QP 切成连续段;总在飞 = n × QD
  *   -O <bits>            调优/诊断:bit0 submitter 稀疏 fence(每 16 圈),
@@ -170,6 +170,10 @@ static uint8_t	g_seed = 1;
 #define CAP_FLAGS_DEFAULT	1
 static unsigned	g_cap_flags = CAP_FLAGS_DEFAULT;
 static int	g_cap_fd = -1;
+/* -X:所有 DevX 队列的显存(g_nq × DEVX_Q_MEM_LEN),及其在 dma-buf 里的起始偏移 */
+static void	*g_dq_mem;
+static int	g_dq_fd = -1;
+static size_t	g_dq_off;
 
 /* ================================================================== */
 /* SPDK hooks:让 SPDK 用我们的 PD,并把显存注册成 dma-buf MR          */
@@ -249,8 +253,11 @@ static bool
 probe_cb(void *c, const struct spdk_nvme_transport_id *t,
 	 struct spdk_nvme_ctrlr_opts *o)
 {
-	/* -X 的 DevX 队列用 qid = g_nq + 1,SPDK 不分配它 */
-	o->num_io_queues = g_nq + 1 + (g_devx ? 1 : 0);
+	/*
+	 * 不带 -X:SPDK 建 qid 1..g_nq,另留一个。
+	 * 带 -X:SPDK 只用 qid 1 预热,DevX 队列用 qid 2..g_nq + 1。
+	 */
+	o->num_io_queues = g_nq + 1;
 	return true;
 }
 
@@ -950,8 +957,8 @@ main(int argc, char **argv)
 		fprintf(stderr, "-O 0x80000 起的 BF 对照位要配 0x8000 或 0x40000\n");
 		return 1;
 	}
-	if (g_devx && (g_nq != 1 || (g_cap_in_hbm && !g_cap_flags))) {
-		fprintf(stderr, "-X 目前只支持 -q 1;配 -H 时胶囊区要单独分配(-F 不为 0)\n");
+	if (g_devx && g_cap_in_hbm && !g_cap_flags) {
+		fprintf(stderr, "-X 配 -H 时胶囊区要单独分配(-F 不为 0)\n");
 		return 1;
 	}
 	if (g_nq > 1 && (g_opt & 0x200)) {
@@ -1052,7 +1059,7 @@ main(int argc, char **argv)
 		/* -X:DevX 队列显存跟在胶囊区后面,同一次分配(坑 6,见 devx_qp.h) */
 		if (gpu_alloc_exportable_ex(&g_cap_hbm, &g_cap_fd,
 					    CAP_AREA_LEN +
-					    (g_devx ? DEVX_Q_MEM_LEN : 0),
+					    (g_devx ? (size_t)g_nq * DEVX_Q_MEM_LEN : 0),
 					    g_cap_flags) != 0) {
 			fprintf(stderr, "胶囊区 ExtMalloc(flag=0x%x) 失败\n",
 				g_cap_flags);
@@ -1060,6 +1067,11 @@ main(int argc, char **argv)
 		}
 		gpu_memset_dev(g_cap_hbm, 0, CAP_AREA_LEN);
 		gpu_sync();
+		if (g_devx) {
+			g_dq_mem = (char *)g_cap_hbm + CAP_AREA_LEN;
+			g_dq_fd = g_cap_fd;
+			g_dq_off = CAP_AREA_LEN;
+		}
 		printf("[GPU] data=%p (%zu)  capsule(HBM flag=0x%x)=%p\n",
 		       g_data_gpu, g_data_len, g_cap_flags, g_cap_hbm);
 	} else if (g_cap_in_hbm) {
@@ -1076,6 +1088,16 @@ main(int argc, char **argv)
 		memset(g_cap_host, 0, CAP_AREA_LEN);
 		printf("[GPU] data=%p (%zu)  capsule(host)=%p\n",
 		       g_data_gpu, g_data_len, g_cap_host);
+	}
+	if (g_devx && !g_dq_mem) {
+		/* -X 不配 -H:所有 DevX 队列的显存一次分配,每条一段(坑 6) */
+		if (gpu_alloc_exportable_ex(&g_dq_mem, &g_dq_fd,
+					    (size_t)g_nq * DEVX_Q_MEM_LEN,
+					    CAP_FLAGS_DEFAULT) != 0) {
+			fprintf(stderr, "DevX 队列显存分配失败\n");
+			return 1;
+		}
+		g_dq_off = 0;
 	}
 
 	/* ---- 建连 ---- */
@@ -1326,30 +1348,36 @@ main(int argc, char **argv)
 	if (g_devx) {
 		struct devx_q_cfg dc;
 
-		memset(&dc, 0, sizeof(dc));
-		dc.traddr = g_traddr;
-		dc.trsvcid = g_trsvcid;
-		dc.qid = (uint16_t)(g_nq + 1);
-		dc.qdepth = 128;
-		dc.gpu_flag = CAP_FLAGS_DEFAULT;
-		dc.cap_host = g_cap_in_hbm ? g_cap_hbm : g_cap_host;
-		dc.cap_len = CAP_AREA_LEN;
-		dc.cap_fd = g_cap_in_hbm ? g_cap_fd : -1;
-		dc.want_bf = g_bf_gap >= 0;
-		if (g_cap_in_hbm) {
-			dc.q_mem = (char *)g_cap_hbm + CAP_AREA_LEN;
-			dc.q_fd = g_cap_fd;
-			dc.q_off = CAP_AREA_LEN;
+		/*
+		 * 每条 DevX 队列:qid 2 + q,队列显存是 g_dq_mem 的第 q 段;
+		 * 胶囊区和主存方案一样按 QP 切开。
+		 */
+		for (q = 0; q < g_nq; q++) {
+			memset(&dc, 0, sizeof(dc));
+			dc.slot = q;
+			dc.traddr = g_traddr;
+			dc.trsvcid = g_trsvcid;
+			dc.qid = (uint16_t)(2 + q);
+			dc.qdepth = 128;
+			dc.cap_host = g_cap_in_hbm ? g_cap_hbm : g_cap_host;
+			dc.cap_len = CAP_AREA_LEN;
+			dc.cap_fd = g_cap_in_hbm ? g_cap_fd : -1;
+			dc.want_bf = g_bf_gap >= 0;
+			dc.q_mem = (char *)g_dq_mem + (size_t)q * DEVX_Q_MEM_LEN;
+			dc.q_fd = g_dq_fd;
+			dc.q_off = g_dq_off + (size_t)q * DEVX_Q_MEM_LEN;
+			dc.data_gpu = g_base_gpu;
+			dc.data_len = g_total_len;
+			dc.data_fd = g_base_fd;
+			ctxs[q] = ctx;
+			ctxs[q].capsule      += (size_t)q * CAP_QP_STRIDE;
+			ctxs[q].capsule_addr += (uint64_t)q * CAP_QP_STRIDE;
+			if (devx_q_create(g_ctrlr, &dc, &ctxs[q]) != 0) {
+				fprintf(stderr, "第 %u 条 DevX 队列建立失败\n", q);
+				return 1;
+			}
 		}
-		dc.data_gpu = g_base_gpu;
-		dc.data_len = g_total_len;
-		dc.data_fd = g_base_fd;
-		ctxs[0] = ctx;
-		if (devx_q_create(g_ctrlr, &dc, &ctxs[0]) != 0) {
-			fprintf(stderr, "DevX 队列建立失败\n");
-			return 1;
-		}
-		/* 下文 QD 上限的计算沿用单 QP 时的变量 */
+		/* 下文 QD 上限的计算沿用单 QP 时的变量;各队列一样大 */
 		qp = NULL;
 		rq_posted = 128;
 		dvc.cqe_cnt = ctxs[0].cq_cnt;
@@ -1732,8 +1760,10 @@ queues_ready:
 	 * 的 CQE,照样报"完成 N/N",但 target 侧查无此命令。
 	 */
 	if (g_devx) {
-		devx_q_check(&ctxs[0], ctxs[0].njobs, shs[0].cqe_req,
-			     shs[0].cqe_resp, (g_opt & 0x800) != 0);
+		for (q = 0; q < g_nq; q++) {
+			devx_q_check(q, ctxs[q].njobs, shs[q].cqe_req,
+				     shs[q].cqe_resp, (g_opt & 0x800) != 0);
+		}
 	} else for (q = 0; q < g_nq; q++) {
 		volatile uint32_t *qdb = (volatile uint32_t *)hw[q].dvq.dbrec;
 		volatile uint32_t *cdb = (volatile uint32_t *)hw[q].dvc.dbrec;
@@ -2182,7 +2212,9 @@ queues_ready:
 	}
 
 	for (q = 0; q < g_nq; q++) {
-		spdk_nvme_ctrlr_free_io_qpair(hw[q].qpair);
+		if (hw[q].qpair) {	/* -X 时只有 hw[0] 有 */
+			spdk_nvme_ctrlr_free_io_qpair(hw[q].qpair);
+		}
 	}
 	spdk_nvme_detach(g_ctrlr);
 	return (err || done != g_rounds) ? 2 : 0;
