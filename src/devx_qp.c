@@ -526,8 +526,12 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 
 	/* ---- Fabrics Connect:CPU 在这条 QP 上发一条 ---- */
 	{
-		uint8_t *cap_slot = (uint8_t *)cfg->cap_host + cfg->cap_len - 64;
-		uint8_t capbuf[64], *cap = capbuf;
+		/*
+		 * Connect 的胶囊放连接数据那页的后半(主存,conn_mr),不放胶囊区:
+		 * -H 时胶囊区在显存,CPU 拷进去之后网卡读到的不一定是新值,
+		 * 实测 -X -H 时 Connect 收不到任何 CQE。
+		 */
+		uint8_t *cap = conn + 2048;
 		uint8_t wqe[64], cqe[64];
 		uint32_t ci = 0, got_resp = 0, polls = 0;
 		uint16_t st = 0xffff;
@@ -547,16 +551,10 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 		*(uint16_t *)(cap + 42) = cfg->qid;
 		*(uint16_t *)(cap + 44) = (uint16_t)(cfg->qdepth - 1);
 		*(uint32_t *)(cap + 48) = copts->keep_alive_timeout_ms;
-		if (cfg->cap_fd >= 0) {
-			gpu_copy_to_dev(cap_slot, cap, 64);
-			gpu_sync();
-		} else {
-			memcpy(cap_slot, cap, 64);
-		}
 
 		memset(wqe, 0, sizeof(wqe));
-		(void)mlx5_build_send_wqe(wqe, 0, g.qpn, (uint64_t)cap_slot,
-					  cap_mr->lkey, 64);
+		(void)mlx5_build_send_wqe(wqe, 0, g.qpn, (uint64_t)cap,
+					  conn_mr->lkey, 64);
 		dev_put(sq_off(0), wqe, 64);
 		{
 			uint32_t one = htobe32(1);
@@ -598,8 +596,10 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 			dev_put(DQ_OFF_CQ_DBR, &v, 4);
 		}
 		if (!got_resp || st != 0) {
-			fprintf(stderr, "[Connect] %s (status 0x%x,轮询 %u 次)\n",
-				got_resp ? "target 拒绝" : "等不到响应", st, polls);
+			fprintf(stderr, "[Connect] %s (status 0x%x,轮询 %u 次,收到 CQE %u 个,"
+				"当前 op_own 0x%02x)\n",
+				got_resp ? "target 拒绝" : "等不到响应", st, polls, ci,
+				cqe[63]);
 			return -1;
 		}
 		printf("[Connect] qid %u sqsize %u kato %u ms:成功\n", cfg->qid,

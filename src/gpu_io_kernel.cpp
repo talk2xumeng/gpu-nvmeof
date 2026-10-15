@@ -38,14 +38,19 @@
 #define GIO_TIMEOUT	2000000000ULL	/* ~1.25 s @ 1.6 GHz */
 
 /*
- * ---- fence 级别(-O 0x4000000,gpu_io_run 启动前由 k_set_fence 写入) ----
+ * ---- fence 级别(-O 0x4000000) ----
  *
  * 默认全用 __threadfence_system()。共享状态(gio_shared / tag)在显存,
  * 跨 block 可见只需要 device 级;-X 时队列也在显存,网卡读写显存同样只要
  * device 级(mxshmem 的 IBGDA_MEMBAR、tst/devx_probe 已验证)。胶囊在
  * finegrained 显存(-H)时同理。写 MMIO 门铃之后的那次 fence 始终是 system。
+ *
+ * 级别放在 block 的 shared memory 里,k_gpu_io 开头由本 block 的线程 0 写。
+ * 最早放在 __device__ 全局变量里,每次 fence 都多一次显存读(~0.3–0.5 µs),
+ * 一条 I/O 十来次 fence,实测提交 +1.3 µs、总计 +1.8 µs —— 连不开 0x4000000
+ * 的默认路径也一起变慢。
  */
-__device__ uint32_t gio_f_sh, gio_f_q, gio_f_cap;
+static __shared__ uint32_t gio_f_sh, gio_f_q, gio_f_cap;
 
 __device__ static __forceinline__ void
 fence_sh(void)
@@ -75,15 +80,6 @@ fence_cap(void)
 	} else {
 		__threadfence_system();
 	}
-}
-
-__global__ void
-k_set_fence(uint32_t sh, uint32_t q, uint32_t cap)
-{
-	gio_f_sh = sh;
-	gio_f_q = q;
-	gio_f_cap = cap;
-	__threadfence_system();
 }
 
 /* ---- 线程间可见的读写(同 Mooncake maca_ops.cuh 的 ld_acquire/st_release) ---- */
@@ -1051,6 +1047,13 @@ k_gpu_io(const struct gpu_io_ctx *ctxs, struct gio_shared *shs,
 	ctx = ctxs[q];
 	sh = shs + q;
 	tags = tags_all + (size_t)q * ctx.qd;
+	{
+		uint32_t dev = (ctx.opt & GIO_OPT_DEVFENCE) ? 1u : 0u;
+
+		gio_f_sh = dev;
+		gio_f_q = dev && ctx.q_in_gpu;
+		gio_f_cap = dev && ctx.cap_in_gpu;
+	}
 
 	/* 记 kernel 的起止时钟:由本 QP 实际干活的第一个 block 记 */
 	if (t == 0) {
@@ -1246,10 +1249,6 @@ gpu_io_run(struct gpu_io_ctx *ctxs, unsigned int nq,
 		clock_gettime(CLOCK_MONOTONIC, &ts);
 		*wall_us_out = ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
 	}
-	k_set_fence<<<1, 1>>>((opt & GIO_OPT_DEVFENCE) ? 1u : 0u,
-			      ((opt & GIO_OPT_DEVFENCE) && ctxs[0].q_in_gpu) ? 1u : 0u,
-			      ((opt & GIO_OPT_DEVFENCE) && ctxs[0].cap_in_gpu) ? 1u : 0u);
-	mcDeviceSynchronize();
 	k_gpu_io<<<nq * per, 32>>>(d_ctx, d_sh, d_tags, per, start_lba, d_cap,
 				   d_sub, d_wait, d_spin, d_lock, d_stat, d_det,
 				   d_hand, d_tsreq, d_tsresp, d_reqat, d_dw0);
