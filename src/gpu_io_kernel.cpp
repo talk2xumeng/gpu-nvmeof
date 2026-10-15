@@ -19,7 +19,8 @@
  * 约束:
  * 1. SQ/CQ/dbrec/recv buffer 在主机内存(SPDK 建的),fence 用 system 级
  * 2. 接管后这个 qpair 不能再调 spdk_nvme_ns_cmd_*(坑 3)
- * 3. C1 阶段 kernel 不补 recv buffer,总 I/O 数不能超过已 post 的数量
+ * 3. C2:poller 每收一个响应就把那块 recv buffer 重新 post(rq_repost),
+ *    总 I/O 数不再受 RQ 深度限制;-O 2048 关掉
  * 4. clock64() 是每线程各自的计数,跨线程的时间戳不能相减 ——
  *    等待时间只在 submitter 自己的线程里量
  */
@@ -202,6 +203,9 @@ cqe_ts(struct gpu_io_ctx *c, volatile uint8_t *cqe)
 	return cqe64_ts(cqe + c->cqe_size - 64);
 }
 
+__device__ static void rq_repost(struct gpu_io_ctx *c, struct gio_shared *sh,
+			  uint16_t wqe_counter);
+
 __device__ static uint64_t
 consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	    volatile uint8_t *cqe, uint32_t *seq)
@@ -219,6 +223,9 @@ consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		sh->cqe_resp++;
 		handle_resp(c, sh, tags, cqe + (c->cqe_size - 64), op_own,
 			    wc, *seq);
+		if (!(c->opt & 0x800) && c->rq_shadow) {
+			rq_repost(c, sh, wc);
+		}
 		r = clock64() - r0;
 		(*seq)++;
 	} else if (opcode == MLX5_CQE_REQ) {
@@ -237,6 +244,46 @@ consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		set_abort(sh, GIO_E_CQE);
 	}
 	return r;
+}
+
+/*
+ * C2:把刚消费的 recv 槽 k 原样重新 post 到 RQ 头。
+ *
+ * RC 的 recv 按 FIFO 消费,网卡消费后不清槽内容;把同一个描述符写到
+ * head 处,等于把那块 buffer 还回去。和 rdma-core mlx5_post_recv 一样,
+ * RQ 只推 dbrec[0](大端,低 16 位),不敲门铃。
+ *
+ * 描述符从显存影子取,不回读主存;影子跟着搬,保证下一圈取到的还是
+ * 这块 buffer。调用方保证此刻只有自己在消费 CQ(poller / 持 cq_lock /
+ * QD=1 串行快路径),所以 sh->rq_head 不用原子操作。
+ *
+ * 必须在 handle_resp 读完响应之后调:非内联响应的数据在这块 buffer 里。
+ */
+__device__ static void
+rq_repost(struct gpu_io_ctx *c, struct gio_shared *sh, uint16_t wqe_counter)
+{
+	uint32_t mask = c->rq_wqe_cnt - 1;
+	uint32_t k = wqe_counter & mask;
+	uint32_t head = *(volatile uint32_t *)&sh->rq_head;
+	uint32_t h = head & mask;
+	uint32_t words = c->rq_stride / 8, i;
+	volatile uint64_t *dst = (volatile uint64_t *)(c->rq_buf +
+						       (size_t)h * c->rq_stride);
+	volatile uint64_t *src = c->rq_shadow + (size_t)k * words;
+	volatile uint64_t *shd = c->rq_shadow + (size_t)h * words;
+
+	for (i = 0; i < words; i++) {
+		uint64_t v = src[i];
+
+		dst[i] = v;
+		shd[i] = v;
+	}
+	WQE_FENCE_QUEUE();		/* 槽内容先于 dbrec 落地 */
+	head++;
+	c->qp_dbrec[0] = wqe_hto_be32(head & 0xffff);
+	WQE_FENCE_DB();
+	*(volatile uint32_t *)&sh->rq_head = head;
+	*(volatile uint32_t *)&sh->rq_reposted += 1;
 }
 
 /* 消费一个 CQE 后推进 ci,并立刻还给网卡(出错也要还,否则 CQ 会溢出) */
@@ -701,6 +748,8 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	uint64_t *d_det = NULL, *d_hand = NULL;
 	uint64_t *d_tsreq = NULL, *d_tsresp = NULL, *d_reqat = NULL;
 	uint32_t *d_stat = NULL, *d_dw0 = NULL;
+	uint64_t *d_rqs = NULL;		/* C2:RQ 槽的显存影子 */
+	size_t rqs_len = (size_t)ctx->rq_wqe_cnt * ctx->rq_stride;
 	struct gio_shared *d_sh = NULL, sh0;
 	struct gio_tag *d_tags = NULL;
 	size_t sz = ctx->njobs * sizeof(uint64_t);
@@ -732,6 +781,20 @@ gpu_io_run(struct gpu_io_ctx *ctx, unsigned long long start_lba,
 	sh0.sq_pi = ctx->sq_pi;
 	sh0.sp_ci = ctx->cq_ci;
 	sh0.sp_phase = ctx->cq_phase;
+	sh0.rq_head = ctx->rq_head;
+
+	/* C2:接管时的 RQ 内容拷进显存,kernel 补 recv 时从这里取描述符 */
+	ctx->rq_shadow = NULL;
+	if (!(ctx->opt & 0x800) && ctx->rq_host_buf && rqs_len &&
+	    ctx->rq_stride % 8 == 0) {
+		if (mcMalloc((void **)&d_rqs, rqs_len) != mcSuccess ||
+		    mcMemcpy(d_rqs, ctx->rq_host_buf, rqs_len,
+			     mcMemcpyHostToDevice) != mcSuccess) {
+			fprintf(stderr, "RQ 影子分配/拷贝失败\n");
+			goto out;
+		}
+		ctx->rq_shadow = (volatile uint64_t *)d_rqs;
+	}
 	mcMemcpy(d_sh, &sh0, sizeof(sh0), mcMemcpyHostToDevice);
 	mcMemset(d_tags, 0, tsz);
 	mcMemset(d_stat, 0xff, ctx->njobs * sizeof(uint32_t));
@@ -804,6 +867,8 @@ out:
 	if (d_stat) mcFree(d_stat);
 	if (d_dw0)  mcFree(d_dw0);
 	if (d_sh)   mcFree(d_sh);
+	if (d_rqs)  mcFree(d_rqs);
+	ctx->rq_shadow = NULL;
 	if (d_tags) mcFree(d_tags);
 	return rc;
 }

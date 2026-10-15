@@ -22,7 +22,9 @@
  *                        bit7(=128) 读 CQE 硬件时间戳,
  *                        bit8(=256) 精简提交(仅 QD=1,配 32):门铃后不做带
  *                        fence 的写,bit9(=512) 胶囊槽位轮换,
- *                        bit10(=1024) 旧式 cid 0xE000|j(仅 QD=1)
+ *                        bit10(=1024) 旧式 cid 0xE000|j(仅 QD=1),
+ *                        bit11(=2048) 不补 recv(C1 行为,对照用;
+ *                        此时 -r 不能超过挂着的 recv 数 ~127)
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -1080,8 +1082,9 @@ main(int argc, char **argv)
 	}
 
 	/*
-	 * C1 不补 recv buffer:每条 I/O 的响应消耗一个,总数不能超过已 post 的。
-	 * 超出的那条响应无处安放,表现是超时。
+	 * QD 仍受 queue size 限制:同时在飞的命令数不能超过 target 端的
+	 * 队列深度,也不能超过挂着的 recv 数。总条数(-r)从 C2 起不再受限 ——
+	 * kernel 收一个响应就补一个 recv(-O 2048 关掉时才受限)。
 	 */
 	if (rq_posted < 2) {
 		fprintf(stderr, "已 post 的 recv 数 %u 异常\n", rq_posted);
@@ -1214,13 +1217,20 @@ main(int argc, char **argv)
 		 * post 回去,实际挂着的比 queue size 少一个。
 		 */
 		ctx.rq_tail = sq_pi & 0xffff;
+		ctx.rq_head = rq_head;
+		ctx.rq_host_buf = dvq.rq.buf;	/* gpu_io_run 拷成显存影子 */
 		rq_posted = (rq_head - sq_pi) & 0xffff;
 		printf("[接管] SQ pi=%u  CQ ci=%u phase=%u  RQ head=%u tail=%u "
 		       "(挂着 %u 个 recv)\n", sq_pi, cq_ci, ctx.cq_phase,
 		       rq_head, ctx.rq_tail, rq_posted);
-		if (g_rounds > rq_posted) {
-			fprintf(stderr, "-r %u 超过挂着的 recv 数 %u(C1 尚不补充)\n",
+		if ((g_opt & 0x800) && g_rounds > rq_posted) {
+			fprintf(stderr, "-r %u 超过挂着的 recv 数 %u(-O 2048 不补 recv)\n",
 				g_rounds, rq_posted);
+			return 1;
+		}
+		if (!(g_opt & 0x800) && dvq.rq.stride % 8) {
+			fprintf(stderr, "RQ stride %u 不是 8 的倍数,补 recv 不支持\n",
+				dvq.rq.stride);
 			return 1;
 		}
 	}
@@ -1240,10 +1250,11 @@ main(int argc, char **argv)
 	c_reqat  = calloc(g_rounds, sizeof(*c_reqat));
 	c_dw0    = calloc(g_rounds, sizeof(*c_dw0));
 	us = calloc(g_rounds, sizeof(*us));
-	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u, %s, -O %u\n",
+	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u, %s, %s, -O %u\n",
 	       g_kv ? kv_opc_name(ctx.nvme_opc) : g_write ? "WRITE" : "READ",
 	       g_rounds, g_io_bytes, g_qd,
-	       ctx.data_step ? "每条一块" : "单块复用", g_opt);
+	       ctx.data_step ? "每条一块" : "单块复用",
+	       (g_opt & 0x800) ? "不补 recv" : "补 recv", g_opt);
 
 	if (gpu_io_run(&ctx, g_start_lba, c_cap, c_sub, c_wait, c_spin,
 		       c_lock, c_stat, c_det, c_hand, c_tsreq, c_tsresp,
@@ -1441,11 +1452,19 @@ main(int argc, char **argv)
 		uint32_t cq_now = be32toh(cdb[0]) & 0xffffff;
 
 		printf("[dbrec] SQ %u -> %u (+%u, 期望 +%u)   CQ %u -> %u (+%u)"
-		       "   RQ head %u\n",
+		       "   RQ %u -> %u (+%u, 期望 +%u)\n",
 		       ctx.sq_pi, sq_now, (sq_now - ctx.sq_pi) & 0xffff, g_rounds,
-		       ctx.cq_ci, cq_now, cq_now - ctx.cq_ci, rq_now);
-		if (((sq_now - ctx.sq_pi) & 0xffff) != g_rounds) {
+		       ctx.cq_ci, cq_now, cq_now - ctx.cq_ci,
+		       ctx.rq_head, rq_now, (rq_now - ctx.rq_head) & 0xffff,
+		       (g_opt & 0x800) ? 0 : sh.cqe_resp);
+		if (((sq_now - ctx.sq_pi) & 0xffff) != (g_rounds & 0xffff)) {
 			printf("  *** SQ 增量不等于轮数:kernel 的命令没发出去 ***\n");
+		}
+		if (!(g_opt & 0x800) &&
+		    (((rq_now - ctx.rq_head) & 0xffff) != (sh.cqe_resp & 0xffff) ||
+		     sh.rq_reposted != sh.cqe_resp)) {
+			printf("  *** RQ 补充数(%u)和响应数(%u)对不上 ***\n",
+			       sh.rq_reposted, sh.cqe_resp);
 		}
 	}
 

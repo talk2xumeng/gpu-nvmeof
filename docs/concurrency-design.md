@@ -193,6 +193,31 @@ C1–C3 进 `src/`(替换现有串行 kernel,保留 `-K` 等旧开关的语义);
   同一 block 的线程锁步执行,分支不同时被串行化
 - 结果区分"等到响应"和"NVMe 成功",坑 9 根治
 
+## C2 实现要点(2026-10-15,待上机验收)
+
+- **在哪做**:`consume_one` 处理完 RESP_SEND 后调 `rq_repost`。独立 poller、
+  自轮询(`-O 16`,持 `cq_lock`)、串行快路径(`-O 32`)三条消费路径共用
+  这一处。它们在同一时刻只有一个消费者,所以 `sh->rq_head` 用普通的
+  volatile 读写就够;自轮询换人时,靠 `cq_lock` 进出的 fence 交接。
+- **怎么补**:
+  1. 取刚消费的槽 `k = wqe_counter & mask`。
+  2. 把 `k` 的描述符写到 `rq_head & mask`。
+  3. `rq_head++`,`dbrec[0] = be32(rq_head & 0xffff)`。
+
+  写的顺序是:先写槽,`__threadfence_system`,再写 dbrec,再 fence。
+  和 SQ 一样,不敲门铃(rdma-core 的 `mlx5_post_recv` 也是只推 dbrec)。
+- **描述符从显存影子取**:`gpu_io_run` 在 launch 前把接管时的整个 RQ
+  拷进显存。补的时候从影子读,写到主存的 RQ 槽,同时更新影子的 head 槽。
+  这样每条响应只多出两次 posted 写(16 B 槽 + 4 B dbrec)和一次 fence,
+  不需要回读主存(回读一次约 0.7 µs)。
+- **接管时少挂的那一个 recv**:SPDK 补 recv 是延迟 flush 的,接管时挂着的
+  是 127 个,不是 128 个。第一个补进去的会写到那个"已消费、未重挂"的位置,
+  那块 buffer 从此不再使用,无害。在飞的 recv 数始终保持 127。
+- **对照开关**:`-O 2048` 不补 recv,恢复 C1 行为(`-r` 上限约 127)。可以
+  用它测补 recv 本身的开销。
+- **检查项**:结束时打印 `RQ a -> b (+n, 期望 +响应数)`;`sh.rq_reposted`
+  必须等于响应数,对不上会醒目提示。
+
 ## C1 状态(2026-09-17 暂停)
 
 ### 已完成

@@ -92,6 +92,20 @@ struct gpu_io_ctx {
 	uint8_t			kv_klen;	/* 1..16 */
 	uint8_t			kv_seed;
 	uint32_t		kv_opts;	/* CDW11[15:8],NVME_KV_STORE_* / NVME_KV_RETRIEVE_* */
+
+	/*
+	 * ---- C2:RQ 自持(docs/concurrency-design.md) ----
+	 * 收完一个响应就把那块 recv buffer 原样重新 post 到 RQ 头,单次 launch
+	 * 的 I/O 数不再受 RQ 深度(~127)限制。槽内容从显存里的影子副本取,
+	 * 不回读主存(每次 ~0.7 us);写 RQ 槽 + dbrec[0] 都是 posted 写。
+	 *   rq_head     接管时 dbrec[0] 的值(已 post 计数)
+	 *   rq_shadow   显存,rq_wqe_cnt 个槽、每槽 rq_stride 字节,接管时的 RQ 内容
+	 *   rq_host_buf 主存里的 RQ(host 指针,只给 gpu_io_run 拷影子用)
+	 * opt bit11(0x800)关掉,恢复 C1 行为(做对照用)。
+	 */
+	uint32_t		rq_head;
+	volatile uint64_t	*rq_shadow;
+	const void		*rq_host_buf;
 };
 
 /*
@@ -132,6 +146,9 @@ struct gio_shared {
 	uint64_t	k_start;
 	uint64_t	k_end;
 	uint64_t	resp_cycles;	/* poller:处理响应(handle_resp)的总耗时 */
+	/* C2:当前消费者(poller / 持 cq_lock 者 / 串行快路径)独占读写 */
+	uint32_t	rq_head;
+	uint32_t	rq_reposted;
 };
 
 /* 每个 tag(= submitter 线程)一项,放显存 */

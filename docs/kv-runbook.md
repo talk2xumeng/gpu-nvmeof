@@ -104,7 +104,7 @@ make run-gpu-kv-delete      # ⑤ GPU Delete,另起进程确认 key 已不存在
 | 参数 | 含义 |
 |---|---|
 | `GPU_BS` | value 字节数,8 的倍数,最大 131072 |
-| `GPU_ROUNDS` | key 个数,不超过 127 |
+| `GPU_ROUNDS` | key 个数(C2 起不再受 127 限制) |
 | `GPU_QD` | 并发数 |
 | `GPU_LBA` | 起始 key 序号 |
 
@@ -192,6 +192,6 @@ make run-kv-smoke
 | GPU 侧报 `SC=0x01 Invalid Opcode` | 命令没到 kv_emu。要么 SPDK 打完补丁没重编,要么 target 跑的是 nvmf_tgt 而不是 kv_tgt |
 | GPU 侧报 `SC=0x02` 或 `0x86` | key 长度字段不对。把输出里的 `[胶囊]` dump 拿出来看 |
 | CPU 侧准备阶段出现 `CQ transport error -6` | keep-alive 超时,target 把连接断了。确认 initiator 用的是最新代码 |
-| `-r` 超过 127 时报「超过挂着的 recv 数」 | 还没做 C2(kernel 补 recv),目前单次运行的上限就是 127 |
+| `-r` 超过 127 时报「超过挂着的 recv 数」 | 用的是 C2 之前的二进制,或带了 `-O 2048`;重新 `make` |
 | `RDMA connect error -99`,ping 却能通、ttl=63 | ARP 被别的网口抢答,见第六节 |
 | kv_tgt 启动报 `No free 2048 kB hugepages` | 重启后 hugepage 没了,见第六节 |

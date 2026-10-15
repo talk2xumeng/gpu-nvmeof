@@ -55,7 +55,7 @@ COUNT      ?= 20000
 ROUNDS     ?= 2000
 # 64 token × 70272 B/token(DeepSeek MLA)≈ 4.5 MiB
 KVBLOCK    ?= 4718592
-# GPU-initiated 原型:单线程串行发,轮数受 RQ 深度限制
+# GPU-initiated 原型。kernel 自己补 recv(C2),轮数不受 RQ 深度限制
 GPU_ROUNDS ?= 100
 GPU_BS     ?= 4096
 GPU_QD     ?= 1
@@ -244,12 +244,12 @@ run-latency-noker: $(BIN)/latency_baseline
 	sudo $(LAT) -g $(GPU_ID) -b $(KVBLOCK) -r $(ROUNDS) -k 0
 
 # GPU-initiated:稳态收发全在 kernel 内,CPU 只做初始化。
-# 轮数别超过 RQ 深度 —— kernel 不补 recv buffer,超了会死等。
+# C2 起 kernel 自己补 recv,轮数不受 RQ 深度限制(-O 2048 关掉时恢复 ~127 上限)。
 run-gpu-initiated: $(BIN)/gpu_initiated
 	sudo ./$(BIN)/gpu_initiated -a $(TARGET_IP) -n $(NQN) \
 	     -g $(GPU_ID) -r $(GPU_ROUNDS) -b $(GPU_BS) -Q $(GPU_QD)
 
-# 逐块校验。I/O 总数目前受已 post 的 recv 数(queue size)限制,C2 解除。
+# 逐块校验。显存按条数分配(每条一块),条数很大时注意显存和盘/malloc 容量。
 GI := $(BIN)/gpu_initiated -a $(TARGET_IP) -n $(NQN) -g $(GPU_ID) \
       -r $(GPU_ROUNDS) -b $(GPU_BS) -Q $(GPU_QD) -L $(GPU_LBA) -S $(SEED)
 
