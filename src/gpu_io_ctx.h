@@ -207,6 +207,15 @@ struct gio_shared {
  */
 #define GIO_OPT_RBPAR	0x400000u
 #define GIO_OPT_DB8	0x800000u
+/*
+ * 0x800000 实测(QD1):不回读 / 回读 1 次,等待都是 ~11 us —— 网卡回 SQ 取
+ * WQE 比用 BF 数据慢 ~3 us。默认路径快,应是 BF 数据真被用上了,而且 4 个
+ * 8 字节写是被回读隔开到达的。下面两位验证"隔开"能否代替回读:
+ *   0x1000000  每个 BF 8 字节写之后 system fence
+ *   0x2000000  BF 8 字节写之间空等 ~0.9 us
+ */
+#define GIO_OPT_BFSEP	0x1000000u
+#define GIO_OPT_BFGAP	0x2000000u
 #define GIO_PF_TAG	0	/* 写 tag 的 job/state(两次 fence) */
 #define GIO_PF_LOCK	1	/* 抢 SQ 锁 */
 #define GIO_PF_PI	2	/* 读共享 sq_pi(fence) */

@@ -661,30 +661,30 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 		 * 取数据,还把之前写主存的 WQE/dbrec 推了出去(PCIe 上读不能越过
 		 * 之前的 posted 写)。GIO_OPT_BF1 保留这个作用,只读 1 次 8 字节。
 		 */
-		uint32_t w32[8];
+		/*
+		 * 纯寄存器构造(不取地址,不落 local memory):和
+		 * mlx5_build_send_wqe 逐字一致,按小端拼成 4 个 64 位字。
+		 * 之前经 w32[8] 数组构造,剖析里"写 WQE"要 2.3~4.3 us,
+		 * 多半是数组落在 local memory(显存)上的读写。
+		 */
 		uint64_t w64[4];
 
-		(void)mlx5_build_send_wqe((void *)w32, pi, c->qpn, cap_addr,
-					  c->capsule_lkey, 64);
-		if (unsig) {
-			w32[2] = 0;
-		}
-		for (w = 0; w < 4; w++) {
-			w64[w] = (uint64_t)w32[2 * w] |
-				 ((uint64_t)w32[2 * w + 1] << 32);
-		}
-		if (c->opt & GIO_OPT_BF1) {
+		w64[0] = (uint64_t)wqe_hto_be32(((uint32_t)pi << 8) |
+						MLX5_OPCODE_SEND) |
+			 ((uint64_t)wqe_hto_be32((c->qpn << 8) | 2) << 32);
+		w64[1] = unsig ? 0 :
+			 (uint64_t)(((uint32_t)MLX5_WQE_CTRL_CQ_UPDATE) << 24);
+		w64[2] = (uint64_t)wqe_hto_be32(64) |
+			 ((uint64_t)wqe_hto_be32(c->capsule_lkey) << 32);
+		w64[3] = (uint64_t)wqe_hto_be32((uint32_t)(cap_addr >> 32)) |
+			 ((uint64_t)wqe_hto_be32((uint32_t)cap_addr) << 32);
+		{
 			volatile uint64_t *d64 = (volatile uint64_t *)sq_slot;
 
-			for (w = 0; w < 4; w++) {
-				d64[w] = w64[w];
-			}
-		} else {
-			volatile uint32_t *d32 = (volatile uint32_t *)sq_slot;
-
-			for (w = 0; w < 8; w++) {
-				d32[w] = w32[w];
-			}
+			d64[0] = w64[0];
+			d64[1] = w64[1];
+			d64[2] = w64[2];
+			d64[3] = w64[3];
 		}
 		WQE_FENCE_QUEUE();
 		pf_mark(pf, GIO_PF_WQE, pt);
@@ -707,10 +707,29 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 		if (c->opt & GIO_OPT_DB8) {
 			/* 普通门铃:只写控制段前 8 字节,网卡从 SQ 取 WQE */
 			bfp[0] = w64[0];
-		} else {
+		} else if (c->opt & (GIO_OPT_BFSEP | GIO_OPT_BFGAP)) {
+			/*
+			 * 默认路径里 4 个 BF 写被回读隔开(各 ~1.5 us)时网卡最快。
+			 * BFSEP:每写一个 8 字节就 system fence;BFGAP:每个之间
+			 * 空等 ~1000 时钟(~0.9 us)。看"隔开"本身能不能代替回读。
+			 */
 			for (w = 0; w < 4; w++) {
 				bfp[w] = w64[w];
+				if (c->opt & GIO_OPT_BFSEP) {
+					__threadfence_system();
+				}
+				if ((c->opt & GIO_OPT_BFGAP) && w < 3) {
+					uint64_t t0 = clock64();
+
+					while (clock64() - t0 < 1000) {
+					}
+				}
 			}
+		} else {
+			bfp[0] = w64[0];
+			bfp[1] = w64[1];
+			bfp[2] = w64[2];
+			bfp[3] = w64[3];
 		}
 		if (!(c->opt & GIO_OPT_DB8) && (c->opt & GIO_OPT_BF64)) {
 			for (w = 4; w < 8; w++) {
