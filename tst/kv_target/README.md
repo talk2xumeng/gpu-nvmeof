@@ -63,7 +63,7 @@ make run-kv-smoke                  # ① CPU 路径冒烟,不碰 GPU
 make run-gpu-kv-retrieve           # ② GPU Retrieve:逐块校验 + DW0 = value 长度
 make run-gpu-kv-store              # ③ GPU Store,另起进程回读
 make run-gpu-kv-exist              # ④ GPU Exist
-make run-gpu-kv-delete             # ⑤ GPU Delete,回读应全部是 C
+make run-gpu-kv-delete             # ⑤ GPU Delete,另起进程 -V -D 确认全部不存在
 ```
 
 建议按顺序跑:
@@ -125,9 +125,37 @@ TCP 和 RDMA 走的是同一段 `nvmf_ctrlr_process_io_cmd`,补丁和 bdev 与�
 无关。没有验证过的只有 GPU kernel 发出的 keyed SGL 那一段,而那段与现有读写
 路径完全相同,已在硬件上验证过。
 
-### 待上机
+### 2026-10-15,上机(GPU 路径)
 
-②–⑤ 尚未在 mx-decode 上跑过。
+- initiator:mx-decode-02,GPU 4,mlx5_1
+- target:mx-prefill-02(172.16.3.8),在容器里跑 kv_tgt,后端是 KVEmu0
+- 胶囊放在主存;响应 100/100 都内联在 CQE 里,cid 异常为 0,wqe_counter 连续
+
+| 测试 | 结果 | 等待 p50 | 总计 p50 |
+|---|---|---|---|
+| Retrieve 4 KiB × 100,QD 1 | 100/100;DW0 全部 = 4096;逐块一致 | 11.7 µs | 21.6 µs |
+| Store 4 KiB × 100,QD 1 | 100/100;另起进程回读逐块一致 | 17.3 µs | 27.1 µs |
+| Exist × 100 | 100/100 | 10.4 µs | 19.9 µs |
+| Delete × 100 | 100/100;另起进程回读全部不存在 | 10.8 µs | 20.5 µs |
+| Retrieve 64 KiB × 100,QD 4 | 100/100;DW0 全部 = 65536;逐块一致 | 33.4 µs | 43.5 µs |
+
+胶囊逐字段核对过,均符合 KV 1.3:
+
+- key 位于 CDW2/3 和 CDW14/15
+- CDW10 是 HBS/VS
+- CDW11 是 KL=16
+- Exist/Delete 的 SGL 长度为 0
+
+怎么读这些延迟:
+
+- **基线**:Exist/Delete 不带数据,约 10.5 µs 的等待就是一次往返的基线。
+- **Retrieve**:在基线上多约 1 µs,用于 target 发 RDMA WRITE 写进 HBM。
+- **Store**:多约 7 µs。target 要先发 RDMA READ 把 value 从 HBM 取回,再执行,
+  比 Retrieve 多一个往返。这和 NVM 写比读慢是同一个原因。
+- **"提交" 约 8.5 µs**:这是 C1 那个 QD=1 回退,和 KV 无关。
+- **DW0 的代价**:读 DW0 会让每条响应多一次主存读,poller 处理一条响应约 4.5 µs。
+- **QD 4 × 64 KiB**:100 条用了 1182 µs,约 5.5 GB/s。QD 和单 poller 都是限制
+  因素,这个数不代表上限。
 
 ## 踩到的坑
 

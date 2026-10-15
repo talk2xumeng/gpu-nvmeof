@@ -272,10 +272,10 @@ run-gpu-kv-store: $(BIN)/gpu_initiated
 run-gpu-kv-exist: $(BIN)/gpu_initiated
 	sudo ./$(GKV) -E
 
-# 回读应全部是 C(key 不存在)。-V 的退出码因此非 0,属预期
+# 回读用 -V -D:期望全部不存在,全是才 PASS
 run-gpu-kv-delete: $(BIN)/gpu_initiated
 	-sudo ./$(GKV) -D
-	-sudo ./$(GKV) -V
+	sudo ./$(GKV) -V -D
 
 # ---- KV 模拟 target(tst/kv_target,target 机器上编)----
 kv-tgt:

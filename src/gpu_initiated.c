@@ -39,11 +39,13 @@
  *                        默认 Retrieve;-W Store;-E Exist;-D Delete
  *   -k -P / -k -V        CPU 路径 Delete / Retrieve 这批 key(-V 逐块比对,
  *                        不存在的 key 记作 C)
+ *   -k -V -D             回读,期望这批 key 全部不存在(验 Delete):
+ *                        全是 C 才 PASS,还在的 key 逐个列出
  *
  *   Retrieve/Exist/Delete:进程内先用 CPU 路径 Store 好这批 key;
  *   Retrieve 额外核对每条 CQE DW0(value 长度)== -b。
  *   Store:进程内先 Delete 这批 key,校验同写,另起进程 -k -V。
- *   Delete:另起进程 -k -V,应全部是 C。
+ *   Delete:另起进程 -k -V -D。
  *
  * 多块校验:第 i 轮读写显存第 i 块、LBA L+i*nlb,每块内容由
  * (seed, LBA) 决定(blk_pattern.h),漏块/串块/残留都能区分。
@@ -744,6 +746,7 @@ main(int argc, char **argv)
 		void *b = spdk_dma_zmalloc(g_io_bytes, 4096, NULL);
 		uint8_t *all = NULL;
 		unsigned nfail = 0, bad = 0;
+		unsigned absent = 0, shown_present = 0;	/* -k -V -D */
 
 		if (!b) {
 			return 1;
@@ -770,6 +773,18 @@ main(int argc, char **argv)
 				continue;
 			}
 			st = cpu_kv(NVME_KV_OPC_RETRIEVE, b, g_io_bytes, idx, &dw0);
+			if (g_kv_delete) {
+				/* -V -D:期望不存在,只看状态,不比内容 */
+				if (st == NVME_KV_SC_KEY_NOT_EXIST) {
+					absent++;
+				} else if (st != 0) {
+					nfail++;
+				} else if (shown_present++ < 8) {
+					printf("  key %" PRIu64 " 仍存在 (value %u 字节)\n",
+					       idx, dw0);
+				}
+				continue;
+			}
 			if (st == NVME_KV_SC_KEY_NOT_EXIST) {
 				memset(b, CPAT, g_io_bytes);
 			} else if (st != 0) {
@@ -798,6 +813,14 @@ main(int argc, char **argv)
 		if (g_paint && g_kv) {
 			printf("[删除] key %" PRIu64 " 起 %u 个 (seed %u),失败 %u\n",
 			       g_start_lba, g_rounds, g_seed, nfail);
+		} else if (g_kv && g_kv_delete) {
+			bad = g_rounds - absent - nfail;
+			printf("\n[回读] key %" PRIu64 " 起 %u 个 (seed %u),期望全部不存在:\n"
+			       "  不存在 %u,仍存在 %u,出错 %u\n  %s\n",
+			       g_start_lba, g_rounds, g_seed, absent, bad, nfail,
+			       (bad || nfail) ? "*** FAIL ***" :
+			       "*** PASS:全部已删除 ***");
+			free(all);
 		} else if (g_paint) {
 			printf("[涂色] LBA %" PRIu64 " 起 %u 块填 0x%02x,失败 %u\n",
 			       g_start_lba, g_rounds, CPAT, nfail);
@@ -1750,10 +1773,11 @@ main(int argc, char **argv)
 	if (g_kv && (g_write || g_kv_delete)) {
 		/* 同读写:接管过的 qpair 不能再用 CPU 路径,另起进程(坑 3) */
 		printf("\n[校验] 请另起进程回读,%s:\n",
-		       g_kv_delete ? "应全部是 C(key 已删)" : "应逐块一致");
+		       g_kv_delete ? "应全部不存在" : "应逐块一致");
 		printf("  %s -a %s -n %s -g %d -b %u -r %u -L %" PRIu64
-		       " -S %u -k -V\n", argv[0], g_traddr, g_nqn, g_gpu_id,
-		       g_io_bytes, done, g_start_lba, g_seed);
+		       " -S %u -k -V%s\n", argv[0], g_traddr, g_nqn, g_gpu_id,
+		       g_io_bytes, done, g_start_lba, g_seed,
+		       g_kv_delete ? " -D" : "");
 	} else if (g_kv && g_kv_exist) {
 		printf("\n[校验] Exist 只看状态:NVMe 成功 == 条数即 PASS\n");
 	} else if (g_write) {

@@ -182,10 +182,16 @@ GPU 侧已支持发 KV 命令。使用 `gpu_initiated -k`,默认发 Retrieve;
 和 NVM 的 Write/Read 用的是同一个 opcode,SPDK nvmf 会把它们当读写处理。
 因此需要打一个只对 `kv_emu` bdev 生效的透传补丁。
 
-现状:
+现状(2026-10-15):
 
-- CPU 路径冒烟已在 SPDK v24.09 + TCP 回环上全过,详见该目录 README。
-- GPU 路径(`make run-gpu-kv-*`)尚未上机。
+- **CPU 路径冒烟**:SPDK v24.09 + TCP 回环,25/25 全过。
+- **GPU 路径**:在 mx-decode-02 → mx-prefill-02 上跑通了 Retrieve、Store、
+  Exist、Delete,QD 1 和 QD 4 两种配置。
+  - 全部做了逐块校验。
+  - Retrieve 的 DW0 都等于 value 长度。
+  - 4 KiB Retrieve 的等待 p50 是 11.7 µs,Store 是 17.3 µs。
+
+数据和胶囊核对见 `tst/kv_target/README.md`「验证记录」。
 
 ---
 
