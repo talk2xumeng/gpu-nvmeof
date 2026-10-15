@@ -161,7 +161,31 @@ struct gio_shared {
 	uint32_t	rq_flushes;	/* 推 dbrec[0] 的次数 */
 	uint32_t	cq_ci_written;	/* opt 0x2000:最近一次写进 CQ dbrec 的 ci */
 	uint32_t	cq_db_writes;	/* 写 CQ dbrec 的次数 */
+	/* opt GIO_OPT_PROF:分段计时累计(cycles),下标见 GIO_PF_* */
+	uint64_t	prof[16];
 };
+
+/*
+ * 剖析(-O 0x20000):提交路径和 poller 每圈拆段计时,累计进 sh->prof。
+ * 提交段由各 submitter atomicAdd,poller 段只有 poller 写。
+ */
+#define GIO_OPT_PROF	0x20000u
+#define GIO_PF_TAG	0	/* 写 tag 的 job/state(两次 fence) */
+#define GIO_PF_LOCK	1	/* 抢 SQ 锁 */
+#define GIO_PF_PI	2	/* 读共享 sq_pi(fence) */
+#define GIO_PF_WQE	3	/* 写 WQE 到主存 SQ 槽 + FENCE_QUEUE */
+#define GIO_PF_DBR	4	/* 写 SQ dbrec + FENCE_DB */
+#define GIO_PF_BF	5	/* 回读 SQ 槽 + 写 BlueFlame + FENCE_DB */
+#define GIO_PF_REL	6	/* 写共享 sq_pi + 解锁(两次 fence) */
+#define GIO_PF_POST	7	/* 门铃后写 t_post + fence */
+#define GIO_PF_IREAD	8	/* poller 空转:读 CQE 尾(主存) */
+#define GIO_PF_IFLUSH	9	/* poller 空转:idle_flush */
+#define GIO_PF_ICHK	10	/* poller 空转:done/abort 检查 */
+#define GIO_PF_HFENCE	11	/* poller 命中:owner 之后的 fence */
+#define GIO_PF_HCONS	12	/* poller 命中:consume_one(含补 recv) */
+#define GIO_PF_HCI	13	/* poller 命中:advance_ci */
+#define GIO_PF_NIDLE	14	/* poller 空转圈数 */
+#define GIO_PF_NHIT	15	/* poller 命中次数 */
 
 /*
  * poller 降本(C3 前置)。各自一个 opt 位,便于逐项对照:

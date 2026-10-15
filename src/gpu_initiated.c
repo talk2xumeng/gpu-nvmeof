@@ -33,6 +33,7 @@
  *                        -O 的值与 0x7000 按位或;
  *                        bit15(=0x8000) WQE 寄存器构造、不回读 SQ 槽(实测变慢);
  *                        bit16(=0x10000) 旧行为:不加默认的 0x7000(对照用)
+ *                        bit17(=0x20000) 剖析:提交路径、poller 每圈分段计时
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -558,7 +559,7 @@ qp_desc(unsigned nq)
 static void
 sh_sum(struct gio_shared *o, const struct gio_shared *s, unsigned nq)
 {
-	unsigned q;
+	unsigned q, i;
 
 	*o = s[0];
 	for (q = 1; q < nq; q++) {
@@ -582,6 +583,9 @@ sh_sum(struct gio_shared *o, const struct gio_shared *s, unsigned nq)
 		o->rq_reposted += x->rq_reposted;
 		o->rq_flushes += x->rq_flushes;
 		o->cq_db_writes += x->cq_db_writes;
+		for (i = 0; i < 16; i++) {
+			o->prof[i] += x->prof[i];
+		}
 	}
 }
 
@@ -1954,6 +1958,45 @@ main(int argc, char **argv)
 			if (ssum) {
 				printf("   平均每圈 %.0f ns",
 				       wsum * 1000.0 / (double)ssum);
+			}
+			printf("\n");
+		}
+
+		/*
+		 * -O 0x20000 剖析:提交路径每条的平均分段,poller 空转一圈 /
+		 * 命中一次的平均分段。都是均值(含少数长尾),单位 ns。
+		 */
+		if (g_opt & GIO_OPT_PROF) {
+			double ns = 1e6 / clk_khz;
+			double nj = done ? done : 1;
+			double ni = sh.prof[GIO_PF_NIDLE] ? sh.prof[GIO_PF_NIDLE] : 1;
+			double nh = sh.prof[GIO_PF_NHIT] ? sh.prof[GIO_PF_NHIT] : 1;
+
+			printf("\n  [剖析] 提交每条(ns): 写 tag %.0f | 抢锁 %.0f | 读 sq_pi %.0f"
+			       " | 写 WQE+fence %.0f | dbrec+fence %.0f | 回读+BF+fence %.0f"
+			       " | 写 sq_pi+解锁 %.0f | 写 t_post+fence %.0f",
+			       sh.prof[GIO_PF_TAG] * ns / nj,
+			       sh.prof[GIO_PF_LOCK] * ns / nj,
+			       sh.prof[GIO_PF_PI] * ns / nj,
+			       sh.prof[GIO_PF_WQE] * ns / nj,
+			       sh.prof[GIO_PF_DBR] * ns / nj,
+			       sh.prof[GIO_PF_BF] * ns / nj,
+			       sh.prof[GIO_PF_REL] * ns / nj,
+			       sh.prof[GIO_PF_POST] * ns / nj);
+			if (!(g_opt & 0x30)) {
+				printf("\n  [剖析] poller 空转 %llu 圈,每圈(ns): 读 CQE %.0f"
+				       " | idle_flush %.0f | done/abort 检查 %.0f",
+				       (unsigned long long)sh.prof[GIO_PF_NIDLE],
+				       sh.prof[GIO_PF_IREAD] * ns / (ni + nh),
+				       sh.prof[GIO_PF_IFLUSH] * ns / ni,
+				       sh.prof[GIO_PF_ICHK] * ns / ni);
+				printf("\n  [剖析] poller 命中 %llu 次,每次(ns): 读 CQE %.0f"
+				       " | fence %.0f | consume_one %.0f | advance_ci %.0f",
+				       (unsigned long long)sh.prof[GIO_PF_NHIT],
+				       sh.prof[GIO_PF_IREAD] * ns / (ni + nh),
+				       sh.prof[GIO_PF_HFENCE] * ns / nh,
+				       sh.prof[GIO_PF_HCONS] * ns / nh,
+				       sh.prof[GIO_PF_HCI] * ns / nh);
 			}
 			printf("\n");
 		}

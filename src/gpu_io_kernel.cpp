@@ -370,13 +370,27 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 	uint64_t spins = 0, hits = 0, rcyc = 0;
 	uint64_t idle_since = clock64();
 	uint64_t pstart = idle_since;
+	/* -O 0x20000 剖析:本地累计,退出时写进 sh->prof */
+	int prof = (c->opt & GIO_OPT_PROF) != 0;
+	uint64_t pf[16] = { 0 }, p0 = 0, p1;
 
 	for (;;) {
 		uint32_t idx = ci & (c->cq_cnt - 1);
 		volatile uint8_t *cqe = c->cq_buf + (size_t)idx * c->cqe_size;
-		uint64_t tail = cqe_tail(c, cqe);
-		uint8_t op_own = TAIL_OP_OWN(tail);
-		uint8_t opcode = op_own >> 4;
+		uint64_t tail;
+		uint8_t op_own, opcode;
+
+		if (prof) {
+			p0 = clock64();
+		}
+		tail = cqe_tail(c, cqe);
+		op_own = TAIL_OP_OWN(tail);
+		opcode = op_own >> 4;
+		if (prof) {
+			p1 = clock64();
+			pf[GIO_PF_IREAD] += p1 - p0;
+			p0 = p1;
+		}
 
 		spins++;
 
@@ -386,6 +400,12 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		 */
 		if ((op_own & 1) != (phase & 1) || opcode == MLX5_CQE_INVALID) {
 			idle_flush(c, sh, ci);
+			if (prof) {
+				p1 = clock64();
+				pf[GIO_PF_IFLUSH] += p1 - p0;
+				p0 = p1;
+				pf[GIO_PF_NIDLE]++;
+			}
 			if ((c->opt & 2) && (spins & 0xff) != 0) {
 				continue;
 			}
@@ -397,6 +417,9 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 				set_abort(sh, GIO_E_TIMEOUT);
 				break;
 			}
+			if (prof) {
+				pf[GIO_PF_ICHK] += clock64() - p0;
+			}
 			continue;
 		}
 
@@ -404,9 +427,22 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		__threadfence_system();
 		hits++;
 		idle_since = clock64();
+		if (prof) {
+			pf[GIO_PF_HFENCE] += idle_since - p0;
+			p0 = idle_since;
+			pf[GIO_PF_NHIT]++;
+		}
 
 		rcyc += consume_one(c, sh, tags, cqe, &seq);
+		if (prof) {
+			p1 = clock64();
+			pf[GIO_PF_HCONS] += p1 - p0;
+			p0 = p1;
+		}
 		advance_ci(c, sh, &ci, &phase);
+		if (prof) {
+			pf[GIO_PF_HCI] += clock64() - p0;
+		}
 
 		if (ld_acq32(&sh->abort)) {
 			break;
@@ -417,6 +453,14 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 	sh->poll_hits = hits;
 	sh->poll_cycles = clock64() - pstart;
 	sh->resp_cycles = rcyc;
+	if (prof) {
+		int k;
+
+		/* 提交段(0..7)由 submitter atomicAdd,poller 只写自己的 8..15 */
+		for (k = GIO_PF_IREAD; k < 16; k++) {
+			sh->prof[k] = pf[k];
+		}
+	}
 }
 
 /*
@@ -514,8 +558,25 @@ sq_unlock(struct gio_shared *sh)
  *   正常路径 锁内从共享 sq_pi 取,用完写回(带 fence)
  *   精简路径(opt bit8) 本地算,门铃之后不再写任何东西
  */
+/*
+ * 剖析:pf 非空时把 [now - *t] 累计进 pf[i],并把 *t 推到 now。
+ * pf 是 submitter 线程本地的数组,退出时才一次性加进 sh->prof,
+ * 免得原子操作本身混进被测的段里。
+ */
+__device__ static inline void
+pf_mark(uint64_t *pf, int i, uint64_t *t)
+{
+	if (pf) {
+		uint64_t now = clock64();
+
+		pf[i] += now - *t;
+		*t = now;
+	}
+}
+
 __device__ static void
-post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr)
+post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
+	 uint64_t *pf, uint64_t *pt)
 {
 	uint32_t slot = pi & (c->sq_wqe_cnt - 1);
 	volatile uint8_t *sq_slot = c->sq_buf + (size_t)slot * c->sq_stride;
@@ -561,24 +622,29 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr)
 		((volatile uint32_t *)sq_slot)[2] = 0;
 	}
 	WQE_FENCE_QUEUE();
+	pf_mark(pf, GIO_PF_WQE, pt);
 
 	c->qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
 	WQE_FENCE_DB();
+	pf_mark(pf, GIO_PF_DBR, pt);
 
 	src = (const uint64_t *)(void *)sq_slot;
 	for (w = 0; w < 4; w++) {
 		bfp[w] = src[w];
 	}
 	WQE_FENCE_DB();
+	pf_mark(pf, GIO_PF_BF, pt);
 
 }
 
 __device__ static void
-post_locked(struct gpu_io_ctx *c, struct gio_shared *sh, uint64_t cap_addr)
+post_locked(struct gpu_io_ctx *c, struct gio_shared *sh, uint64_t cap_addr,
+	    uint64_t *pf, uint64_t *pt)
 {
 	uint16_t pi = (uint16_t)ld_acq32(&sh->sq_pi);
 
-	post_wqe(c, pi, cap_addr);
+	pf_mark(pf, GIO_PF_PI, pt);
+	post_wqe(c, pi, cap_addr, pf, pt);
 	st_rel32(&sh->sq_pi, (uint32_t)pi + 1);
 }
 
@@ -595,6 +661,10 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	/* 串行快路径(opt bit5)的本地 CQ 状态 */
 	uint32_t my_ci = c->cq_ci, my_seq = 0;
 	uint8_t my_phase = c->cq_phase;
+	/* -O 0x20000 剖析:提交路径分段先本地累计,退出时加进 sh->prof */
+	uint64_t lpf[GIO_PF_POST + 1] = { 0 };
+	uint64_t *pf = (c->opt & GIO_OPT_PROF) ? lpf : NULL;
+	uint64_t pt = 0;
 
 	while (claim_job(sh, c->njobs, &j)) {
 		/* 多 QP:j 是本 QP 内的序号,J 是全局序号(LBA/key/块/统计数组) */
@@ -632,19 +702,24 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		/* 必须在门铃之前置 POSTED,否则 poller 置的 DONE 会被覆盖 */
 		st_rel32(&tags[tag].job, j);
 		st_rel32(&tags[tag].state, GIO_ST_POSTED);
+		pt = t1;
+		pf_mark(pf, GIO_PF_TAG, &pt);
 
 		if (c->opt & 0x100) {
 			/* 门铃之后一个带 fence 的写都没有,同旧串行 kernel */
-			post_wqe(c, (uint16_t)(c->sq_pi + j), cap_addr);
+			post_wqe(c, (uint16_t)(c->sq_pi + j), cap_addr, pf, &pt);
 			lspins = 0;
 			t2 = clock64();
 		} else {
 			lspins = sq_lock(sh);
-			post_locked(c, sh, cap_addr);
+			pf_mark(pf, GIO_PF_LOCK, &pt);
+			post_locked(c, sh, cap_addr, pf, &pt);
 			sq_unlock(sh);
+			pf_mark(pf, GIO_PF_REL, &pt);
 			t2 = clock64();
 			tags[tag].t_post = t2;
 			__threadfence_system();
+			pf_mark(pf, GIO_PF_POST, &pt);
 		}
 
 		for (;;) {
@@ -741,6 +816,14 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	/* 串行快路径自己消费 CQ:退出前把攒着的 RQ / CQ dbrec 交出去 */
 	if (c->opt & 0x20) {
 		idle_flush(c, sh, my_ci);
+	}
+	if (pf) {
+		int k;
+
+		for (k = 0; k <= GIO_PF_POST; k++) {
+			atomicAdd((unsigned long long *)&sh->prof[k],
+				  (unsigned long long)lpf[k]);
+		}
 	}
 }
 
