@@ -170,6 +170,12 @@ struct gio_shared {
  * 提交段由各 submitter atomicAdd,poller 段只有 poller 写。
  */
 #define GIO_OPT_PROF	0x20000u
+/*
+ * BlueFlame 只回读 1 次(-O 0x40000):WQE 在寄存器里构造,写 SQ 槽和
+ * BlueFlame 都用寄存器里的值,中间只做一次 8 字节主存读来推出前面的
+ * posted 写。默认路径回读 4 次(~6 us);0x8000 不读(等待变长)。
+ */
+#define GIO_OPT_BF1	0x40000u
 #define GIO_PF_TAG	0	/* 写 tag 的 job/state(两次 fence) */
 #define GIO_PF_LOCK	1	/* 抢 SQ 锁 */
 #define GIO_PF_PI	2	/* 读共享 sq_pi(fence) */

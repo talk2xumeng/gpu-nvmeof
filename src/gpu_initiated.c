@@ -34,6 +34,7 @@
  *                        bit15(=0x8000) WQE 寄存器构造、不回读 SQ 槽(实测变慢);
  *                        bit16(=0x10000) 旧行为:不加默认的 0x7000(对照用)
  *                        bit17(=0x20000) 剖析:提交路径、poller 每圈分段计时
+ *                        bit18(=0x40000) BlueFlame 只回读 1 次(WQE 在寄存器里构造)
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)

@@ -65,6 +65,46 @@ set_abort(struct gio_shared *sh, int err)
 /* poller                                                              */
 /* ================================================================== */
 
+/*
+ * 消费者(poller / 持 cq_lock 者 / 串行快路径)独占的状态和计数器。
+ *
+ * 剖析(-O 0x20000)显示,显存上每次 volatile 读写约 0.5 us(全局内存
+ * 延迟),poller 每处理一条响应要碰十几次 gio_shared,空转一圈也有两次
+ * —— 处理一条响应 7 us、空转一圈 3 us 大半花在这里。现在消费者把这些
+ * 放在寄存器里(ps 是消费者线程的局部变量,热路径函数全部内联),
+ * 只在进出时和 gio_shared 交换:独立 poller 和串行快路径在开始 / 结束时,
+ * 自轮询每一步持锁进出时。跨 block 真正需要的只有 tag 状态和 abort。
+ */
+struct pstate {
+	uint32_t	done_cnt, nvme_err, cid_bad, wc_mismatch;
+	uint32_t	cqe_req, cqe_resp, resp_inline, err_cqe;
+	uint16_t	first_status, first_bad_cid;
+	uint32_t	rq_head, rq_reposted, rq_pending, rq_flushes;
+	uint32_t	cq_ci_written, cq_db_writes;
+	uint32_t	aborted;	/* 本消费者置过 abort(不回写共享区) */
+};
+
+#define PS_FIELDS(X) X(done_cnt) X(nvme_err) X(cid_bad) X(wc_mismatch) \
+	X(cqe_req) X(cqe_resp) X(resp_inline) X(err_cqe) X(first_status) \
+	X(first_bad_cid) X(rq_head) X(rq_reposted) X(rq_pending) X(rq_flushes) \
+	X(cq_ci_written) X(cq_db_writes)
+
+__device__ static __forceinline__ void
+ps_load(struct pstate *ps, struct gio_shared *sh)
+{
+#define PS_LD(f) ps->f = *(volatile __typeof__(sh->f) *)&sh->f;
+	PS_FIELDS(PS_LD)
+#undef PS_LD
+}
+
+__device__ static __forceinline__ void
+ps_store(struct gio_shared *sh, const struct pstate *ps)
+{
+#define PS_ST(f) *(volatile __typeof__(sh->f) *)&sh->f = ps->f;
+	PS_FIELDS(PS_ST)
+#undef PS_ST
+}
+
 /* cqe64 offset 48:网卡的自由运行计数器,大端 */
 __device__ static inline uint64_t
 cqe64_ts(volatile uint8_t *cqe64)
@@ -87,8 +127,9 @@ cqe64_ts(volatile uint8_t *cqe64)
  *   [12..13] cid
  *   [14..15] status:bit0 = phase tag,bit1..8 = SC,bit9..11 = SCT
  */
-__device__ static void
-handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
+__device__ static __forceinline__ void
+handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct pstate *ps,
+	    struct gio_tag *tags,
 	    volatile uint8_t *cqe64, uint8_t op_own, uint16_t wqe_counter,
 	    uint32_t seq)
 {
@@ -103,7 +144,7 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	 * 跨 block 可见的只有 tag 状态,最后统一 fence 一次。
 	 */
 	if (((c->rq_tail + seq) & 0xffff) != wqe_counter) {
-		sh->wc_mismatch++;
+		ps->wc_mismatch++;
 	}
 
 	/*
@@ -112,10 +153,10 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	 */
 	if (op_own & 0x4) {
 		ncqe = cqe64;
-		sh->resp_inline++;
+		ps->resp_inline++;
 	} else if (op_own & 0x8) {
 		ncqe = cqe64 - 64;
-		sh->resp_inline++;
+		ps->resp_inline++;
 	} else {
 		uint32_t k = wqe_counter & (c->rq_wqe_cnt - 1);
 		volatile uint8_t *seg = c->rq_buf + (size_t)k * c->rq_stride;
@@ -124,6 +165,7 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 
 		if (c->rsp_len == 0 || addr < c->rsp_host_base ||
 		    addr + 16 > c->rsp_host_base + c->rsp_len) {
+			ps->aborted = 1;
 			set_abort(sh, GIO_E_RSP_ADDR);
 			return;
 		}
@@ -149,10 +191,11 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	}
 	if ((c->opt & 0x400) ? ((cid & 0xf000) != 0xE000) :
 	    ((cid & GIO_CID_TAG) == 0 || tag >= c->qd)) {
-		if (sh->cid_bad == 0) {
-			sh->first_bad_cid = cid;
+		if (ps->cid_bad == 0) {
+			ps->first_bad_cid = cid;
 		}
-		sh->cid_bad++;
+		ps->cid_bad++;
+		ps->aborted = 1;
 		set_abort(sh, GIO_E_CID);
 		return;
 	}
@@ -168,10 +211,10 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		vt->dw0 = dw0;
 		vt->status = status;
 		if ((status >> 1) != 0) {
-			if (sh->nvme_err == 0) {
-				sh->first_status = status;
+			if (ps->nvme_err == 0) {
+				ps->first_status = status;
 			}
-			sh->nvme_err++;
+			ps->nvme_err++;
 			vt->state = GIO_ST_NVME_ERR;
 		} else {
 			vt->state = GIO_ST_DONE;
@@ -179,7 +222,7 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		vt->t_done = clock64();
 		__threadfence_system();
 	}
-	sh->done_cnt++;
+	ps->done_cnt++;
 }
 
 /*
@@ -204,54 +247,59 @@ cqe_ts(struct gpu_io_ctx *c, volatile uint8_t *cqe)
 	return cqe64_ts(cqe + c->cqe_size - 64);
 }
 
-__device__ static void rq_repost(struct gpu_io_ctx *c, struct gio_shared *sh,
-			  uint16_t wqe_counter);
+__device__ static __forceinline__ void rq_repost(struct gpu_io_ctx *c,
+						 struct pstate *ps,
+						 uint16_t wqe_counter);
 
 /* 把已写好的 RQ 槽一次性交给网卡:槽内容先落地,再推 dbrec[0] */
-__device__ static void
-rq_flush(struct gpu_io_ctx *c, struct gio_shared *sh)
+__device__ static __forceinline__ void
+rq_flush(struct gpu_io_ctx *c, struct pstate *ps)
 {
 	uint32_t head;
 
-	if (*(volatile uint32_t *)&sh->rq_pending == 0) {
+	if (ps->rq_pending == 0) {
 		return;
 	}
-	head = *(volatile uint32_t *)&sh->rq_head;
+	head = ps->rq_head;
 	WQE_FENCE_QUEUE();
 	c->qp_dbrec[0] = wqe_hto_be32(head & 0xffff);
 	WQE_FENCE_DB();
-	*(volatile uint32_t *)&sh->rq_pending = 0;
-	*(volatile uint32_t *)&sh->rq_flushes += 1;
+	ps->rq_pending = 0;
+	ps->rq_flushes += 1;
 }
 
 /* opt 0x2000:把 CQ dbrec 补到当前 ci(空闲 / 退出时调) */
-__device__ static void
-cq_flush(struct gpu_io_ctx *c, struct gio_shared *sh, uint32_t ci)
+__device__ static __forceinline__ void
+cq_flush(struct gpu_io_ctx *c, struct pstate *ps, uint32_t ci)
 {
 	if (!(c->opt & 0x2000) ||
-	    *(volatile uint32_t *)&sh->cq_ci_written == ci) {
+	    ps->cq_ci_written == ci) {
 		return;
 	}
 	c->cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
 	WQE_FENCE_DB();
-	*(volatile uint32_t *)&sh->cq_ci_written = ci;
-	*(volatile uint32_t *)&sh->cq_db_writes += 1;
+	ps->cq_ci_written = ci;
+	ps->cq_db_writes += 1;
 }
 
 /* 消费者空闲时调:把攒着的 RQ 补充和 CQ ci 都交出去 */
-__device__ static inline void
-idle_flush(struct gpu_io_ctx *c, struct gio_shared *sh, uint32_t ci)
+__device__ static __forceinline__ void
+idle_flush(struct gpu_io_ctx *c, struct pstate *ps, uint32_t ci)
 {
-	rq_flush(c, sh);
-	cq_flush(c, sh, ci);
+	rq_flush(c, ps);
+	cq_flush(c, ps, ci);
 }
 
-__device__ static uint64_t
-consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
-	    volatile uint8_t *cqe, uint32_t *seq)
+__device__ static __forceinline__ uint64_t
+consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct pstate *ps,
+	    struct gio_tag *tags,
+	    volatile uint8_t *cqe, uint64_t tail, uint32_t *seq)
 {
-	/* 调用方 fence 过了;owner 确认前读到的尾部字不一定是终值,重读一次 */
-	uint64_t tail = cqe_tail(c, cqe);
+	/*
+	 * tail 是调用方判 owner 时读到的那个 8 字节:对齐的 8 字节读是一次
+	 * 完整的 PCIe 读,不会读到半新半旧,不必再读一次(主存读 ~1 us)。
+	 * CQE 其余字段要在调用方 fence 之后再读。
+	 */
 	uint8_t op_own = TAIL_OP_OWN(tail);
 	uint8_t opcode = op_own >> 4;
 	uint64_t r = 0;
@@ -260,16 +308,16 @@ consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		uint16_t wc = TAIL_WQE_CTR(tail);
 		uint64_t r0 = clock64();
 
-		sh->cqe_resp++;
-		handle_resp(c, sh, tags, cqe + (c->cqe_size - 64), op_own,
+		ps->cqe_resp++;
+		handle_resp(c, sh, ps, tags, cqe + (c->cqe_size - 64), op_own,
 			    wc, *seq);
 		if (!(c->opt & 0x800) && c->rq_shadow) {
-			rq_repost(c, sh, wc);
+			rq_repost(c, ps, wc);
 		}
 		r = clock64() - r0;
 		(*seq)++;
 	} else if (opcode == MLX5_CQE_REQ) {
-		sh->cqe_req++;
+		ps->cqe_req++;
 		if (c->opt & 0x80) {
 			sh->last_req_ts = cqe_ts(c, cqe);
 			sh->last_req_at = clock64();
@@ -279,8 +327,9 @@ consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		/* cqe64 在条目末尾;syndrome 在其 offset 55,vendor_err 在 54 */
 		uint32_t base = c->cqe_size - 64;
 
-		sh->err_cqe = ((uint32_t)cqe[base + 54] << 8) |
+		ps->err_cqe = ((uint32_t)cqe[base + 54] << 8) |
 			      cqe[base + 55];
+		ps->aborted = 1;
 		set_abort(sh, GIO_E_CQE);
 	}
 	return r;
@@ -295,16 +344,16 @@ consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
  *
  * 描述符从显存影子取,不回读主存;影子跟着搬,保证下一圈取到的还是
  * 这块 buffer。调用方保证此刻只有自己在消费 CQ(poller / 持 cq_lock /
- * QD=1 串行快路径),所以 sh->rq_head 不用原子操作。
+ * QD=1 串行快路径),所以 ps->rq_head 不用原子操作。
  *
  * 必须在 handle_resp 读完响应之后调:非内联响应的数据在这块 buffer 里。
  */
-__device__ static void
-rq_repost(struct gpu_io_ctx *c, struct gio_shared *sh, uint16_t wqe_counter)
+__device__ static __forceinline__ void
+rq_repost(struct gpu_io_ctx *c, struct pstate *ps, uint16_t wqe_counter)
 {
 	uint32_t mask = c->rq_wqe_cnt - 1;
 	uint32_t k = wqe_counter & mask;
-	uint32_t head = *(volatile uint32_t *)&sh->rq_head;
+	uint32_t head = ps->rq_head;
 	uint32_t h = head & mask;
 	uint32_t words = c->rq_stride / 8, i;
 	volatile uint64_t *dst = (volatile uint64_t *)(c->rq_buf +
@@ -319,9 +368,9 @@ rq_repost(struct gpu_io_ctx *c, struct gio_shared *sh, uint16_t wqe_counter)
 		shd[i] = v;
 	}
 	head++;
-	*(volatile uint32_t *)&sh->rq_head = head;
-	*(volatile uint32_t *)&sh->rq_reposted += 1;
-	*(volatile uint32_t *)&sh->rq_pending += 1;
+	ps->rq_head = head;
+	ps->rq_reposted += 1;
+	ps->rq_pending += 1;
 
 	/*
 	 * 默认每个都推 dbrec;opt 0x1000 攒够一批再推。两次 system fence
@@ -329,14 +378,14 @@ rq_repost(struct gpu_io_ctx *c, struct gio_shared *sh, uint16_t wqe_counter)
 	 * 少 GIO_RQ_BATCH 个,host 侧相应压低 QD 上限。
 	 */
 	if (!(c->opt & 0x1000) ||
-	    *(volatile uint32_t *)&sh->rq_pending >= GIO_RQ_BATCH) {
-		rq_flush(c, sh);
+	    ps->rq_pending >= GIO_RQ_BATCH) {
+		rq_flush(c, ps);
 	}
 }
 
 /* 消费一个 CQE 后推进 ci,并立刻还给网卡(出错也要还,否则 CQ 会溢出) */
-__device__ static void
-advance_ci(struct gpu_io_ctx *c, struct gio_shared *sh, uint32_t *ci,
+__device__ static __forceinline__ void
+advance_ci(struct gpu_io_ctx *c, struct pstate *ps, uint32_t *ci,
 	   uint8_t *phase)
 {
 	(*ci)++;
@@ -351,14 +400,14 @@ advance_ci(struct gpu_io_ctx *c, struct gio_shared *sh, uint32_t *ci,
 		 */
 		if ((*ci & (GIO_CQ_BATCH - 1)) == 0) {
 			c->cq_dbrec[0] = wqe_hto_be32(*ci & 0xffffff);
-			*(volatile uint32_t *)&sh->cq_ci_written = *ci;
-			*(volatile uint32_t *)&sh->cq_db_writes += 1;
+			ps->cq_ci_written = *ci;
+			ps->cq_db_writes += 1;
 		}
 		return;
 	}
 	c->cq_dbrec[0] = wqe_hto_be32(*ci & 0xffffff);
 	WQE_FENCE_DB();
-	*(volatile uint32_t *)&sh->cq_db_writes += 1;
+	ps->cq_db_writes += 1;
 }
 
 __device__ static void
@@ -370,9 +419,15 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 	uint64_t spins = 0, hits = 0, rcyc = 0;
 	uint64_t idle_since = clock64();
 	uint64_t pstart = idle_since;
+	/* 空转时每 chk 圈才查一次全局 abort(fence + 显存读 ~0.6 us) */
+	uint32_t chk = (c->opt & 2) ? 0xff : 0x3f;
+	struct pstate ps;
 	/* -O 0x20000 剖析:本地累计,退出时写进 sh->prof */
 	int prof = (c->opt & GIO_OPT_PROF) != 0;
 	uint64_t pf[16] = { 0 }, p0 = 0, p1;
+
+	ps_load(&ps, sh);
+	ps.aborted = 0;
 
 	for (;;) {
 		uint32_t idx = ci & (c->cq_cnt - 1);
@@ -399,23 +454,25 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		 * 恰好等于首圈的 phase(0) —— 只判 owner 会把空条目当 CQE 消费掉。
 		 */
 		if ((op_own & 1) != (phase & 1) || opcode == MLX5_CQE_INVALID) {
-			idle_flush(c, sh, ci);
+			idle_flush(c, &ps, ci);
 			if (prof) {
 				p1 = clock64();
 				pf[GIO_PF_IFLUSH] += p1 - p0;
 				p0 = p1;
 				pf[GIO_PF_NIDLE]++;
 			}
-			if ((c->opt & 2) && (spins & 0xff) != 0) {
-				continue;
-			}
-			/* done_cnt 只有 poller 自己写,不用 fence */
-			if (sh->done_cnt >= c->njobs || ld_acq32(&sh->abort)) {
+			/* done_cnt 在寄存器里,每圈查也不花钱 */
+			if (ps.done_cnt >= c->njobs) {
 				break;
 			}
-			if (clock64() - idle_since > GIO_TIMEOUT) {
-				set_abort(sh, GIO_E_TIMEOUT);
-				break;
+			if ((spins & chk) == 0) {
+				if (ld_acq32(&sh->abort)) {
+					break;
+				}
+				if (clock64() - idle_since > GIO_TIMEOUT) {
+					set_abort(sh, GIO_E_TIMEOUT);
+					break;
+				}
 			}
 			if (prof) {
 				pf[GIO_PF_ICHK] += clock64() - p0;
@@ -433,22 +490,24 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 			pf[GIO_PF_NHIT]++;
 		}
 
-		rcyc += consume_one(c, sh, tags, cqe, &seq);
+		rcyc += consume_one(c, sh, &ps, tags, cqe, tail, &seq);
 		if (prof) {
 			p1 = clock64();
 			pf[GIO_PF_HCONS] += p1 - p0;
 			p0 = p1;
 		}
-		advance_ci(c, sh, &ci, &phase);
+		advance_ci(c, &ps, &ci, &phase);
 		if (prof) {
 			pf[GIO_PF_HCI] += clock64() - p0;
 		}
 
-		if (ld_acq32(&sh->abort)) {
+		/* 自己置的 abort 立刻退;别人置的(submitter 超时)按圈数查 */
+		if (ps.aborted || ((hits & chk) == 0 && ld_acq32(&sh->abort))) {
 			break;
 		}
 	}
-	idle_flush(c, sh, ci);
+	idle_flush(c, &ps, ci);
+	ps_store(sh, &ps);
 	sh->poll_spins = spins;
 	sh->poll_hits = hits;
 	sh->poll_cycles = clock64() - pstart;
@@ -465,9 +524,9 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 
 /*
  * 自轮询(opt bit4):调用方已持 cq_lock。把已经到了的 CQE 最多收 32 个,
- * 别人的完成也按 cid 分发。ci/phase/seq 在共享区里,换人持锁时靠
- * 进出各一次 fence 交接;计数器也只有持锁者写,同样被这两次 fence 覆盖。
- * 不在这里 fence 收尾 —— 调用方释放锁时统一 fence。
+ * 别人的完成也按 cid 分发。ci/phase/seq 和消费者状态都在共享区里,换人
+ * 持锁时靠进出各一次 fence 交接。不在这里 fence 收尾 —— 调用方释放锁时
+ * 统一 fence。
  */
 __device__ static void
 poll_step(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
@@ -475,11 +534,14 @@ poll_step(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 	uint32_t ci, seq, n;
 	uint8_t phase;
 	uint64_t rc = 0;
+	struct pstate ps;
 
 	__threadfence_system();
 	ci = sh->sp_ci;
 	phase = (uint8_t)sh->sp_phase;
 	seq = sh->sp_seq;
+	ps_load(&ps, sh);
+	ps.aborted = 0;
 	sh->poll_spins++;
 
 	for (n = 0; n < 32; n++) {
@@ -494,11 +556,12 @@ poll_step(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		}
 		__threadfence_system();
 		sh->poll_hits++;
-		rc += consume_one(c, sh, tags, cqe, &seq);
-		advance_ci(c, sh, &ci, &phase);
+		rc += consume_one(c, sh, &ps, tags, cqe, tail, &seq);
+		advance_ci(c, &ps, &ci, &phase);
 	}
 	/* 每步结束都交出去:下一个持锁者未必马上来 */
-	idle_flush(c, sh, ci);
+	idle_flush(c, &ps, ci);
+	ps_store(sh, &ps);
 	if (n) {
 		*(volatile uint32_t *)&sh->sp_ci = ci;
 		*(volatile uint32_t *)&sh->sp_phase = phase;
@@ -563,7 +626,7 @@ sq_unlock(struct gio_shared *sh)
  * pf 是 submitter 线程本地的数组,退出时才一次性加进 sh->prof,
  * 免得原子操作本身混进被测的段里。
  */
-__device__ static inline void
+__device__ static __forceinline__ void
 pf_mark(uint64_t *pf, int i, uint64_t *t)
 {
 	if (pf) {
@@ -574,7 +637,7 @@ pf_mark(uint64_t *pf, int i, uint64_t *t)
 	}
 }
 
-__device__ static void
+__device__ static __forceinline__ void
 post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 	 uint64_t *pf, uint64_t *pt)
 {
@@ -588,31 +651,55 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 	int unsig = (c->opt & 0x4000) && ((pi & (GIO_SIG_EVERY - 1)) !=
 					  (GIO_SIG_EVERY - 1));
 
-	if (c->opt & 0x8000) {
+	if (c->opt & (0x8000 | GIO_OPT_BF1)) {
 		/*
-		 * 在寄存器里构造,分别写 SQ 槽和 BlueFlame,不再从主存回读
-		 * (原路径 4 次 8 字节 volatile 读,每次 ~0.7 us)。按 32 位构造、
-		 * 按 32 位拼 64 位,避免坑 wqe_build.h 里那个严格别名问题。
+		 * 在寄存器里构造,分别写 SQ 槽和 BlueFlame,不再从主存回读 4 次
+		 * (剖析:回读 + BF + fence 约 6 us,是提交路径的大头)。按 32 位
+		 * 构造、按 32 位拼 64 位,避免坑 wqe_build.h 里那个严格别名问题。
+		 *
+		 * 0x8000 一次都不读,实测提交快 ~1 us、等待却慢 ~2.7 us:回读不只是
+		 * 取数据,还把之前写主存的 WQE/dbrec 推了出去(PCIe 上读不能越过
+		 * 之前的 posted 写)。GIO_OPT_BF1 保留这个作用,只读 1 次 8 字节。
 		 */
 		uint32_t w32[8];
-		volatile uint32_t *d32 = (volatile uint32_t *)sq_slot;
+		uint64_t w64[4];
 
 		(void)mlx5_build_send_wqe((void *)w32, pi, c->qpn, cap_addr,
 					  c->capsule_lkey, 64);
 		if (unsig) {
 			w32[2] = 0;
 		}
-		for (w = 0; w < 8; w++) {
-			d32[w] = w32[w];
-		}
-		WQE_FENCE_QUEUE();
-		c->qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
-		WQE_FENCE_DB();
 		for (w = 0; w < 4; w++) {
-			bfp[w] = (uint64_t)w32[2 * w] |
+			w64[w] = (uint64_t)w32[2 * w] |
 				 ((uint64_t)w32[2 * w + 1] << 32);
 		}
+		if (c->opt & GIO_OPT_BF1) {
+			volatile uint64_t *d64 = (volatile uint64_t *)sq_slot;
+
+			for (w = 0; w < 4; w++) {
+				d64[w] = w64[w];
+			}
+		} else {
+			volatile uint32_t *d32 = (volatile uint32_t *)sq_slot;
+
+			for (w = 0; w < 8; w++) {
+				d32[w] = w32[w];
+			}
+		}
+		WQE_FENCE_QUEUE();
+		pf_mark(pf, GIO_PF_WQE, pt);
+		c->qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
 		WQE_FENCE_DB();
+		pf_mark(pf, GIO_PF_DBR, pt);
+		if (c->opt & GIO_OPT_BF1) {
+			/* 一次主存读,把前面的 WQE / dbrec 写推到主存 */
+			(void)*(volatile uint64_t *)sq_slot;
+		}
+		for (w = 0; w < 4; w++) {
+			bfp[w] = w64[w];
+		}
+		WQE_FENCE_DB();
+		pf_mark(pf, GIO_PF_BF, pt);
 		return;
 	}
 
@@ -637,7 +724,7 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 
 }
 
-__device__ static void
+__device__ static __forceinline__ void
 post_locked(struct gpu_io_ctx *c, struct gio_shared *sh, uint64_t cap_addr,
 	    uint64_t *pf, uint64_t *pt)
 {
@@ -661,11 +748,16 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	/* 串行快路径(opt bit5)的本地 CQ 状态 */
 	uint32_t my_ci = c->cq_ci, my_seq = 0;
 	uint8_t my_phase = c->cq_phase;
+	struct pstate sps;		/* 串行快路径的消费者状态,退出时写回 */
 	/* -O 0x20000 剖析:提交路径分段先本地累计,退出时加进 sh->prof */
 	uint64_t lpf[GIO_PF_POST + 1] = { 0 };
 	uint64_t *pf = (c->opt & GIO_OPT_PROF) ? lpf : NULL;
 	uint64_t pt = 0;
 
+	if (c->opt & 0x20) {
+		ps_load(&sps, sh);
+		sps.aborted = 0;
+	}
 	while (claim_job(sh, c->njobs, &j)) {
 		/* 多 QP:j 是本 QP 内的序号,J 是全局序号(LBA/key/块/统计数组) */
 		uint32_t J = c->job_base + j;
@@ -728,11 +820,12 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 				uint32_t idx = my_ci & (c->cq_cnt - 1);
 				volatile uint8_t *cqe = c->cq_buf +
 					(size_t)idx * c->cqe_size;
-				uint8_t oo = TAIL_OP_OWN(cqe_tail(c, cqe));
+				uint64_t tl = cqe_tail(c, cqe);
+				uint8_t oo = TAIL_OP_OWN(tl);
 
 				if ((oo & 1) != (my_phase & 1) ||
 				    (oo >> 4) == MLX5_CQE_INVALID) {
-					idle_flush(c, sh, my_ci);
+					idle_flush(c, &sps, my_ci);
 					if ((spins & 0x3ff) == 0 &&
 					    clock64() - t2 > GIO_TIMEOUT) {
 						set_abort(sh, GIO_E_WAIT);
@@ -743,15 +836,15 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 				}
 				__threadfence_system();
 				sh->poll_hits++;
-				sh->resp_cycles += consume_one(c, sh, tags, cqe,
-							       &my_seq);
-				advance_ci(c, sh, &my_ci, &my_phase);
+				sh->resp_cycles += consume_one(c, sh, &sps, tags,
+							       cqe, tl, &my_seq);
+				advance_ci(c, &sps, &my_ci, &my_phase);
 				/* handle_resp 在本 block 里已 fence 过,直接读 */
 				st = *(volatile uint32_t *)&tags[tag].state;
 				if (st >= GIO_ST_DONE) {
 					break;
 				}
-				if (ld_acq32(&sh->abort)) {
+				if (sps.aborted || ld_acq32(&sh->abort)) {
 					break;
 				}
 				continue;
@@ -815,7 +908,8 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	}
 	/* 串行快路径自己消费 CQ:退出前把攒着的 RQ / CQ dbrec 交出去 */
 	if (c->opt & 0x20) {
-		idle_flush(c, sh, my_ci);
+		idle_flush(c, &sps, my_ci);
+		ps_store(sh, &sps);
 	}
 	if (pf) {
 		int k;
