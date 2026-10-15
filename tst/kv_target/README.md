@@ -1,5 +1,7 @@
 # tst/kv_target —— 不用 KV 盘也能测 GPU 发 KV 命令
 
+> 只想照着命令跑:见 `docs/kv-runbook.md`。本文讲原理和验证记录。
+
 手头的 NVMe 盘只支持 NVM 命令集,不支持 KV(CSI 01h)。这里提供一个
 **target 侧的模拟**,让 GPU 侧的 KV 路径能在现有 RDMA 链路上跑通。
 

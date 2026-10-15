@@ -84,6 +84,7 @@ docs/
   status.md           GPU-initiated 现状与差距
   debug-notes.md      GPU-initiated 排查笔记(先读这个)
   concurrency-design.md  并发提交 + RQ 自持设计
+  kv-runbook.md       KV 测试操作手册:两台机器上的命令、判据、排查
 scripts/
 ```
 
