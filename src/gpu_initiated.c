@@ -1040,8 +1040,11 @@ main(int argc, char **argv)
 		 * 两次普通 mcMalloc 落同一 slab 会让第二个 MR 错位。
 		 * ExtMalloc 是另一套分配器,但 lkey 得和数据区不同才算真分开,
 		 * 启动时会打出来核对。 */
+		/* -X:DevX 队列显存跟在胶囊区后面,同一次分配(坑 6,见 devx_qp.h) */
 		if (gpu_alloc_exportable_ex(&g_cap_hbm, &g_cap_fd,
-					    CAP_AREA_LEN, g_cap_flags) != 0) {
+					    CAP_AREA_LEN +
+					    (g_devx ? DEVX_Q_MEM_LEN : 0),
+					    g_cap_flags) != 0) {
 			fprintf(stderr, "胶囊区 ExtMalloc(flag=0x%x) 失败\n",
 				g_cap_flags);
 			return 1;
@@ -1322,6 +1325,11 @@ main(int argc, char **argv)
 		dc.cap_host = g_cap_in_hbm ? g_cap_hbm : g_cap_host;
 		dc.cap_len = CAP_AREA_LEN;
 		dc.cap_fd = g_cap_in_hbm ? g_cap_fd : -1;
+		if (g_cap_in_hbm) {
+			dc.q_mem = (char *)g_cap_hbm + CAP_AREA_LEN;
+			dc.q_fd = g_cap_fd;
+			dc.q_off = CAP_AREA_LEN;
+		}
 		dc.data_gpu = g_base_gpu;
 		dc.data_len = g_total_len;
 		dc.data_fd = g_base_fd;

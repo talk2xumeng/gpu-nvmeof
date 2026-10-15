@@ -36,7 +36,7 @@ extern int gpu_sync(void);
 #define MC_HOST_REGISTER_MAPPED		0x02
 #define MC_HOST_REGISTER_IO_MEMORY	0x04
 
-#define DQ_MEM_LEN	(2u * 1024 * 1024)
+#define DQ_MEM_LEN	DEVX_Q_MEM_LEN
 #define DQ_OFF_CQ	0x00000u
 #define DQ_OFF_CQ_DBR	0x10000u
 #define DQ_OFF_QP_DBR	0x10040u
@@ -242,8 +242,11 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 	}
 
 	/* ---- 显存 umem ---- */
-	if (gpu_alloc_exportable_ex((void **)&g.mem, &g.mem_fd, DQ_MEM_LEN,
-				    cfg->gpu_flag) != 0) {
+	if (cfg->q_mem) {
+		g.mem = cfg->q_mem;
+		g.mem_fd = cfg->q_fd;
+	} else if (gpu_alloc_exportable_ex((void **)&g.mem, &g.mem_fd, DQ_MEM_LEN,
+					   cfg->gpu_flag) != 0) {
 		fprintf(stderr, "[DevX] 队列显存分配失败(flag %u)\n", cfg->gpu_flag);
 		return -1;
 	}
@@ -251,7 +254,7 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 		struct mlx5dv_devx_umem_in ui;
 
 		memset(&ui, 0, sizeof(ui));
-		ui.addr = 0;
+		ui.addr = (void *)(uintptr_t)(cfg->q_mem ? cfg->q_off : 0);	/* dma-buf 内偏移 */
 		ui.size = DQ_MEM_LEN;
 		ui.access = IBV_ACCESS_LOCAL_WRITE;
 		ui.pgsz_bitmap = 1ULL << 12;

@@ -22,6 +22,9 @@
 struct spdk_nvme_ctrlr;
 struct gpu_io_ctx;
 
+/* 队列显存的大小(CQ / dbrec / RQ / SQ 都在里面) */
+#define DEVX_Q_MEM_LEN	(2u * 1024 * 1024)
+
 struct devx_q_cfg {
 	const char	*traddr;
 	const char	*trsvcid;
@@ -35,6 +38,16 @@ struct devx_q_cfg {
 	void		*data_gpu;
 	size_t		data_len;
 	int		data_fd;
+	/*
+	 * 队列显存由调用方给(q_mem 非空):和别的显存同一次分配,q_off 是它在
+	 * 那个 dma-buf 里的偏移。MACA 的 dma-buf offset 0 是底层分配的基址
+	 * (坑 6),两次 ExtMalloc 可能落在同一块里 —— -X -H 时胶囊区和队列
+	 * 各分配一次,队列的 umem 实际指到了胶囊区,网卡的 CQE 全写错地方。
+	 * q_mem 为空时自己分配(-X 不配 -H 时它是第一次 ExtMalloc,没有这个问题)。
+	 */
+	void		*q_mem;
+	int		q_fd;
+	size_t		q_off;
 };
 
 /* 失败返回非 0 并打印原因;成功时把 ctx 里和队列、MR 有关的字段全部填好 */
