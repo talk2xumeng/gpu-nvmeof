@@ -68,28 +68,64 @@ if ! $RPC rpc_get_methods 2>/dev/null | grep -q bdev_kv_emu_create; then
     exit 1
 fi
 
+# 先查后建:已经有的对象不再发创建 RPC。否则重复执行时 kv_tgt 日志里
+# 会刷一串 "already exists" / "Unable to remove namespace" 的 *ERROR*,
+# 看着像出错,实际无害,但会盖住真正的问题。
+have() {	# have <transport|bdev|subsys|ns|listener> <名字> [<nqn>]
+    python3 -c '
+import json, sys
+kind, name, nqn, tj, bj, sj = sys.argv[1:7]
+t, b, s = json.loads(tj), json.loads(bj), json.loads(sj)
+sub = next((x for x in s if x["nqn"] == (nqn or name)), None)
+ok = {
+    "transport": any(x.get("trtype", "").upper() == name.upper() for x in t),
+    "bdev":      any(x["name"] == name for x in b),
+    "subsys":    sub is not None,
+    "ns":        sub is not None and any(n["bdev_name"] == name
+                                         for n in sub.get("namespaces", [])),
+    "listener":  sub is not None and any(a.get("traddr") == name
+                                         for a in sub.get("listen_addresses", [])),
+}[kind]
+sys.exit(0 if ok else 1)
+' "$1" "$2" "${3:-}" "$T_JSON" "$B_JSON" "$S_JSON"
+}
+refresh() {
+    T_JSON=$($RPC nvmf_get_transports 2>/dev/null || echo '[]')
+    B_JSON=$($RPC bdev_get_bdevs 2>/dev/null || echo '[]')
+    S_JSON=$($RPC nvmf_get_subsystems 2>/dev/null || echo '[]')
+}
+refresh
+
 # -i 131072:单条命令最大 128 KiB,和 setup_target.sh 一致;
 # value 更大时要同时调大这里和 initiator 侧的 -b
-$RPC nvmf_create_transport -t RDMA -u 8192 -i 131072 >/dev/null 2>&1 || true
+have transport RDMA || $RPC nvmf_create_transport -t RDMA -u 8192 -i 131072
 
-kvrpc bdev_kv_emu_create "{\"name\": \"$BDEV\", \"capacity_mb\": $KV_MB, \
-\"max_value\": $KV_MAXVAL, \"ednek\": $([ "$KV_EDNEK" = 1 ] && echo true || echo false)}" \
-    || echo "($BDEV 可能已存在)"
+have bdev $BDEV || kvrpc bdev_kv_emu_create "{\"name\": \"$BDEV\", \"capacity_mb\": $KV_MB, \
+\"max_value\": $KV_MAXVAL, \"ednek\": $([ "$KV_EDNEK" = 1 ] && echo true || echo false)}" >/dev/null
 
-# 新建的 subsystem 里没有 ns 1,remove 会报 Invalid parameters(rpc.py 打在
-# stdout 上),属正常 —— 一并静音
 add_subsys() {	# nqn serial bdev
-    $RPC nvmf_create_subsystem $1 -a -s $2 >/dev/null 2>&1 || true
-    $RPC nvmf_subsystem_remove_ns $1 1 >/dev/null 2>&1 || true
-    $RPC nvmf_subsystem_add_ns $1 $3
-    $RPC nvmf_subsystem_add_listener $1 -t rdma -a $TARGET_IP -s 4420 >/dev/null 2>&1 || true
+    refresh
+    have subsys $1 || $RPC nvmf_create_subsystem $1 -a -s $2
+    refresh
+    if ! have ns $3 $1; then
+        # 挂的是别的 bdev:先摘掉 ns 1 再挂(ns 1 不存在时 remove 会报错,先判断)
+        if echo "$S_JSON" | python3 -c 'import json,sys
+n=sys.argv[1]; d=json.load(sys.stdin)
+sys.exit(0 if any(x["nqn"]==n and any(z["nsid"]==1 for z in x.get("namespaces",[])) for x in d) else 1)' $1; then
+            $RPC nvmf_subsystem_remove_ns $1 1
+        fi
+        $RPC nvmf_subsystem_add_ns $1 $3
+    fi
+    have listener $TARGET_IP $1 || \
+        $RPC nvmf_subsystem_add_listener $1 -t rdma -a $TARGET_IP -s 4420
 }
 
 add_subsys $NQN SPDK00000000000001 $BDEV
 echo "KV : $NQN -> $BDEV (kv_emu, ${KV_MB} MiB, value <= $KV_MAXVAL B)"
 
 if [ "$NVM_NQN" != none ]; then
-    $RPC bdev_malloc_create -b $NVM_BDEV $NVM_MB 512 >/dev/null 2>&1 || true
+    refresh
+    have bdev $NVM_BDEV || $RPC bdev_malloc_create -b $NVM_BDEV $NVM_MB 512 >/dev/null
     add_subsys $NVM_NQN SPDK00000000000002 $NVM_BDEV
     echo "NVM: $NVM_NQN -> $NVM_BDEV (malloc, ${NVM_MB} MiB,对照用)"
 fi

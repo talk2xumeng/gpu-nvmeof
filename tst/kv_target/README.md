@@ -190,6 +190,35 @@ TCP 和 RDMA 走的是同一段 `nvmf_ctrlr_process_io_cmd`,补丁和 bdev 与�
 - **QD 4 × 64 KiB**:100 条用了 1182 µs,约 5.5 GB/s。QD 和单 poller 都是限制
   因素,这个数不代表上限。
 
+### 2026-10-15,KV vs NVM 延迟对照(`make kv-vs-nvm`,优化前)
+
+- 链路:mx-decode-02 → mx-prefill-02
+- 后端:KV 是 kv_emu,NVM 是 malloc
+- 运行方式:QD 1,每次 100 条,重复 3 次,取各次 p50 的中位数,单位 us
+
+| 大小 | read | retrieve | Δ | write | store | Δ |
+|---|---|---|---|---|---|---|
+| 4K | 21.0 | 20.7 | −0.3 | 24.5 | 26.9 | +2.4 |
+| 64K | 29.4 | 32.1 | +2.7 | 31.6 | 54.5 | +22.9 |
+| 128K | 35.6 | 40.8 | +5.2 | 39.6 | 83.9 | +44.3 |
+
+Exist(无数据)总计 20.7 us。
+
+这组数据拆开看,差值有两个来源:
+
+- **GPU 侧的固定开销**:poller 处理一条响应时,KV 比 NVM 多 0.65–1.1 us。
+  这部分就是多读一次 DW0 的代价。QD 1 时它被 C1 的检测下限盖住了,在总计里
+  看不出来。
+- **随大小增长的部分,来自模拟器,不是 KV 协议本身**:
+  - Store 每 KB 多约 340 ns。原因是 kv_emu 当时用 glibc 的 malloc 分配 value,
+    ≥128 KiB 时走的是 mmap,每次还要付首次触碰的缺页和 munmap。
+  - Retrieve 每 KB 多约 40 ns,来自从普通页拷贝。
+
+针对这两点做了修改,修改后的数据等重跑:
+
+- kv_emu 改成 hugepage 分级池,Delete 和覆盖时把 value 缓冲还回池里。
+- poller 只在 Retrieve 时读 DW0。
+
 ## 踩到的坑
 
 **keep-alive 超时**:CPU 侧逐个 Store 几百个 key 时,如果只轮询 I/O qpair,
@@ -202,6 +231,13 @@ admin 队列上的 keep-alive 发不出去。target 会在 KATO(默认 10 s)后�
 进去、bdev 函数全靠桩,补丁新用的 `spdk_bdev_get_module_name` 没有桩,
 `make` 在 test/unit 报 undefined reference(库和 nvmf_tgt 其实已经编好)。
 `apply_kv_patch.sh` 现在会顺带给这两个测试加桩,两者链接通过、全部用例通过。
+
+**target 重启后 RoCE 连不上(ARP flux)**:现象是 initiator 报
+`RDMA connect error -99`,kv_tgt 一条日志都没有,但 ping 能通且 ttl=63。
+查 `ip neigh` 发现,172.16.3.8 解析到的是 target 另一张网卡(ens100np0)的 MAC。
+IP 层不挑入口所以照样能通;RoCE 的建连报文却被送到一张没有这个 GID 的卡上,
+直接丢了。修复办法是在 target 上设 `arp_ignore=1` 和 `arp_announce=2`,
+再清掉 initiator 上旧的 ARP 表项。详见 `docs/kv-runbook.md` 第六节。
 
 **`spdk_event_mempool creation failed`**:DPDK 是 .so 时,
 `librte_mempool_ring` 里只有构造函数。链接时如果开着 `--as-needed`,它会被

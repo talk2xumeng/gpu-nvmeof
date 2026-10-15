@@ -85,8 +85,8 @@ struct gpu_io_ctx {
 	/*
 	 * ---- KV 命令集(wqe_build.h 的 nvme_build_kv_sqe) ----
 	 * kv = 1 时 nvme_opc 是 KV opcode,第 j 条用 key blk_kv_key(kv_seed,
-	 * start + j)、显存第 j 块;poller 额外把响应的 CQE DW0 收进 tag
-	 * (Retrieve 的 value 长度)。kv = 0 时这几个字段不读,读写路径不变。
+	 * start + j)、显存第 j 块;Retrieve 时 poller 额外把响应的 CQE DW0
+	 * (value 长度)收进 tag。kv = 0 时这几个字段不读,读写路径不变。
 	 */
 	uint8_t			kv;
 	uint8_t			kv_klen;	/* 1..16 */

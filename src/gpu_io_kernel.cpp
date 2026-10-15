@@ -128,8 +128,12 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		ncqe = c->rsp_dev + (addr - c->rsp_host_base);
 	}
 	w = *(volatile uint64_t *)(ncqe + 8);
-	/* 多一次主存读(~0.7 us),所以只在 KV 模式下读 */
-	if (c->kv) {
+	/*
+	 * DW0 多一次主存读,实测每条响应 +0.65~1.1 us(KV vs NVM 对照)。只有
+	 * Retrieve 的 DW0 有内容(value 长度),Store/Exist/Delete 不读。
+	 * 没有并成一次 16 字节读:recv buffer 按 40 字节间隔排,不保证 16 对齐。
+	 */
+	if (c->kv && c->nvme_opc == NVME_KV_OPC_RETRIEVE) {
 		dw0 = *(volatile uint32_t *)ncqe;
 	}
 	/* NVMe CQE 小端:[8]sqhd [10]sqid [12]cid [14]status */

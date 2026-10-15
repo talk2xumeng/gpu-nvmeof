@@ -145,7 +145,43 @@ kv_emu 这个 bdev 生效,对其他 bdev 的行为一字不差。
 
 ---
 
-## 六、出问题时先查
+## 六、target 重启之后
+
+重启会丢掉三样东西,kv_tgt 起不来或者连不上,先把这三项补上。
+
+```bash
+# 1. hugepage(容器里是 root,没有 sudo)。kv_tgt 起不来、报
+#    "No free 2048 kB hugepages" 就是缺这一项
+echo 16384 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+
+# 2. ARP(宿主机上)。target 有多张网卡,默认 arp_ignore=0 时任何口都会
+#    回答本机任意 IP 的 ARP —— 172.16.3.8 可能被 ens100np0(mlx5_2)抢答。
+#    IP 照样通(ping 的 ttl 会变成 63),RoCE 建连却超时(initiator 报
+#    RDMA connect error -99,kv_tgt 一条日志都没有)
+sudo sysctl -w net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.arp_announce=2
+#    持久化:
+echo -e "net.ipv4.conf.all.arp_ignore=1\nnet.ipv4.conf.all.arp_announce=2" | \
+    sudo tee /etc/sysctl.d/90-rdma-arp.conf
+
+# 3. 容器如果是新建的,重做一次性准备里的 ldconfig
+```
+
+然后到 initiator 上清掉旧的 ARP 表项,并确认:
+
+```bash
+ip neigh del 172.16.3.8 dev ens3np0
+ping -c2 172.16.3.8               # ttl 应为 64
+ip neigh show 172.16.3.8          # MAC 应为 94:6d:ae:e4:1a:9e(ens10np0)
+make run-kv-smoke
+```
+
+两边的 RoCE 模式和 GID 都检查过,重启后不会变:`cma_roce_mode` 都是 v2,
+`show_gids` 里有 v2 的条目。如果以后又怀疑这里,可以用下面的命令看:
+`sudo cma_roce_mode -d mlx5_0 -p 1`、`show_gids mlx5_0`。
+
+---
+
+## 七、出问题时先查
 
 | 现象 | 原因 / 处理 |
 |---|---|
@@ -157,3 +193,5 @@ kv_emu 这个 bdev 生效,对其他 bdev 的行为一字不差。
 | GPU 侧报 `SC=0x02` 或 `0x86` | key 长度字段不对。把输出里的 `[胶囊]` dump 拿出来看 |
 | CPU 侧准备阶段出现 `CQ transport error -6` | keep-alive 超时,target 把连接断了。确认 initiator 用的是最新代码 |
 | `-r` 超过 127 时报「超过挂着的 recv 数」 | 还没做 C2(kernel 补 recv),目前单次运行的上限就是 127 |
+| `RDMA connect error -99`,ping 却能通、ttl=63 | ARP 被别的网口抢答,见第六节 |
+| kv_tgt 启动报 `No free 2048 kB hugepages` | 重启后 hugepage 没了,见第六节 |

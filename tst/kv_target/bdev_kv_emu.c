@@ -21,8 +21,13 @@
  * 不做的:压缩、Key Per I/O(CDW13)、Identify 里的 KV 数据结构 ——
  * nvmf 仍按 NVM namespace 报 Identify,host 侧不读它,对 GPU 路径无影响。
  *
- * 并发:一把互斥锁保护整张表。这是测试桩,不追求性能;value 的拷贝
- * 在锁内做,保证 Store/Delete 对单个 pair 原子(spec §2.1.4)。
+ * 并发:一把互斥锁保护整张表。Store 的数据在锁外收进新缓冲,锁内只换
+ * 指针;Retrieve 在锁内拷出 —— 保证 Store/Delete 对单个 pair 原子(spec §2.1.4)。
+ *
+ * value 缓冲:按 2 的幂分级的池,底层是 hugepage(spdk_dma_malloc),
+ * Delete / 覆盖时还回池里,不 free。早先直接用 glibc malloc,64–128 KiB
+ * 的 value 每次 Store 都走 mmap + 首次触碰缺页 + munmap,KV vs NVM 对照
+ * 里 Store 比 Write 多出 ~340 ns/KB —— 那是模拟器的代价,不是 KV 的。
  *
  * RPC:
  *   bdev_kv_emu_create   {name, capacity_mb?, max_value?, ednek?}
@@ -32,6 +37,7 @@
 
 #include "spdk/stdinc.h"
 #include "spdk/bdev_module.h"
+#include "spdk/env.h"
 #include "spdk/json.h"
 #include "spdk/jsonrpc.h"
 #include "spdk/log.h"
@@ -72,9 +78,22 @@ struct kv_ent {
 	uint8_t		*val;
 };
 
+/* value 池:第 c 级缓冲大小 = 1 << (KV_POOL_MIN_SHIFT + c) */
+#define KV_POOL_MIN_SHIFT	12		/* 4 KiB 起 */
+#define KV_POOL_NCLASS		21		/* 到 4 GiB,远超 max_value */
+
+struct kv_pool {
+	pthread_mutex_t		lock;
+	void			*free[KV_POOL_NCLASS];	/* 空闲链,next 指针存在缓冲开头 */
+	uint64_t		bytes;		/* 已从 hugepage 取出的总量(含空闲) */
+	uint64_t		hits;		/* 从空闲链复用的次数 */
+	uint64_t		misses;		/* 新分配的次数 */
+};
+
 struct kv_emu {
 	struct spdk_bdev	bdev;
 	pthread_mutex_t		lock;
+	struct kv_pool		pool;
 	struct kv_ent		**bucket;
 	uint64_t		capacity;	/* 字节,key + value 都计入(NSZE/NUSE 语义) */
 	uint64_t		used;
@@ -128,6 +147,91 @@ kv_find(struct kv_emu *d, const uint8_t *key, uint8_t klen)
 		}
 	}
 	return NULL;
+}
+
+/* ================================================================== */
+/* value 池                                                            */
+/* ================================================================== */
+
+static int
+kv_pool_class(uint32_t len)
+{
+	int c = 0;
+
+	while (((uint64_t)1 << (KV_POOL_MIN_SHIFT + c)) < len) {
+		c++;
+	}
+	return c < KV_POOL_NCLASS ? c : -1;
+}
+
+/* len = 0 返回 NULL(零长度 value 不占缓冲),失败也返回 NULL,用 *ok 区分 */
+static uint8_t *
+kv_val_alloc(struct kv_emu *d, uint32_t len, bool *ok)
+{
+	int c;
+	void *p;
+
+	*ok = true;
+	if (len == 0) {
+		return NULL;
+	}
+	c = kv_pool_class(len);
+	if (c < 0) {
+		*ok = false;
+		return NULL;
+	}
+	pthread_mutex_lock(&d->pool.lock);
+	p = d->pool.free[c];
+	if (p) {
+		d->pool.free[c] = *(void **)p;
+		d->pool.hits++;
+	}
+	pthread_mutex_unlock(&d->pool.lock);
+	if (p) {
+		return p;
+	}
+	/* hugepage 内存:已经映射、钉住,没有首次触碰缺页 */
+	p = spdk_dma_malloc((size_t)1 << (KV_POOL_MIN_SHIFT + c), 64, NULL);
+	if (!p) {
+		*ok = false;
+		return NULL;
+	}
+	pthread_mutex_lock(&d->pool.lock);
+	d->pool.bytes += (uint64_t)1 << (KV_POOL_MIN_SHIFT + c);
+	d->pool.misses++;
+	pthread_mutex_unlock(&d->pool.lock);
+	return p;
+}
+
+static void
+kv_val_free(struct kv_emu *d, uint8_t *p, uint32_t len)
+{
+	int c;
+
+	if (!p) {
+		return;
+	}
+	c = kv_pool_class(len);
+	pthread_mutex_lock(&d->pool.lock);
+	*(void **)p = d->pool.free[c];
+	d->pool.free[c] = p;
+	pthread_mutex_unlock(&d->pool.lock);
+}
+
+static void
+kv_pool_destroy(struct kv_pool *pool)
+{
+	int c;
+
+	for (c = 0; c < KV_POOL_NCLASS; c++) {
+		void *p = pool->free[c], *n;
+
+		for (; p; p = n) {
+			n = *(void **)p;
+			spdk_dma_free(p);
+		}
+	}
+	pthread_mutex_destroy(&pool->lock);
 }
 
 /* ================================================================== */
@@ -189,8 +293,10 @@ kv_store(struct kv_emu *d, struct kv_req *r)
 {
 	uint32_t vs = r->cdw10;
 	struct kv_ent **pp, *e;
-	uint8_t *val;
+	uint8_t *val, *old = NULL;
+	uint32_t old_len = 0;
 	uint64_t need;
+	bool ok;
 
 	if (vs > d->max_value) {
 		return KV_SC_INVALID_VALUE_SIZE;
@@ -200,9 +306,9 @@ kv_store(struct kv_emu *d, struct kv_req *r)
 		return SPDK_NVME_SC_INVALID_FIELD;
 	}
 	/* 锁外先把数据收下来;锁内只做替换,保证原子 */
-	val = malloc(vs ? vs : 1);
-	if (!val) {
-		return SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
+	val = kv_val_alloc(d, vs, &ok);
+	if (!ok) {
+		return KV_SC_CAPACITY_EXCEEDED;	/* hugepage 用完 */
 	}
 	iov_to_buf(val, vs, r->iov, r->iovcnt);
 
@@ -210,29 +316,30 @@ kv_store(struct kv_emu *d, struct kv_req *r)
 	pp = kv_find(d, r->key, r->klen);
 	if (pp && (r->cdw11 & KV_STORE_SINKE)) {
 		pthread_mutex_unlock(&d->lock);
-		free(val);
+		kv_val_free(d, val, vs);
 		return KV_SC_KEY_EXISTS;
 	}
 	if (!pp && (r->cdw11 & KV_STORE_SIKE)) {
 		pthread_mutex_unlock(&d->lock);
-		free(val);
+		kv_val_free(d, val, vs);
 		return KV_SC_KEY_NOT_EXIST;
 	}
 	need = (uint64_t)r->klen + vs;
 	if (d->used - (pp ? (*pp)->klen + (*pp)->vlen : 0) + need > d->capacity) {
 		pthread_mutex_unlock(&d->lock);
-		free(val);
+		kv_val_free(d, val, vs);
 		return KV_SC_CAPACITY_EXCEEDED;
 	}
 	if (pp) {
 		e = *pp;
 		d->used -= e->vlen;
-		free(e->val);
+		old = e->val;		/* 锁外还给池 */
+		old_len = e->vlen;
 	} else {
 		e = calloc(1, sizeof(*e));
 		if (!e) {
 			pthread_mutex_unlock(&d->lock);
-			free(val);
+			kv_val_free(d, val, vs);
 			return SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
 		}
 		e->klen = r->klen;
@@ -246,6 +353,7 @@ kv_store(struct kv_emu *d, struct kv_req *r)
 	e->vlen = vs;
 	d->used += vs;
 	pthread_mutex_unlock(&d->lock);
+	kv_val_free(d, old, old_len);
 	return 0;
 }
 
@@ -296,7 +404,7 @@ kv_delete(struct kv_emu *d, struct kv_req *r)
 	d->used -= e->klen + e->vlen;
 	d->nkeys--;
 	pthread_mutex_unlock(&d->lock);
-	free(e->val);
+	kv_val_free(d, e->val, e->vlen);
 	free(e);
 	return 0;
 }
@@ -431,12 +539,15 @@ kv_emu_free(struct kv_emu *d)
 
 			for (; e; e = n) {
 				n = e->next;
-				free(e->val);
+				if (e->val) {
+					spdk_dma_free(e->val);
+				}
 				free(e);
 			}
 		}
 		free(d->bucket);
 	}
+	kv_pool_destroy(&d->pool);
 	pthread_mutex_destroy(&d->lock);
 	free(d->bdev.name);
 	free(d);
@@ -536,6 +647,7 @@ kv_emu_create(const char *name, uint64_t capacity, uint32_t max_value,
 		return -ENOMEM;
 	}
 	pthread_mutex_init(&d->lock, NULL);
+	pthread_mutex_init(&d->pool.lock, NULL);
 	d->bucket = calloc(KV_EMU_NBUCKET, sizeof(*d->bucket));
 	d->bdev.name = strdup(name);
 	if (!d->bucket || !d->bdev.name) {
@@ -676,6 +788,13 @@ rpc_bdev_kv_emu_stats(struct spdk_jsonrpc_request *request,
 	spdk_json_write_named_uint64(w, "used_bytes", d->used);
 	pthread_mutex_unlock(&d->lock);
 	spdk_json_write_named_uint64(w, "capacity", d->capacity);
+	pthread_mutex_lock(&d->pool.lock);
+	spdk_json_write_named_object_begin(w, "value_pool");
+	spdk_json_write_named_uint64(w, "hugepage_bytes", d->pool.bytes);
+	spdk_json_write_named_uint64(w, "reused", d->pool.hits);
+	spdk_json_write_named_uint64(w, "allocated", d->pool.misses);
+	spdk_json_write_object_end(w);
+	pthread_mutex_unlock(&d->pool.lock);
 	for (i = 0; i < SPDK_COUNTOF(ops); i++) {
 		spdk_json_write_named_object_begin(w, ops[i].name);
 		spdk_json_write_named_uint64(w, "count", d->cnt[ops[i].opc]);
