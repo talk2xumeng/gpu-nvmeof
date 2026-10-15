@@ -35,6 +35,8 @@
  *                        bit16(=0x10000) 旧行为:不加默认的 0x7000(对照用)
  *                        bit17(=0x20000) 剖析:提交路径、poller 每圈分段计时
  *                        bit18(=0x40000) BlueFlame 只回读 1 次(WQE 在寄存器里构造)
+ *                        bit19(=0x80000) BF 写满 64 字节,bit20(=0x100000) BF 两块轮换,
+ *                        bit21(=0x200000) 写 BF 前空等 ~3.6 us(这三位配 0x8000/0x40000)
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -683,6 +685,25 @@ qp_attach(struct qp_hw *h, struct gpu_io_ctx *ctx, unsigned q)
 	if (v) {
 		printf("[映射] RQ/SQ/CQ/dbrec/UAR 均已交给 GPU\n");
 	}
+	/*
+	 * BlueFlame 另一半(-O 0x100000 用):页内偏移和 bf.size 异或。单独映射,
+	 * 失败就不轮换,不影响默认路径。
+	 */
+	ctx->bf_alt = NULL;
+	if ((g_opt & GIO_OPT_BFTOG) && h->dvq.bf.size) {
+		uintptr_t r = (uintptr_t)h->dvq.bf.reg;
+		void *alt = (void *)((r & ~(uintptr_t)4095) |
+				     ((r & 4095) ^ h->dvq.bf.size));
+		void *d_alt = NULL;
+
+		if (gpu_map_host(alt, h->dvq.bf.size, MC_HOST_REGISTER_IO_MEMORY |
+				 MC_HOST_REGISTER_MAPPED, &d_alt) == 0) {
+			ctx->bf_alt = (volatile uint64_t *)d_alt;
+		}
+		printf("[BF] reg=%p size=%u 另一半=%p -> %p%s\n", h->dvq.bf.reg,
+		       h->dvq.bf.size, alt, d_alt,
+		       ctx->bf_alt ? "" : "(映射失败,不轮换)");
+	}
 
 	ctx->sq_buf       = (volatile uint8_t *)d_sq;
 	ctx->qp_dbrec     = (volatile uint32_t *)d_dbrec;
@@ -906,6 +927,11 @@ main(int argc, char **argv)
 	}
 	if (g_qd > g_rounds / g_nq) {
 		g_qd = g_rounds / g_nq;
+	}
+	if ((g_opt & (GIO_OPT_BF64 | GIO_OPT_BFTOG | GIO_OPT_BFDLY)) &&
+	    !(g_opt & (0x8000 | GIO_OPT_BF1))) {
+		fprintf(stderr, "-O 0x80000/0x100000/0x200000 要配 0x8000 或 0x40000\n");
+		return 1;
 	}
 	if (g_nq > 1 && (g_opt & 0x200)) {
 		fprintf(stderr, "-O 512(胶囊槽轮换)不支持多 QP\n");

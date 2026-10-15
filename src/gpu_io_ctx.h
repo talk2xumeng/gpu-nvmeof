@@ -114,6 +114,12 @@ struct gpu_io_ctx {
 	 * LBA / key / 显存块 / 逐条统计数组都按全局序号取。单 QP 时 job_base = 0。
 	 */
 	uint32_t		job_base;
+
+	/*
+	 * BlueFlame 的另一半(rdma-core 每次 post 在 bf.reg 和 reg ^ bf.size
+	 * 两块之间轮换)。-O 0x100000 时按 pi 奇偶轮换;映射失败为 NULL。
+	 */
+	volatile uint64_t	*bf_alt;
 };
 
 /*
@@ -176,6 +182,18 @@ struct gio_shared {
  * posted 写。默认路径回读 4 次(~6 us);0x8000 不读(等待变长)。
  */
 #define GIO_OPT_BF1	0x40000u
+/*
+ * BlueFlame 写法对照(须配 0x8000 或 0x40000,即寄存器构造 WQE 的路径)。
+ * 0x8000 / 0x40000 提交快了,门铃→完成却慢 ~2.8 us,下面三位用来找原因:
+ *   0x80000   BF 写满 64 字节(后 32 字节补 0)。mlx5 的 BF 以 64 字节为
+ *             单位,rdma-core 的 mlx5_bf_copy 也是按 64 字节写;我们只写 32
+ *   0x100000  BF 两块缓冲按 pi 奇偶轮换,同 rdma-core
+ *   0x200000  写 BF 前空等 ~4096 个时钟(~3.6 us),不读主存 —— 看慢的
+ *             原因是"读"还是"时间"
+ */
+#define GIO_OPT_BF64	0x80000u
+#define GIO_OPT_BFTOG	0x100000u
+#define GIO_OPT_BFDLY	0x200000u
 #define GIO_PF_TAG	0	/* 写 tag 的 job/state(两次 fence) */
 #define GIO_PF_LOCK	1	/* 抢 SQ 锁 */
 #define GIO_PF_PI	2	/* 读共享 sq_pi(fence) */

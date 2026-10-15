@@ -695,8 +695,22 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 			/* 一次主存读,把前面的 WQE / dbrec 写推到主存 */
 			(void)*(volatile uint64_t *)sq_slot;
 		}
+		if (c->opt & GIO_OPT_BFDLY) {
+			uint64_t t0 = clock64();
+
+			while (clock64() - t0 < 4096) {
+			}
+		}
+		if ((c->opt & GIO_OPT_BFTOG) && (pi & 1) && c->bf_alt) {
+			bfp = c->bf_alt;
+		}
 		for (w = 0; w < 4; w++) {
 			bfp[w] = w64[w];
+		}
+		if (c->opt & GIO_OPT_BF64) {
+			for (w = 4; w < 8; w++) {
+				bfp[w] = 0;
+			}
 		}
 		WQE_FENCE_DB();
 		pf_mark(pf, GIO_PF_BF, pt);
