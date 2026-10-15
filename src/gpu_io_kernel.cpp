@@ -704,10 +704,15 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 		if ((c->opt & GIO_OPT_BFTOG) && (pi & 1) && c->bf_alt) {
 			bfp = c->bf_alt;
 		}
-		for (w = 0; w < 4; w++) {
-			bfp[w] = w64[w];
+		if (c->opt & GIO_OPT_DB8) {
+			/* 普通门铃:只写控制段前 8 字节,网卡从 SQ 取 WQE */
+			bfp[0] = w64[0];
+		} else {
+			for (w = 0; w < 4; w++) {
+				bfp[w] = w64[w];
+			}
 		}
-		if (c->opt & GIO_OPT_BF64) {
+		if (!(c->opt & GIO_OPT_DB8) && (c->opt & GIO_OPT_BF64)) {
 			for (w = 4; w < 8; w++) {
 				bfp[w] = 0;
 			}

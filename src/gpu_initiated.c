@@ -38,6 +38,7 @@
  *                        bit19(=0x80000) BF 写满 64 字节,bit20(=0x100000) BF 两块轮换,
  *                        bit21(=0x200000) 写 BF 前空等 ~3.6 us(这三位配 0x8000/0x40000)
  *                        bit22(=0x400000) 默认路径的 4 次回读并发发出(不配 0x8000)
+ *                        bit23(=0x800000) 只敲门铃(写 8 字节,不送 BF 数据),配 0x8000/0x40000
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -929,9 +930,10 @@ main(int argc, char **argv)
 	if (g_qd > g_rounds / g_nq) {
 		g_qd = g_rounds / g_nq;
 	}
-	if ((g_opt & (GIO_OPT_BF64 | GIO_OPT_BFTOG | GIO_OPT_BFDLY)) &&
+	if ((g_opt & (GIO_OPT_BF64 | GIO_OPT_BFTOG | GIO_OPT_BFDLY |
+		      GIO_OPT_DB8)) &&
 	    !(g_opt & (0x8000 | GIO_OPT_BF1))) {
-		fprintf(stderr, "-O 0x80000/0x100000/0x200000 要配 0x8000 或 0x40000\n");
+		fprintf(stderr, "-O 0x80000/0x100000/0x200000/0x800000 要配 0x8000 或 0x40000\n");
 		return 1;
 	}
 	if (g_nq > 1 && (g_opt & 0x200)) {

@@ -195,13 +195,18 @@ struct gio_shared {
 #define GIO_OPT_BFTOG	0x100000u
 #define GIO_OPT_BFDLY	0x200000u
 /*
- * 实测这台机器上 SPDK 的 QP 没有 BlueFlame(dvq.bf.size = 0,MLNX_OFED
- * 24.10 的 rdma-core,MLX5_SHUT_UP_BF / MLX5_TOTAL_UUARS 都不改变):写 bf.reg
- * 只是敲门铃,网卡总从主存 SQ 取 WQE。不回读时网卡取得慢 ~2.8 us(读 1 次、
- * 空等都不行,要把整个 WQE 读回),所以回读要留着。
- * 0x400000:4 次回读先全部发出再写门铃,让 4 次主存读重叠。
+ * 0x400000:4 次回读先全部发出再写门铃(实测回读耗时不变,等待反而变长)。
+ * 0x800000:普通门铃 —— 只往 bf.reg 写控制段前 8 字节(rdma-core 不用 BF
+ *           时的写法),网卡从主存 SQ 取 WQE。配 0x8000(不回读)或
+ *           0x40000(回读 1 次)。
+ *
+ * BF 对照(QD1,2026-10-15,QP 有 BF:bf.size = 256):回读 4 次时 4 个 8 字节
+ * BF 写之间各隔 ~1.5 us,网卡最快(等待 8.1);4 个写紧挨着发(不回读 /
+ * 回读后集中写)等待 ~11;写满 64 字节 9.3;轮换、空等无效。像是网卡在
+ * 等一个不完整的 BF 块,超时后才回退去 SQ 取 —— 所以试只敲门铃。
  */
 #define GIO_OPT_RBPAR	0x400000u
+#define GIO_OPT_DB8	0x800000u
 #define GIO_PF_TAG	0	/* 写 tag 的 job/state(两次 fence) */
 #define GIO_PF_LOCK	1	/* 抢 SQ 锁 */
 #define GIO_PF_PI	2	/* 读共享 sq_pi(fence) */
