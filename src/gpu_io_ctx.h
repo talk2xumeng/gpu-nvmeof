@@ -149,7 +149,22 @@ struct gio_shared {
 	/* C2:当前消费者(poller / 持 cq_lock 者 / 串行快路径)独占读写 */
 	uint32_t	rq_head;
 	uint32_t	rq_reposted;
+	uint32_t	rq_pending;	/* opt 0x1000:已写槽、还没推 dbrec 的个数 */
+	uint32_t	rq_flushes;	/* 推 dbrec[0] 的次数 */
+	uint32_t	cq_ci_written;	/* opt 0x2000:最近一次写进 CQ dbrec 的 ci */
+	uint32_t	cq_db_writes;	/* 写 CQ dbrec 的次数 */
 };
+
+/*
+ * poller 降本(C3 前置)。各自一个 opt 位,便于逐项对照:
+ *   0x1000  RQ 批量补:攒 GIO_RQ_BATCH 个或空闲时才 fence + 推 dbrec[0]
+ *   0x2000  CQ ci 懒更新:每 GIO_CQ_BATCH 个 CQE 或空闲时才写 CQ dbrec,不 fence
+ *   0x4000  SEND 选择性 signal:每 GIO_SIG_EVERY 条才要 CQE
+ *   0x8000  WQE 在寄存器里构造,不从主存 SQ 槽回读再写 BlueFlame
+ */
+#define GIO_RQ_BATCH	16
+#define GIO_CQ_BATCH	32
+#define GIO_SIG_EVERY	32
 
 /* 每个 tag(= submitter 线程)一项,放显存 */
 struct gio_tag {

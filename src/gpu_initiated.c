@@ -25,6 +25,10 @@
  *                        bit10(=1024) 旧式 cid 0xE000|j(仅 QD=1),
  *                        bit11(=2048) 不补 recv(C1 行为,对照用;
  *                        此时 -r 不能超过挂着的 recv 数 ~127)
+ *                        poller 降本(C3 前置,可组合,0xF000 全开):
+ *                        bit12(=0x1000) RQ 批量补,bit13(=0x2000) CQ ci 懒更新,
+ *                        bit14(=0x4000) SEND 选择性 signal,
+ *                        bit15(=0x8000) WQE 寄存器构造、不回读 SQ 槽
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -1094,6 +1098,20 @@ main(int argc, char **argv)
 		g_qd = rq_posted - 1;
 		printf("[QD] 超过 queue size,降为 %u\n", g_qd);
 	}
+	/*
+	 * 批量补 recv 期间在飞的 recv 最少少 GIO_RQ_BATCH 个;CQ ci 懒更新时
+	 * 网卡眼里的未消费 CQE 最多多 GIO_CQ_BATCH 个,每条 I/O 最多 2 个 CQE。
+	 * 这两种情况都要再压 QD,否则响应无处安放 / CQ 溢出。
+	 */
+	if ((g_opt & 0x1000) && g_qd > rq_posted - 1 - GIO_RQ_BATCH) {
+		g_qd = rq_posted - 1 - GIO_RQ_BATCH;
+		printf("[QD] RQ 批量补(0x1000)要留余量,降为 %u\n", g_qd);
+	}
+	if ((g_opt & 0x2000) &&
+	    2 * g_qd + GIO_CQ_BATCH >= dvc.cqe_cnt) {
+		g_qd = (dvc.cqe_cnt - GIO_CQ_BATCH) / 2 - 1;
+		printf("[QD] CQ ci 懒更新(0x2000)要留余量,降为 %u\n", g_qd);
+	}
 	ctx.qd = g_qd;
 	ctx.opt = g_opt;
 	ctx.njobs = g_rounds;
@@ -1466,6 +1484,12 @@ main(int argc, char **argv)
 			printf("  *** RQ 补充数(%u)和响应数(%u)对不上 ***\n",
 			       sh.rq_reposted, sh.cqe_resp);
 		}
+		if (cq_now != ctx.cq_ci + sh.cqe_req + sh.cqe_resp) {
+			printf("  *** CQ dbrec 没补齐:%u,期望 %u ***\n", cq_now,
+			       ctx.cq_ci + sh.cqe_req + sh.cqe_resp);
+		}
+		printf("[dbrec] 推 RQ dbrec %u 次,写 CQ dbrec %u 次;SEND 要了 CQE 的 %u 条\n",
+		       sh.rq_flushes, sh.cq_db_writes, sh.cqe_req);
 	}
 
 	/*

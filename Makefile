@@ -23,6 +23,7 @@
 #   make run-gpu-kv-store      GPU Store + 另起进程逐块回读
 #   make run-gpu-kv-exist      GPU Exist(只看状态)
 #   make run-gpu-kv-delete     GPU Delete + 另起进程确认全部不存在
+#   make qd-sweep              QD 扫描(IOPS/带宽/延迟),OPTS 对照,见 scripts/qd_sweep.sh
 #   make kv-vs-nvm             KV vs NVM 读写延迟对照(同一 target,QD 1,
 #                              SIZES/REPEAT 可调,见 tst/kv_target/kv_vs_nvm.sh)
 #
@@ -115,7 +116,7 @@ LDFLAGS    := $(SPDK_LIBS) $(SYS_LIBS) $(GPU_LIBS) $(RDMA_LIBS) $(EXTRA_LIBS)
         run-gpu-initiated run-gpu-read-verify run-gpu-write-verify \
         tst pit7-matrix pit7-bench help kv-tgt kv-smoke run-kv-smoke \
         run-gpu-kv-retrieve run-gpu-kv-store run-gpu-kv-exist run-gpu-kv-delete \
-        kv-vs-nvm
+        kv-vs-nvm qd-sweep
 
 # 实验程序也在 all 里:src/ 改动若让它们编不过,当场就能发现,
 # 而不是等回头复现时才知道(坑 4)。
@@ -279,6 +280,17 @@ run-gpu-kv-exist: $(BIN)/gpu_initiated
 run-gpu-kv-delete: $(BIN)/gpu_initiated
 	-sudo ./$(GKV) -D
 	sudo ./$(GKV) -V -D
+
+# QD 扫描。默认对 cnode2(malloc)跑 4K 读,-O 0 与 0xF000 对照
+QDS     ?= 1 4 16 64
+OPTS    ?= 0 0xF000
+SWEEP_NQN ?= nqn.2024-01.io.test:cnode2
+SWEEP_ROUNDS ?= 5000
+
+qd-sweep: $(BIN)/gpu_initiated
+	TARGET_IP=$(TARGET_IP) NQN=$(SWEEP_NQN) GPU_ID=$(GPU_ID) \
+	ROUNDS=$(SWEEP_ROUNDS) SIZES="$(GPU_BS)" QDS="$(QDS)" OPTS="$(OPTS)" \
+	REPEAT=$(REPEAT) EXTRA="$(EXTRA)" BIN=./$(BIN)/gpu_initiated scripts/qd_sweep.sh
 
 # 同一个 kv_tgt 上 KV(cnode1)和 malloc(cnode2)各跑一遍,算差值
 KV_NQN  ?= $(NQN)

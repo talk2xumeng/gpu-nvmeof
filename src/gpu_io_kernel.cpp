@@ -206,6 +206,45 @@ cqe_ts(struct gpu_io_ctx *c, volatile uint8_t *cqe)
 __device__ static void rq_repost(struct gpu_io_ctx *c, struct gio_shared *sh,
 			  uint16_t wqe_counter);
 
+/* 把已写好的 RQ 槽一次性交给网卡:槽内容先落地,再推 dbrec[0] */
+__device__ static void
+rq_flush(struct gpu_io_ctx *c, struct gio_shared *sh)
+{
+	uint32_t head;
+
+	if (*(volatile uint32_t *)&sh->rq_pending == 0) {
+		return;
+	}
+	head = *(volatile uint32_t *)&sh->rq_head;
+	WQE_FENCE_QUEUE();
+	c->qp_dbrec[0] = wqe_hto_be32(head & 0xffff);
+	WQE_FENCE_DB();
+	*(volatile uint32_t *)&sh->rq_pending = 0;
+	*(volatile uint32_t *)&sh->rq_flushes += 1;
+}
+
+/* opt 0x2000:把 CQ dbrec 补到当前 ci(空闲 / 退出时调) */
+__device__ static void
+cq_flush(struct gpu_io_ctx *c, struct gio_shared *sh, uint32_t ci)
+{
+	if (!(c->opt & 0x2000) ||
+	    *(volatile uint32_t *)&sh->cq_ci_written == ci) {
+		return;
+	}
+	c->cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
+	WQE_FENCE_DB();
+	*(volatile uint32_t *)&sh->cq_ci_written = ci;
+	*(volatile uint32_t *)&sh->cq_db_writes += 1;
+}
+
+/* 消费者空闲时调:把攒着的 RQ 补充和 CQ ci 都交出去 */
+__device__ static inline void
+idle_flush(struct gpu_io_ctx *c, struct gio_shared *sh, uint32_t ci)
+{
+	rq_flush(c, sh);
+	cq_flush(c, sh, ci);
+}
+
 __device__ static uint64_t
 consume_one(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	    volatile uint8_t *cqe, uint32_t *seq)
@@ -278,24 +317,47 @@ rq_repost(struct gpu_io_ctx *c, struct gio_shared *sh, uint16_t wqe_counter)
 		dst[i] = v;
 		shd[i] = v;
 	}
-	WQE_FENCE_QUEUE();		/* 槽内容先于 dbrec 落地 */
 	head++;
-	c->qp_dbrec[0] = wqe_hto_be32(head & 0xffff);
-	WQE_FENCE_DB();
 	*(volatile uint32_t *)&sh->rq_head = head;
 	*(volatile uint32_t *)&sh->rq_reposted += 1;
+	*(volatile uint32_t *)&sh->rq_pending += 1;
+
+	/*
+	 * 默认每个都推 dbrec;opt 0x1000 攒够一批再推。两次 system fence
+	 * 实测每条响应 ~3.5 us,是 poller 的大头。批量期间在飞的 recv 最少
+	 * 少 GIO_RQ_BATCH 个,host 侧相应压低 QD 上限。
+	 */
+	if (!(c->opt & 0x1000) ||
+	    *(volatile uint32_t *)&sh->rq_pending >= GIO_RQ_BATCH) {
+		rq_flush(c, sh);
+	}
 }
 
 /* 消费一个 CQE 后推进 ci,并立刻还给网卡(出错也要还,否则 CQ 会溢出) */
 __device__ static void
-advance_ci(struct gpu_io_ctx *c, uint32_t *ci, uint8_t *phase)
+advance_ci(struct gpu_io_ctx *c, struct gio_shared *sh, uint32_t *ci,
+	   uint8_t *phase)
 {
 	(*ci)++;
 	if ((*ci & (c->cq_cnt - 1)) == 0) {
 		*phase ^= 1;
 	}
+	if (c->opt & 0x2000) {
+		/*
+		 * 懒更新:网卡只用 CQ dbrec 判断溢出。每 GIO_CQ_BATCH 个写一次、
+		 * 不 fence(posted 写迟早可见);空闲 / 退出时 cq_flush 补齐。
+		 * 溢出余量由 host 压 QD 保证:2*QD + GIO_CQ_BATCH < cq_cnt。
+		 */
+		if ((*ci & (GIO_CQ_BATCH - 1)) == 0) {
+			c->cq_dbrec[0] = wqe_hto_be32(*ci & 0xffffff);
+			*(volatile uint32_t *)&sh->cq_ci_written = *ci;
+			*(volatile uint32_t *)&sh->cq_db_writes += 1;
+		}
+		return;
+	}
 	c->cq_dbrec[0] = wqe_hto_be32(*ci & 0xffffff);
 	WQE_FENCE_DB();
+	*(volatile uint32_t *)&sh->cq_db_writes += 1;
 }
 
 __device__ static void
@@ -322,6 +384,7 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		 * 恰好等于首圈的 phase(0) —— 只判 owner 会把空条目当 CQE 消费掉。
 		 */
 		if ((op_own & 1) != (phase & 1) || opcode == MLX5_CQE_INVALID) {
+			idle_flush(c, sh, ci);
 			if ((c->opt & 2) && (spins & 0xff) != 0) {
 				continue;
 			}
@@ -342,12 +405,13 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		idle_since = clock64();
 
 		rcyc += consume_one(c, sh, tags, cqe, &seq);
-		advance_ci(c, &ci, &phase);
+		advance_ci(c, sh, &ci, &phase);
 
 		if (ld_acq32(&sh->abort)) {
 			break;
 		}
 	}
+	idle_flush(c, sh, ci);
 	sh->poll_spins = spins;
 	sh->poll_hits = hits;
 	sh->poll_cycles = clock64() - pstart;
@@ -386,8 +450,10 @@ poll_step(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		__threadfence_system();
 		sh->poll_hits++;
 		rc += consume_one(c, sh, tags, cqe, &seq);
-		advance_ci(c, &ci, &phase);
+		advance_ci(c, sh, &ci, &phase);
 	}
+	/* 每步结束都交出去:下一个持锁者未必马上来 */
+	idle_flush(c, sh, ci);
 	if (n) {
 		*(volatile uint32_t *)&sh->sp_ci = ci;
 		*(volatile uint32_t *)&sh->sp_phase = phase;
@@ -456,8 +522,43 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr)
 	const uint64_t *src;
 	int w;
 
+	/* opt 0x4000:只有每 GIO_SIG_EVERY 条要 CQE(fm_ce_se 在第 2 个字的最高字节) */
+	int unsig = (c->opt & 0x4000) && ((pi & (GIO_SIG_EVERY - 1)) !=
+					  (GIO_SIG_EVERY - 1));
+
+	if (c->opt & 0x8000) {
+		/*
+		 * 在寄存器里构造,分别写 SQ 槽和 BlueFlame,不再从主存回读
+		 * (原路径 4 次 8 字节 volatile 读,每次 ~0.7 us)。按 32 位构造、
+		 * 按 32 位拼 64 位,避免坑 wqe_build.h 里那个严格别名问题。
+		 */
+		uint32_t w32[8];
+		volatile uint32_t *d32 = (volatile uint32_t *)sq_slot;
+
+		(void)mlx5_build_send_wqe((void *)w32, pi, c->qpn, cap_addr,
+					  c->capsule_lkey, 64);
+		if (unsig) {
+			w32[2] = 0;
+		}
+		for (w = 0; w < 8; w++) {
+			d32[w] = w32[w];
+		}
+		WQE_FENCE_QUEUE();
+		c->qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
+		WQE_FENCE_DB();
+		for (w = 0; w < 4; w++) {
+			bfp[w] = (uint64_t)w32[2 * w] |
+				 ((uint64_t)w32[2 * w + 1] << 32);
+		}
+		WQE_FENCE_DB();
+		return;
+	}
+
 	(void)mlx5_build_send_wqe((void *)sq_slot, pi, c->qpn, cap_addr,
 				  c->capsule_lkey, 64);
+	if (unsig) {
+		((volatile uint32_t *)sq_slot)[2] = 0;
+	}
 	WQE_FENCE_QUEUE();
 
 	c->qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
@@ -553,6 +654,7 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 
 				if ((oo & 1) != (my_phase & 1) ||
 				    (oo >> 4) == MLX5_CQE_INVALID) {
+					idle_flush(c, sh, my_ci);
 					if ((spins & 0x3ff) == 0 &&
 					    clock64() - t2 > GIO_TIMEOUT) {
 						set_abort(sh, GIO_E_WAIT);
@@ -565,7 +667,7 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 				sh->poll_hits++;
 				sh->resp_cycles += consume_one(c, sh, tags, cqe,
 							       &my_seq);
-				advance_ci(c, &my_ci, &my_phase);
+				advance_ci(c, sh, &my_ci, &my_phase);
 				/* handle_resp 在本 block 里已 fence 过,直接读 */
 				st = *(volatile uint32_t *)&tags[tag].state;
 				if (st >= GIO_ST_DONE) {
@@ -632,6 +734,10 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		if (st < GIO_ST_DONE) {
 			break;
 		}
+	}
+	/* 串行快路径自己消费 CQ:退出前把攒着的 RQ / CQ dbrec 交出去 */
+	if (c->opt & 0x20) {
+		idle_flush(c, sh, my_ci);
 	}
 }
 

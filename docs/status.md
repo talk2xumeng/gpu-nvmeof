@@ -107,7 +107,7 @@ kernel 现在是**单线程串行**：发一条、等一条、再发下一条。
 
 ~~kernel 不补 RQ recv buffer，单次 launch 的轮数上限 128。~~
 
-C2 已实现，待上机验收：poller 每收一个响应，就把那块 recv buffer 原样
+C2 已验收（2026-10-15）：poller 每收一个响应，就把那块 recv buffer 原样
 重新 post 到 RQ 头，然后推 dbrec[0]。槽内容取自显存里的影子副本，不回读
 主存。`-O 2048` 可以关掉这个功能做对照。详见 `docs/concurrency-design.md`「C2 实现要点」。
 
@@ -213,7 +213,10 @@ KV 的延迟瓶颈和读写完全一样,都在 C1 回退(提交约 8.5 µs)和 C
    QD=4 读）。4 KiB QD=1 延迟 22–23 us，比串行版本（8.6 us）高，1 MiB 下
    无差异，疑似检测下限；排查记录和恢复步骤见
    `docs/concurrency-design.md`「C1 状态」
-4. **RQ 自持（C2）** —— 已实现，待上机验收（QD=1 跑 1000 条，dbrec RQ 增加 1000，块图全部为 `.`）
+4. ~~**RQ 自持（C2）**~~ 已验收：QD1 下 1000 条、QD16 下 5000 条都通过。
+   基线 QD 扫描显示 4K 读在约 75k IOPS 饱和，瓶颈是 poller 处理每条 I/O
+   要约 13 µs。降本的开关（`-O 0x1000` 到 `0x8000`）已加上，用 `make qd-sweep`
+   做对照，见 `docs/concurrency-design.md`。
 5. CQ 进显存 —— 延迟优化，可以晚做
 6. 错误恢复 —— 交付前
 
