@@ -506,21 +506,42 @@ report_blocks(const char *tag, const uint8_t *buf, uint32_t n, uint32_t bs,
 	unsigned bad = 0, shown = 0, i;
 	struct blk_result r;
 
-	printf("\n[%s] %u 块 × %u 字节, LBA %" PRIu64 " 起, seed %u\n  ",
+	/*
+	 * 全对时只打计数。有错时只打含错的行(每行 64 块,行首是块号),
+	 * 最多 16 行。
+	 */
+	printf("\n[%s] %u 块 × %u 字节, LBA %" PRIu64 " 起, seed %u\n",
 	       tag, n, bs, lba0, seed);
 	for (i = 0; i < n; i++) {
 		blk_check(buf + (size_t)i * bs, bs, seed,
 			  lba0 + (uint64_t)i * nlb, &r);
-		putchar(blk_map_char(&r));
 		cnt[(unsigned char)blk_map_char(&r)]++;
 		if (r.v != BLK_OK) {
 			bad++;
 		}
-		if (i % 64 == 63 && i + 1 < n) {
-			printf("\n  ");
+	}
+	if (bad) {
+		unsigned row, rows = 0, j;
+
+		for (row = 0; row * 64 < n && rows < 16; row++) {
+			char line[65];
+			int hit = 0;
+
+			for (j = 0; j < 64 && row * 64 + j < n; j++) {
+				i = row * 64 + j;
+				blk_check(buf + (size_t)i * bs, bs, seed,
+					  lba0 + (uint64_t)i * nlb, &r);
+				line[j] = blk_map_char(&r);
+				hit |= r.v != BLK_OK;
+			}
+			line[j] = 0;
+			if (hit) {
+				printf("  %7u %s\n", row * 64, line);
+				rows++;
+			}
 		}
 	}
-	printf("\n  ");
+	printf("  ");
 	for (i = 0; i < 128; i++) {
 		if (cnt[i]) {
 			printf("%c=%u ", (char)i, cnt[i]);
