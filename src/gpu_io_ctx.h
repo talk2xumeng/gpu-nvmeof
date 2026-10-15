@@ -124,6 +124,9 @@ struct gpu_io_ctx {
 	/* 队列(SQ/CQ/RQ/dbrec)在显存(-X);胶囊在显存(-H)。配 GIO_OPT_DEVFENCE */
 	uint8_t			q_in_gpu;
 	uint8_t			cap_in_gpu;
+
+	/* GIO_OPT_BFGAP:BF 的 4 个 8 字节写之间空等的时钟数(-G,默认 1000) */
+	uint32_t		bf_gap;
 };
 
 /*

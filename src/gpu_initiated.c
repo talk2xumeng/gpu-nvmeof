@@ -14,6 +14,8 @@
  *   -g <id>              GPU 编号
  *   -r <n> -b <bytes>    I/O 总数、每条字节数
  *   -Q <qd>              每个 QP 同时在飞的 I/O 数(submitter 线程数,默认 1)
+ *   -G <cycles>          配 -X:用 BlueFlame,WQE 分 4 个 8 字节写、之间空等 cycles
+ *                        个 GPU 时钟(不配 -G 只敲 8 字节门铃,网卡回 SQ 取 WQE)
  *   -X                   IO 队列改用 DevX 自建的 QP,CQ/SQ/RQ/dbrec 全在显存
  *                        (src/devx_qp.c)。目前只支持 -q 1、胶囊在主存
  *   -q <n>               QP 数(默认 1,最多 GIO_MAX_QP)。每个 QP 一个 poller、
@@ -145,6 +147,7 @@ static uint32_t	g_rounds = 100;
 static uint32_t	g_qd = 1;
 static uint32_t	g_nq = 1;		/* -q: QP 数 */
 static int	g_devx;			/* -X: DevX 自建 IO 队列,队列在显存 */
+static int	g_bf_gap = -1;		/* -G: BF 写之间空等的时钟数;-1 = 不用 BF */
 static uint32_t	g_opt;
 static uint32_t	g_io_bytes = 4096;
 static int	g_write, g_cap_in_hbm, g_paint, g_verify;
@@ -890,7 +893,7 @@ main(int argc, char **argv)
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:Q:q:O:WHPVKF:L:S:kEDX")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:Q:q:O:WHPVKF:L:S:kEDXG:")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -901,6 +904,7 @@ main(int argc, char **argv)
 		case 'Q': g_qd = (unsigned)atoi(optarg); break;
 		case 'q': g_nq = (unsigned)atoi(optarg); break;
 		case 'X': g_devx = 1; break;
+		case 'G': g_bf_gap = atoi(optarg); break;
 		case 'O': g_opt = (unsigned)strtoul(optarg, NULL, 0); break;
 		case 'W': g_write = 1; break;
 		case 'H': g_cap_in_hbm = 1; break;
@@ -969,6 +973,11 @@ main(int argc, char **argv)
 		g_opt &= ~(GIO_OPT_BF1 | GIO_OPT_BF64 | GIO_OPT_BFTOG |
 			   GIO_OPT_BFDLY | GIO_OPT_BFSEP | GIO_OPT_BFGAP |
 			   GIO_OPT_RBPAR);
+		if (g_bf_gap >= 0) {
+			/* -G:BF UAR,WQE 分 4 个 8 字节写、中间空等 g_bf_gap 个时钟 */
+			g_opt &= ~GIO_OPT_DB8;
+			g_opt |= GIO_OPT_BFGAP;
+		}
 	}
 	if ((g_opt & 0x20) && g_qd != 1) {
 		fprintf(stderr, "-O 32(串行快路径)只能配 -Q 1\n");
@@ -1294,6 +1303,7 @@ main(int argc, char **argv)
 					: (uint64_t)g_cap_host;
 	ctx.capsule_lkey = g_cap_mr->lkey;
 	ctx.cap_in_gpu   = g_cap_in_hbm ? 1 : 0;
+	ctx.bf_gap       = g_bf_gap >= 0 ? (uint32_t)g_bf_gap : 1000;
 	ctx.data_addr    = (uint64_t)g_data_gpu;
 	ctx.data_rkey    = g_data_mr->rkey;
 	ctx.nsid         = spdk_nvme_ns_get_id(g_ns);
@@ -1325,6 +1335,7 @@ main(int argc, char **argv)
 		dc.cap_host = g_cap_in_hbm ? g_cap_hbm : g_cap_host;
 		dc.cap_len = CAP_AREA_LEN;
 		dc.cap_fd = g_cap_in_hbm ? g_cap_fd : -1;
+		dc.want_bf = g_bf_gap >= 0;
 		if (g_cap_in_hbm) {
 			dc.q_mem = (char *)g_cap_hbm + CAP_AREA_LEN;
 			dc.q_fd = g_cap_fd;

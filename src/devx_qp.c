@@ -230,7 +230,20 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 		fprintf(stderr, "[DevX] PD / EQ 失败: %s\n", strerror(errno));
 		return -1;
 	}
-	g.uar = mlx5dv_devx_alloc_uar(g.ctx, MLX5DV_UAR_ALLOC_TYPE_NC);
+	/*
+	 * -X 时等待比主存方案多 ~3 µs,网卡时间戳显示全在"门铃→SEND 完成":
+	 * 没有 BF,网卡要回 SQ 取 WQE。-G 时要一个 BF 类型的 UAR,kernel 把
+	 * WQE 按 8 字节分 4 次、中间空等写进 BF(连着写网卡不认,见 0018)。
+	 */
+	if (cfg->want_bf) {
+		g.uar = mlx5dv_devx_alloc_uar(g.ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
+		if (!g.uar) {
+			fprintf(stderr, "[DevX] BF 类型 UAR 分配失败,退回 NC\n");
+		}
+	}
+	if (!g.uar) {
+		g.uar = mlx5dv_devx_alloc_uar(g.ctx, MLX5DV_UAR_ALLOC_TYPE_NC);
+	}
 	if (!g.uar) {
 		g.uar = mlx5dv_devx_alloc_uar(g.ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
 	}
@@ -377,9 +390,11 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 		}
 		g.qpn = DEVX_GET(create_qp_out, out, qpn);
 	}
-	printf("[DevX] %s qid %u  CQN 0x%x QPN 0x%x  显存 %p umem %u  uar %u\n",
+	printf("[DevX] %s qid %u  CQN 0x%x QPN 0x%x  显存 %p umem %u  uar %u(%s,reg 页内 0x%lx)\n",
 	       ibv_get_device_name(g.ctx->device), cfg->qid, g.cqn, g.qpn,
-	       g.mem, g.umem->umem_id, g.uar->page_id);
+	       g.mem, g.umem->umem_id, g.uar->page_id,
+	       cfg->want_bf ? "要 BF" : "NC",
+	       (unsigned long)((uintptr_t)g.uar->reg_addr & 4095));
 
 	/* ---- RST2INIT(参数来自 rdma_cm)---- */
 	memset(&qa, 0, sizeof(qa));

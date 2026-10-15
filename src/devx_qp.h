@@ -48,6 +48,8 @@ struct devx_q_cfg {
 	void		*q_mem;
 	int		q_fd;
 	size_t		q_off;
+	/* 要 BlueFlame 的 UAR(-G);否则 NC UAR,只敲 8 字节门铃 */
+	int		want_bf;
 };
 
 /* 失败返回非 0 并打印原因;成功时把 ctx 里和队列、MR 有关的字段全部填好 */

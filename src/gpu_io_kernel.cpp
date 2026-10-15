@@ -766,7 +766,7 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 				if ((c->opt & GIO_OPT_BFGAP) && w < 3) {
 					uint64_t t0 = clock64();
 
-					while (clock64() - t0 < 1000) {
+					while (clock64() - t0 < c->bf_gap) {
 					}
 				}
 			}
