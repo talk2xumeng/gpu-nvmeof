@@ -167,7 +167,29 @@ kernel 算出来的。如果 attention 和发送在同一个 kernel 里、中间
 
 ---
 
-## 五、下一步建议顺序
+## 五、KV 命令集(NVMe KV 1.3)
+
+GPU 侧已支持发 KV 命令。使用 `gpu_initiated -k`,默认发 Retrieve;
+`-W` 发 Store,`-E` 发 Exist,`-D` 发 Delete。
+
+- 胶囊构造在 `wqe_build.h` 的 `nvme_build_kv_sqe`。
+- kernel 在 `ctx.kv` 置位时,按 `(seed, 序号)` 生成 16 字节 key,并把响应的
+  CQE DW0 收回来。对 Retrieve,DW0 就是 value 的长度。
+- 读写路径没有改动。`ctx.kv = 0` 时,KV 字段一概不读;poller 也不多读那
+  8 字节,避免多一次 0.7 µs 的主存往返。
+
+盘不支持 KV,所以 target 侧用 `tst/kv_target` 模拟。KV 的 Store/Retrieve
+和 NVM 的 Write/Read 用的是同一个 opcode,SPDK nvmf 会把它们当读写处理。
+因此需要打一个只对 `kv_emu` bdev 生效的透传补丁。
+
+现状:
+
+- CPU 路径冒烟已在 SPDK v24.09 + TCP 回环上全过,详见该目录 README。
+- GPU 路径(`make run-gpu-kv-*`)尚未上机。
+
+---
+
+## 六、下一步建议顺序
 
 1. ~~**多块校验**~~ 已完成：读写各 100 块逐块一致
 2. **同一 kernel 内写 payload + 发命令** —— 已定论（`tst/pit7`）：普通显存

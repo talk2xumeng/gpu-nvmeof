@@ -177,6 +177,100 @@ nvme_build_rw_sqe(struct nvme_sqe *cmd, uint8_t opc, uint16_t cid,
 }
 
 /* ------------------------------------------------------------------ */
+/* NVMe KV 命令集(CSI 01h,KV Command Set Spec 1.3)                   */
+/* ------------------------------------------------------------------ */
+
+/*
+ * 胶囊外形和读写完全一样(64 字节 SQE + keyed SGL),只是字段含义换了:
+ *
+ *   CDW2/CDW3    key 字节 [7:0]      -- 读写里是保留字段
+ *   CDW14/CDW15  key 字节 [15:8]
+ *   CDW10        Store: value 长度 VS;Retrieve/List: host buffer 长度 HBS
+ *   CDW11        [7:0] key 长度 KL(<=16);[15:8] Store/Retrieve 选项
+ *
+ * key 按字节数组放:SQE 是小端,key[0] 落在 CDW2 的最低字节,所以直接
+ * 逐字节拷进 SQE 偏移 8..15 和 56..63 即可,不用拼 dword。
+ *
+ * 注意 Store=01h、Retrieve=02h 和 NVM 的 WRITE/READ 是同一个 opcode ——
+ * 数据方向位一致,所以传输层(RDMA READ/WRITE 显存)不用改;但 target
+ * 侧必须知道这个 namespace 是 KV,否则会按 LBA 去解释 CDW10/11。
+ * 模拟 target 的处理见 tst/kv_target。
+ *
+ * 完成时 Retrieve 的 CQE DW0 = value 实际长度(可能大于 HBS,此时只
+ * 回了前 HBS 字节)。kernel 侧在 ctx.kv 置位时会把 DW0 收回来。
+ */
+#define NVME_KV_OPC_STORE	0x01	/* host -> ctrlr */
+#define NVME_KV_OPC_RETRIEVE	0x02	/* ctrlr -> host */
+#define NVME_KV_OPC_LIST	0x06	/* ctrlr -> host */
+#define NVME_KV_OPC_DELETE	0x10	/* 无数据 */
+#define NVME_KV_OPC_EXIST	0x14	/* 无数据 */
+
+#define NVME_KV_MAX_KEY		16
+
+/* CDW11 选项位(已移到 [15:8] 的位置,直接或进 cdw11) */
+#define NVME_KV_STORE_SIKE	(1u << 8)	/* 只在 key 已存在时写(update) */
+#define NVME_KV_STORE_SINKE	(1u << 9)	/* 只在 key 不存在时写(insert) */
+#define NVME_KV_STORE_NOCOMP	(1u << 10)
+#define NVME_KV_RETRIEVE_RRD	(1u << 8)	/* 返回未解压的原始数据 */
+
+/* Generic 状态码(SCT=0)里 KV 用到的 SC */
+#define NVME_KV_SC_CAPACITY_EXCEEDED	0x81
+#define NVME_KV_SC_NS_NOT_READY		0x82
+#define NVME_KV_SC_INVALID_VALUE_SIZE	0x85
+#define NVME_KV_SC_INVALID_KEY_SIZE	0x86
+#define NVME_KV_SC_KEY_NOT_EXIST	0x87
+#define NVME_KV_SC_UNRECOVERED		0x88
+#define NVME_KV_SC_KEY_EXISTS		0x89
+
+/* 这条 opcode 是否带数据(决定 SGL 长度和 CDW10 是否有意义) */
+WQE_FN int
+nvme_kv_opc_has_data(uint8_t opc)
+{
+	return opc == NVME_KV_OPC_STORE || opc == NVME_KV_OPC_RETRIEVE ||
+	       opc == NVME_KV_OPC_LIST;
+}
+
+/*
+ * 构造一条 KV 命令。
+ *
+ *   key/klen   key 字节和长度(klen 1..16;超过 16 target 会回 Invalid Field)
+ *   opts       CDW11[15:8] 的选项位,Delete/Exist 忽略
+ *   buf_addr   value 所在显存(Store 取、Retrieve/List 写),rkey 同读写
+ *   buf_len    Store: value 长度;Retrieve/List: buffer 长度;
+ *              Delete/Exist 忽略,SGL 长度填 0(target 判为无数据传输)
+ */
+WQE_FN void
+nvme_build_kv_sqe(struct nvme_sqe *cmd, uint8_t opc, uint16_t cid,
+		  uint32_t nsid, const uint8_t *key, uint8_t klen,
+		  uint32_t opts, uint64_t buf_addr, uint32_t rkey,
+		  uint32_t buf_len)
+{
+	uint8_t *raw = (uint8_t *)cmd;
+	int has_data = nvme_kv_opc_has_data(opc);
+	uint32_t sgl_len = has_data ? buf_len : 0;
+	int i;
+
+	/* 地址/rkey/类型和读写一样填;长度为 0 时 target 不做数据传输 */
+	nvme_build_rw_sqe(cmd, opc, cid, nsid, 0, 1,
+			  has_data ? buf_addr : 0, has_data ? rkey : 0,
+			  sgl_len);
+
+	/* 上面按 LBA 填的 CDW10-12 全部作废 */
+	cmd->cdw10 = has_data ? buf_len : 0;
+	cmd->cdw11 = (uint32_t)klen |
+		     ((opc == NVME_KV_OPC_STORE || opc == NVME_KV_OPC_RETRIEVE) ?
+		      (opts & 0xff00u) : 0);
+	cmd->cdw12 = 0;
+
+	/* key[0..7] -> SQE 8..15(CDW2/3),key[8..15] -> SQE 56..63(CDW14/15) */
+	for (i = 0; i < NVME_KV_MAX_KEY; i++) {
+		uint8_t b = (i < klen) ? key[i] : 0;
+
+		raw[i < 8 ? 8 + i : 56 + (i - 8)] = b;
+	}
+}
+
+/* ------------------------------------------------------------------ */
 /* mlx5 SEND WQE                                                       */
 /* ------------------------------------------------------------------ */
 

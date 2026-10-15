@@ -72,11 +72,13 @@ src/
   kernels.cpp         基线用的 GPU kernel,mxcc 编译
   gpu_backend.h       MACA/CUDA 后端抽象
   dmabuf_probe.c      显存注册路径能力探测
-  gpu_initiated.c     GPU-initiated 原型 host 侧(初始化 + 校验)
+  gpu_initiated.c     GPU-initiated 原型 host 侧(初始化 + 校验;-k 为 KV 命令集)
   gpu_io_kernel.cpp   GPU-initiated 原型 kernel(稳态收发)
   blk_pattern.h       逐块可辨识的校验 pattern,host/kernel 共用
 tst/
   pit7/               坑 7 实验:kernel 写显存对网卡的可见性(独立程序 + 矩阵脚本)
+  kv_target/          KV 命令集的模拟 target(SPDK 内存 KV bdev + nvmf 补丁)
+                      和 CPU 侧冒烟测试 —— 盘不支持 KV 时测 GPU 的 KV 路径
 docs/
   NVMeoF-GPU验证手册.md
   status.md           GPU-initiated 现状与差距

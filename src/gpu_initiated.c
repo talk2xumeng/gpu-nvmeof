@@ -32,6 +32,19 @@
  *   -P                   把 [L, L+r) 涂成 0xCC 然后退出
  *   -V                   回读 [L, L+r) 逐块校验然后退出(-S 要和写入时一致)
  *
+ * KV 命令集(target 的 namespace 必须是 KV,见 tst/kv_target):
+ *
+ *   -k                   KV 模式。第 i 条用 key blk_kv_key(seed, L+i)、
+ *                        value = 显存第 i 块,长度 -b(8 的倍数即可,不受扇区约束)
+ *                        默认 Retrieve;-W Store;-E Exist;-D Delete
+ *   -k -P / -k -V        CPU 路径 Delete / Retrieve 这批 key(-V 逐块比对,
+ *                        不存在的 key 记作 C)
+ *
+ *   Retrieve/Exist/Delete:进程内先用 CPU 路径 Store 好这批 key;
+ *   Retrieve 额外核对每条 CQE DW0(value 长度)== -b。
+ *   Store:进程内先 Delete 这批 key,校验同写,另起进程 -k -V。
+ *   Delete:另起进程 -k -V,应全部是 C。
+ *
  * 多块校验:第 i 轮读写显存第 i 块、LBA L+i*nlb,每块内容由
  * (seed, LBA) 决定(blk_pattern.h),漏块/串块/残留都能区分。
  *
@@ -57,6 +70,7 @@
 
 #include "gpu_io_ctx.h"
 #include "blk_pattern.h"
+#include "wqe_build.h"		/* KV 胶囊构造,CPU 路径和 kernel 共用 */
 
 extern int gpu_io_run(struct gpu_io_ctx *, unsigned long long,
 		      unsigned long long *, unsigned long long *,
@@ -64,7 +78,8 @@ extern int gpu_io_run(struct gpu_io_ctx *, unsigned long long,
 		      unsigned long long *, unsigned int *,
 		      unsigned long long *, unsigned long long *,
 		      unsigned long long *, unsigned long long *,
-		      unsigned long long *, double *, struct gio_shared *);
+		      unsigned long long *, double *,
+		      unsigned int *, struct gio_shared *);
 extern int gpu_alloc_exportable(void **, int *, size_t);
 extern int gpu_alloc_exportable_ex(void **, int *, size_t, unsigned int);
 extern int gpu_map_host(void *, size_t, unsigned int, void **);
@@ -106,6 +121,9 @@ static uint32_t	g_opt;
 static uint32_t	g_io_bytes = 4096;
 static int	g_write, g_cap_in_hbm, g_paint, g_verify;
 static int	g_fill_by_kernel;	/* -K: 源数据由 kernel 写,不用 mcMemset */
+static int	g_kv;			/* -k: KV 命令集 */
+static int	g_kv_exist, g_kv_delete;	/* -E / -D */
+#define KV_KLEN	16
 static uint64_t	g_start_lba;
 static uint8_t	g_seed = 1;
 
@@ -246,6 +264,96 @@ cpu_io(int is_write, void *buf, uint64_t lba, uint32_t nlb)
 	return st > 0 ? 0 : -1;
 }
 
+/*
+ * KV 命令走 SPDK 的 CPU 路径(io_raw),同样只能在接管 QP 之前用。
+ *
+ * 胶囊用和 kernel 同一个 nvme_build_kv_sqe 构造,SPDK 只覆盖 cid 和
+ * dptr —— 所以 CPU 路径先跑通,就同时验证了构造函数和 target。
+ * 返回 NVMe status 的 (SCT << 8) | SC,0 为成功,-1 为提交失败;
+ * dw0 带回 CQE DW0(Retrieve 的 value 长度)。
+ */
+struct kv_cpl {
+	int		done;
+	uint32_t	dw0;
+	uint32_t	st;
+};
+
+static void
+kv_cb(void *a, const struct spdk_nvme_cpl *cpl)
+{
+	struct kv_cpl *k = a;
+
+	k->dw0 = cpl->cdw0;
+	k->st = ((uint32_t)cpl->status.sct << 8) | cpl->status.sc;
+	k->done = 1;
+}
+
+static int
+cpu_kv(uint8_t opc, void *buf, uint32_t len, uint64_t idx, uint32_t *dw0)
+{
+	struct spdk_nvme_cmd cmd;
+	struct nvme_sqe sqe;
+	struct kv_cpl k = { 0 };
+	uint8_t key[KV_KLEN];
+	int has_data = nvme_kv_opc_has_data(opc);
+
+	SPDK_STATIC_ASSERT(sizeof(sqe) == sizeof(cmd), "SQE 必须是 64 字节");
+	blk_kv_key(key, g_seed, idx);
+	nvme_build_kv_sqe(&sqe, opc, 0, spdk_nvme_ns_get_id(g_ns), key,
+			  KV_KLEN, 0, 0, 0, len);
+	memcpy(&cmd, &sqe, sizeof(cmd));
+	cmd.psdt = 0;
+	memset(&cmd.dptr, 0, sizeof(cmd.dptr));
+
+	if (spdk_nvme_ctrlr_cmd_io_raw(g_ctrlr, g_qpair, &cmd,
+				       has_data ? buf : NULL,
+				       has_data ? len : 0, kv_cb, &k) != 0) {
+		return -1;
+	}
+	while (!k.done) {
+		spdk_nvme_qpair_process_completions(g_qpair, 0);
+		/* 准备阶段要逐个 Store/Delete 一批 key,顺带发 keep-alive,
+		 * 免得跑过 KATO 被 target 断连 */
+		spdk_nvme_ctrlr_process_admin_completions(g_ctrlr);
+	}
+	if (dw0) {
+		*dw0 = k.dw0;
+	}
+	return (int)k.st;
+}
+
+static const char *
+kv_opc_name(uint8_t opc)
+{
+	switch (opc) {
+	case NVME_KV_OPC_STORE:		return "KV STORE";
+	case NVME_KV_OPC_RETRIEVE:	return "KV RETRIEVE";
+	case NVME_KV_OPC_DELETE:	return "KV DELETE";
+	case NVME_KV_OPC_EXIST:		return "KV EXIST";
+	case NVME_KV_OPC_LIST:		return "KV LIST";
+	}
+	return "KV ?";
+}
+
+/* status 字(含 phase 位)里的 SCT=0 SC,给 KV 状态码一个名字 */
+static const char *
+kv_sc_name(uint16_t status)
+{
+	if (((status >> 9) & 7) != 0) {
+		return "";
+	}
+	switch ((status >> 1) & 0xff) {
+	case 0x01: return " Invalid Opcode —— target 不认 KV,namespace 不是 KV?";
+	case 0x02: return " Invalid Field —— key 长度 > 16 或超过 max_io_size";
+	case NVME_KV_SC_CAPACITY_EXCEEDED: return " Capacity Exceeded";
+	case NVME_KV_SC_INVALID_VALUE_SIZE: return " Invalid Value Size";
+	case NVME_KV_SC_INVALID_KEY_SIZE: return " Invalid Key Size";
+	case NVME_KV_SC_KEY_NOT_EXIST: return " KV Key Does Not Exist";
+	case NVME_KV_SC_KEY_EXISTS: return " Key Exists";
+	}
+	return "";
+}
+
 static int cmp_d(const void *a, const void *b)
 {
 	double x = *(const double *)a, y = *(const double *)b;
@@ -257,7 +365,8 @@ static void usage(const char *p)
 	printf("用法: %s -a <ip> -n <nqn> [-g gpu] [-r n_io] [-b bytes] [-Q qd]\n"
 	       "      [-L start_lba] [-S seed] [-W 发写]\n"
 	       "      [-H 胶囊放显存] [-F cap_flag]\n"
-	       "      [-P 涂色] [-V 逐块回读] [-K 旧式单块对照]\n", p);
+	       "      [-P 涂色] [-V 逐块回读] [-K 旧式单块对照]\n"
+	       "      [-k KV 模式:默认 Retrieve,-W Store,-E Exist,-D Delete]\n", p);
 }
 
 /*
@@ -427,7 +536,7 @@ main(int argc, char **argv)
 	struct mlx5dv_obj obj;
 	struct gpu_io_ctx ctx;
 	unsigned long long *cycles, *c_cap, *c_sub, *c_wait, *c_spin, *c_lock;
-	unsigned int *c_stat;
+	unsigned int *c_stat, *c_dw0;
 	unsigned long long *c_det, *c_hand, *c_tsreq, *c_tsresp, *c_reqat;
 	struct gio_shared sh;
 	struct spdk_nvme_io_qpair_opts qopts;
@@ -445,7 +554,7 @@ main(int argc, char **argv)
 	memset(&dvc, 0, sizeof(dvc));
 	memset(&ctx, 0, sizeof(ctx));
 
-	while ((op = getopt(argc, argv, "a:s:n:g:r:b:Q:O:WHPVKF:L:S:")) != -1) {
+	while ((op = getopt(argc, argv, "a:s:n:g:r:b:Q:O:WHPVKF:L:S:kED")) != -1) {
 		switch (op) {
 		case 'a': snprintf(g_traddr, sizeof(g_traddr), "%s", optarg); break;
 		case 's': snprintf(g_trsvcid, sizeof(g_trsvcid), "%s", optarg); break;
@@ -463,6 +572,9 @@ main(int argc, char **argv)
 		case 'F': g_cap_flags = (unsigned)strtoul(optarg, NULL, 0); break;
 		case 'L': g_start_lba = strtoull(optarg, NULL, 0); break;
 		case 'S': g_seed = (uint8_t)strtoul(optarg, NULL, 0); break;
+		case 'k': g_kv = 1; break;
+		case 'E': g_kv_exist = 1; break;
+		case 'D': g_kv_delete = 1; break;
 		default:
 			usage(argv[0]);
 			return 1;
@@ -497,6 +609,15 @@ main(int argc, char **argv)
 	}
 	if ((g_opt & 0x40) && !(g_opt & 0x30)) {
 		fprintf(stderr, "-O 64 必须配 16 或 32,否则没人收割 CQ\n");
+		return 1;
+	}
+	if ((g_kv_exist || g_kv_delete) && !g_kv) {
+		fprintf(stderr, "-E / -D 只用于 KV 模式(-k)\n");
+		return 1;
+	}
+	if (g_kv && (g_fill_by_kernel ||
+		     g_write + g_kv_exist + g_kv_delete > 1)) {
+		fprintf(stderr, "-k 不能配 -K;-W/-E/-D 只能选一个\n");
 		return 1;
 	}
 
@@ -590,9 +711,13 @@ main(int argc, char **argv)
 	sector = spdk_nvme_ns_get_sector_size(g_ns);
 	nlb = g_io_bytes / sector;
 
-	if (g_io_bytes % sector) {
+	/* KV 的 value 是字节粒度,不受扇区约束;nlb 只给读写模式用 */
+	if (!g_kv && g_io_bytes % sector) {
 		fprintf(stderr, "-b %u 不是扇区 %u 的整数倍\n", g_io_bytes, sector);
 		return 1;
+	}
+	if (g_kv) {
+		nlb = 1;	/* KV 的 "LBA" 就是 key 序号,report_blocks 按步长 1 */
 	}
 
 	/*
@@ -630,7 +755,34 @@ main(int argc, char **argv)
 			}
 		}
 		memset(b, CPAT, g_io_bytes);
-		for (i = 0; i < g_rounds; i++) {
+		for (i = 0; i < g_rounds && g_kv; i++) {
+			/*
+			 * KV:涂色 = Delete(key 不存在本来就算成功,EDNEK 默认 0);
+			 * 回读 = Retrieve,不存在的 key 按 0xCC 记,块图上是 C。
+			 */
+			uint64_t idx = g_start_lba + i;
+			uint32_t dw0 = 0;
+			int st;
+
+			if (g_paint) {
+				st = cpu_kv(NVME_KV_OPC_DELETE, NULL, 0, idx, NULL);
+				nfail += st != 0 && st != NVME_KV_SC_KEY_NOT_EXIST;
+				continue;
+			}
+			st = cpu_kv(NVME_KV_OPC_RETRIEVE, b, g_io_bytes, idx, &dw0);
+			if (st == NVME_KV_SC_KEY_NOT_EXIST) {
+				memset(b, CPAT, g_io_bytes);
+			} else if (st != 0) {
+				nfail++;
+				memset(b, 0, g_io_bytes);
+			} else if (dw0 != g_io_bytes) {
+				printf("  key %" PRIu64 ": value 长度 %u,期望 %u\n",
+				       idx, dw0, g_io_bytes);
+				bad++;
+			}
+			memcpy(all + (size_t)i * g_io_bytes, b, g_io_bytes);
+		}
+		for (i = 0; i < g_rounds && !g_kv; i++) {
 			uint64_t lba = g_start_lba + (uint64_t)i * nlb;
 
 			if (g_paint) {
@@ -643,15 +795,18 @@ main(int argc, char **argv)
 			}
 			memcpy(all + (size_t)i * g_io_bytes, b, g_io_bytes);
 		}
-		if (g_paint) {
+		if (g_paint && g_kv) {
+			printf("[删除] key %" PRIu64 " 起 %u 个 (seed %u),失败 %u\n",
+			       g_start_lba, g_rounds, g_seed, nfail);
+		} else if (g_paint) {
 			printf("[涂色] LBA %" PRIu64 " 起 %u 块填 0x%02x,失败 %u\n",
 			       g_start_lba, g_rounds, CPAT, nfail);
 		} else {
 			if (nfail) {
 				printf("[回读] %u 块 I/O 失败(按全零计)\n", nfail);
 			}
-			bad = report_blocks("回读", all, g_rounds, g_io_bytes,
-					    nlb, g_start_lba, g_seed);
+			bad += report_blocks("回读", all, g_rounds, g_io_bytes,
+					     nlb, g_start_lba, g_seed);
 			free(all);
 		}
 		spdk_dma_free(b);
@@ -664,7 +819,23 @@ main(int argc, char **argv)
 	 * 预热:用 SPDK 正常发一条,触发 hook 注册显存 MR 拿 rkey,
 	 * 同时让 recv buffer 池进入稳定状态。之后才能交给 GPU。
 	 */
-	if (cpu_io(0, g_data_gpu, 0, nlb) != 0) {
+	if (g_kv) {
+		/*
+		 * KV namespace 上发 NVM READ 会被当成 Retrieve(同为 02h),
+		 * CDW11 的 KL=0 会被拒。改发一条真 Retrieve,key 取一个本轮
+		 * 用不到的序号:要的只是 SPDK 为显存建 SGL 时触发 hook 注册 MR,
+		 * 回 87h(不存在)正常。回 01h 说明 target 不认 KV。
+		 */
+		int st = cpu_kv(NVME_KV_OPC_RETRIEVE, g_data_gpu, g_io_bytes,
+				~0ULL, NULL);
+
+		if (st != 0 && st != NVME_KV_SC_KEY_NOT_EXIST) {
+			fprintf(stderr, "KV 预热返回 SCT/SC=0x%03x%s\n", st,
+				st == 0x01 ? " (Invalid Opcode:namespace 不是 KV,"
+					     "检查 target,见 tst/kv_target)" : "");
+			return 1;
+		}
+	} else if (cpu_io(0, g_data_gpu, 0, nlb) != 0) {
 		fprintf(stderr, "预热 I/O 出错\n");
 		return 1;
 	}
@@ -794,6 +965,16 @@ main(int argc, char **argv)
 	ctx.io_bytes     = g_io_bytes;
 	ctx.nvme_opc     = g_write ? 0x01 : 0x02;
 	ctx.data_step    = g_fill_by_kernel ? 0 : g_io_bytes;
+	if (g_kv) {
+		ctx.kv       = 1;
+		ctx.kv_klen  = KV_KLEN;
+		ctx.kv_seed  = g_seed;
+		ctx.kv_opts  = 0;
+		ctx.nvme_opc = g_write ? NVME_KV_OPC_STORE :
+			       g_kv_exist ? NVME_KV_OPC_EXIST :
+			       g_kv_delete ? NVME_KV_OPC_DELETE :
+			       NVME_KV_OPC_RETRIEVE;
+	}
 
 	/*
 	 * ---- RQ 与 recv buffer ----
@@ -917,11 +1098,16 @@ main(int argc, char **argv)
 			uint64_t lba = g_start_lba + (uint64_t)i * nlb;
 
 			blk_fill(b, g_io_bytes, g_seed, lba);
-			nfail += cpu_io(1, b, lba, nlb) != 0;
+			/* KV:Retrieve/Exist/Delete 都要求 key 先存在 */
+			nfail += g_kv ?
+				 cpu_kv(NVME_KV_OPC_STORE, b, g_io_bytes, lba,
+					NULL) != 0 :
+				 cpu_io(1, b, lba, nlb) != 0;
 		}
 		spdk_dma_free(b);
-		printf("[准备] 显存 %u 块预填 0x%02x;盘上 %u 块写入 pattern"
-		       " (seed %u),失败 %u\n", nblk, RPAT, nblk, g_seed, nfail);
+		printf("[准备] 显存 %u 块预填 0x%02x;%s %u 块写入 pattern"
+		       " (seed %u),失败 %u\n", nblk, RPAT,
+		       g_kv ? "target 上 Store 了" : "盘上", nblk, g_seed, nfail);
 		if (nfail) {
 			return 1;
 		}
@@ -947,7 +1133,19 @@ main(int argc, char **argv)
 		       nblk, g_seed);
 	}
 
-	if (g_write) {
+	if (g_write && g_kv) {
+		/* KV 的"涂色":先删掉这批 key,-k -V 时没写到的显示为 C */
+		unsigned nfail = 0;
+		int st;
+
+		for (i = 0; i < nblk; i++) {
+			st = cpu_kv(NVME_KV_OPC_DELETE, NULL, 0,
+				    g_start_lba + i, NULL);
+			nfail += st != 0 && st != NVME_KV_SC_KEY_NOT_EXIST;
+		}
+		printf("[删除] key %" PRIu64 " 起 %u 个已删除,失败 %u\n",
+		       g_start_lba, nblk, nfail);
+	} else if (g_write) {
 		/* 目标 LBA 全部涂成 0xCC,-V 时就能区分"没写"和"写了别的" */
 		void *b = spdk_dma_zmalloc(g_io_bytes, 4096, NULL);
 		unsigned nfail = 0;
@@ -1017,14 +1215,16 @@ main(int argc, char **argv)
 	c_tsreq  = calloc(g_rounds, sizeof(*c_tsreq));
 	c_tsresp = calloc(g_rounds, sizeof(*c_tsresp));
 	c_reqat  = calloc(g_rounds, sizeof(*c_reqat));
+	c_dw0    = calloc(g_rounds, sizeof(*c_dw0));
 	us = calloc(g_rounds, sizeof(*us));
 	printf("\n[运行] %s %u 条, 每条 %u 字节, QD %u, %s, -O %u\n",
-	       g_write ? "WRITE" : "READ", g_rounds, g_io_bytes, g_qd,
+	       g_kv ? kv_opc_name(ctx.nvme_opc) : g_write ? "WRITE" : "READ",
+	       g_rounds, g_io_bytes, g_qd,
 	       ctx.data_step ? "每条一块" : "单块复用", g_opt);
 
 	if (gpu_io_run(&ctx, g_start_lba, c_cap, c_sub, c_wait, c_spin,
 		       c_lock, c_stat, c_det, c_hand, c_tsreq, c_tsresp,
-		       c_reqat, &wall_us, &sh) != 0) {
+		       c_reqat, &wall_us, c_dw0, &sh) != 0) {
 		fprintf(stderr, "kernel 执行失败\n");
 		return 1;
 	}
@@ -1050,9 +1250,30 @@ main(int argc, char **argv)
 			printf(" (首个 status=0x%04x: SCT=%u SC=0x%02x%s)",
 			       sh.first_status, (sh.first_status >> 9) & 7,
 			       (sh.first_status >> 1) & 0xff,
+			       g_kv ? kv_sc_name(sh.first_status) :
 			       ((sh.first_status >> 1) & 0xff) == 0x02 &&
 			       ((sh.first_status >> 9) & 7) == 0 ?
 			       " Invalid Field —— 常见于超过 max_io_size" : "");
+		}
+		/* Retrieve 的 DW0 是 value 实际长度,应正好等于 -b */
+		if (g_kv && ctx.nvme_opc == NVME_KV_OPC_RETRIEVE) {
+			unsigned nbad = 0, first = 0;
+
+			for (i = 0; i < g_rounds; i++) {
+				if (c_stat[i] == 0 && c_dw0[i] != g_io_bytes) {
+					if (nbad++ == 0) {
+						first = i;
+					}
+				}
+			}
+			printf("\n[KV] Retrieve DW0(value 长度)不等于 %u 的: %u",
+			       g_io_bytes, nbad);
+			if (nbad) {
+				printf(" (首个第 %u 条 = %u)", first, c_dw0[first]);
+				if (!err) {
+					err = -5;
+				}
+			}
 		}
 		printf("\n[poller] CQE: SEND 完成 %u, 响应 %u;cid 异常 %u",
 		       sh.cqe_req, sh.cqe_resp, sh.cid_bad);
@@ -1526,7 +1747,16 @@ main(int argc, char **argv)
 
 
 	/* ---- 校验 ---- */
-	if (g_write) {
+	if (g_kv && (g_write || g_kv_delete)) {
+		/* 同读写:接管过的 qpair 不能再用 CPU 路径,另起进程(坑 3) */
+		printf("\n[校验] 请另起进程回读,%s:\n",
+		       g_kv_delete ? "应全部是 C(key 已删)" : "应逐块一致");
+		printf("  %s -a %s -n %s -g %d -b %u -r %u -L %" PRIu64
+		       " -S %u -k -V\n", argv[0], g_traddr, g_nqn, g_gpu_id,
+		       g_io_bytes, done, g_start_lba, g_seed);
+	} else if (g_kv && g_kv_exist) {
+		printf("\n[校验] Exist 只看状态:NVMe 成功 == 条数即 PASS\n");
+	} else if (g_write) {
 		/*
 		 * 写的校验不能在本进程做。kernel 接管过这条 qpair —— 消费了
 		 * CQE、占了 RQ slot,SPDK 对它的内部状态已经失同步。再调

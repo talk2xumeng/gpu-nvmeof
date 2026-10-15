@@ -81,6 +81,17 @@ struct gpu_io_ctx {
 	uint64_t		rsp_host_base;	/* recv buffer 区间,网卡看到的地址 */
 	uint64_t		rsp_len;
 	volatile uint8_t	*rsp_dev;	/* 同一区间的 GPU 映射 */
+
+	/*
+	 * ---- KV 命令集(wqe_build.h 的 nvme_build_kv_sqe) ----
+	 * kv = 1 时 nvme_opc 是 KV opcode,第 j 条用 key blk_kv_key(kv_seed,
+	 * start + j)、显存第 j 块;poller 额外把响应的 CQE DW0 收进 tag
+	 * (Retrieve 的 value 长度)。kv = 0 时这几个字段不读,读写路径不变。
+	 */
+	uint8_t			kv;
+	uint8_t			kv_klen;	/* 1..16 */
+	uint8_t			kv_seed;
+	uint32_t		kv_opts;	/* CDW11[15:8],NVME_KV_STORE_* / NVME_KV_RETRIEVE_* */
 };
 
 /*
@@ -130,7 +141,7 @@ struct gio_tag {
 	uint16_t	status;		/* poller:NVMe status 字(含 phase tag 位) */
 	uint64_t	ts_resp;	/* opt bit7:响应 CQE 的网卡时间戳 */
 	uint16_t	rsvd;
-	uint32_t	rsvd2;
+	uint32_t	dw0;		/* poller:NVMe CQE DW0(仅 ctx.kv) */
 	/*
 	 * 等待拆分(诊断)。clock64() 可能是每个 block 各自的计数,跨 block
 	 * 相减的结果若离谱,说明不能这么比。

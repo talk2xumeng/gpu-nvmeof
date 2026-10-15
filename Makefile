@@ -15,6 +15,15 @@
 #   make run-gpu-read-verify    GPU 读 + 逐块校验(进程内)
 #   make run-gpu-write-verify   GPU 写 + 另起进程逐块回读
 #
+# KV 命令集(target 换成 tst/kv_target 的 kv_tgt,见那里的 README):
+#   make kv-tgt           编 kv_tgt + kv_smoke(target 机器上,只要 SPDK)
+#   make kv-smoke         只编 kv_smoke(initiator 机器上)
+#   make run-kv-smoke     CPU 路径冒烟:验 target 和胶囊构造,不碰 GPU
+#   make run-gpu-kv-retrieve   GPU Retrieve + 逐块校验 + DW0 校验
+#   make run-gpu-kv-store      GPU Store + 另起进程逐块回读
+#   make run-gpu-kv-exist      GPU Exist(只看状态)
+#   make run-gpu-kv-delete     GPU Delete + 另起进程确认全部不存在
+#
 # 实验(tst/,各目录有 README 记录背景和结论):
 #   make pit7-matrix [MATRIX=1|2|3] 坑 7:kernel 写显存对网卡的可见性
 #   make pit7-bench                 坑 7:kernel 填充微基准
@@ -102,7 +111,8 @@ LDFLAGS    := $(SPDK_LIBS) $(SYS_LIBS) $(GPU_LIBS) $(RDMA_LIBS) $(EXTRA_LIBS)
         run-mmio-probe run-mmio-probe-w \
         run-verify run-bw run-host run-latency run-latency-noker sweep-block \
         run-gpu-initiated run-gpu-read-verify run-gpu-write-verify \
-        tst pit7-matrix pit7-bench help
+        tst pit7-matrix pit7-bench help kv-tgt kv-smoke run-kv-smoke \
+        run-gpu-kv-retrieve run-gpu-kv-store run-gpu-kv-exist run-gpu-kv-delete
 
 # 实验程序也在 all 里:src/ 改动若让它们编不过,当场就能发现,
 # 而不是等回头复现时才知道(坑 4)。
@@ -129,7 +139,7 @@ $(BIN)/%.o: $(SRC)/%.cpp | $(BIN)
 
 # WQE/CQE 的字节布局全在 wqe_build.h 里,改它必须重编 —— 否则只动
 # header 时 make 认为 .o 还是新的,你会拿着旧二进制查一晚上。
-$(BIN)/gpu_io_kernel.o: $(SRC)/wqe_build.h $(SRC)/gpu_io_ctx.h
+$(BIN)/gpu_io_kernel.o: $(SRC)/wqe_build.h $(SRC)/gpu_io_ctx.h $(SRC)/blk_pattern.h
 
 # GPU-initiated 原型。host 侧直接用了 mlx5dv 拿 SQ/CQ/UAR,要显式
 # 链 -lmlx5;kernel 那个 .o 是 C++ 编出来的,要 -lstdc++。
@@ -248,6 +258,37 @@ run-gpu-write-verify: $(BIN)/gpu_initiated
 	-sudo ./$(GI) -W
 	sudo ./$(GI) -V
 
+# KV:key = (seed, L+i),value 长度 = GPU_BS(8 的倍数即可)。
+# 写类(Store/Delete)的回读同样必须另起进程。
+GKV := $(GI) -k
+
+run-gpu-kv-retrieve: $(BIN)/gpu_initiated
+	sudo ./$(GKV)
+
+run-gpu-kv-store: $(BIN)/gpu_initiated
+	-sudo ./$(GKV) -W
+	sudo ./$(GKV) -V
+
+run-gpu-kv-exist: $(BIN)/gpu_initiated
+	sudo ./$(GKV) -E
+
+# 回读应全部是 C(key 不存在)。-V 的退出码因此非 0,属预期
+run-gpu-kv-delete: $(BIN)/gpu_initiated
+	-sudo ./$(GKV) -D
+	-sudo ./$(GKV) -V
+
+# ---- KV 模拟 target(tst/kv_target,target 机器上编)----
+kv-tgt:
+	$(MAKE) -C $(TST)/kv_target SPDK_DIR=$(SPDK_DIR) BIN=$(abspath $(BIN))
+
+# initiator 侧只要 kv_smoke(kv_tgt 需要打过补丁的 SPDK,只在 target 上编)
+kv-smoke:
+	$(MAKE) -C $(TST)/kv_target SPDK_DIR=$(SPDK_DIR) BIN=$(abspath $(BIN)) \
+	        $(abspath $(BIN))/kv_smoke
+
+run-kv-smoke: kv-smoke
+	sudo ./$(BIN)/kv_smoke -a $(TARGET_IP) -n $(NQN) -S $(SEED)
+
 # 扫 KV block 粒度:16/32/64/128 token @70272 B
 sweep-block: $(BIN)/latency_baseline
 	@for tok in 16 32 64 128; do \
@@ -289,4 +330,4 @@ clean:
 	rm -rf $(BIN)
 
 help:
-	@sed -n '1,25p' Makefile
+	@sed -n '1,35p' Makefile

@@ -65,6 +65,29 @@ blk_word(uint8_t seed, uint64_t lba, uint32_t k)
 	return blk_splitmix64(blk_splitmix64(lba ^ ((uint64_t)seed << 56)) + k);
 }
 
+/*
+ * KV 模式的 key:16 字节,第 idx 个 key(KV 模式下 -L/轮次映射到 idx,
+ * 对应读写模式的 LBA)。value 仍用 blk_fill(seed, idx),所以 value
+ * 自报 idx,串 key 能被 blk_check 识别成 CROSS。
+ *
+ *   [0..7]   idx,小端
+ *   [8..15]  BLK_KV_TAG ^ seed,小端 —— 低字节是 seed,换 seed 就是另一批 key,
+ *            上一轮留在 target 上的 key 不会被本轮命中
+ */
+#define BLK_KV_TAG	0x59454b5550474b00ULL	/* "\0KGPUKEY" */
+
+BLK_FN void
+blk_kv_key(uint8_t key[16], uint8_t seed, uint64_t idx)
+{
+	uint64_t hi = BLK_KV_TAG ^ seed;
+	int i;
+
+	for (i = 0; i < 8; i++) {
+		key[i] = (uint8_t)(idx >> (i * 8));
+		key[8 + i] = (uint8_t)(hi >> (i * 8));
+	}
+}
+
 #if !BLK_DEVICE
 
 #include <stddef.h>
