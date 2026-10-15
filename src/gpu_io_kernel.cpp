@@ -37,12 +37,61 @@
 
 #define GIO_TIMEOUT	2000000000ULL	/* ~1.25 s @ 1.6 GHz */
 
+/*
+ * ---- fence 级别(-O 0x4000000,gpu_io_run 启动前由 k_set_fence 写入) ----
+ *
+ * 默认全用 __threadfence_system()。共享状态(gio_shared / tag)在显存,
+ * 跨 block 可见只需要 device 级;-X 时队列也在显存,网卡读写显存同样只要
+ * device 级(mxshmem 的 IBGDA_MEMBAR、tst/devx_probe 已验证)。胶囊在
+ * finegrained 显存(-H)时同理。写 MMIO 门铃之后的那次 fence 始终是 system。
+ */
+__device__ uint32_t gio_f_sh, gio_f_q, gio_f_cap;
+
+__device__ static __forceinline__ void
+fence_sh(void)
+{
+	if (gio_f_sh) {
+		__threadfence();
+	} else {
+		__threadfence_system();
+	}
+}
+
+__device__ static __forceinline__ void
+fence_q(void)
+{
+	if (gio_f_q) {
+		__threadfence();
+	} else {
+		__threadfence_system();
+	}
+}
+
+__device__ static __forceinline__ void
+fence_cap(void)
+{
+	if (gio_f_cap) {
+		__threadfence();
+	} else {
+		__threadfence_system();
+	}
+}
+
+__global__ void
+k_set_fence(uint32_t sh, uint32_t q, uint32_t cap)
+{
+	gio_f_sh = sh;
+	gio_f_q = q;
+	gio_f_cap = cap;
+	__threadfence_system();
+}
+
 /* ---- 线程间可见的读写(同 Mooncake maca_ops.cuh 的 ld_acquire/st_release) ---- */
 
 __device__ static inline uint32_t
 ld_acq32(uint32_t *p)
 {
-	__threadfence_system();
+	fence_sh();
 	return *(volatile uint32_t *)p;
 }
 
@@ -50,7 +99,7 @@ __device__ static inline void
 st_rel32(uint32_t *p, uint32_t v)
 {
 	*(volatile uint32_t *)p = v;
-	__threadfence_system();
+	fence_sh();
 }
 
 __device__ static void
@@ -220,7 +269,7 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct pstate *ps,
 			vt->state = GIO_ST_DONE;
 		}
 		vt->t_done = clock64();
-		__threadfence_system();
+		fence_sh();
 	}
 	ps->done_cnt++;
 }
@@ -261,9 +310,9 @@ rq_flush(struct gpu_io_ctx *c, struct pstate *ps)
 		return;
 	}
 	head = ps->rq_head;
-	WQE_FENCE_QUEUE();
+	fence_q();
 	c->qp_dbrec[0] = wqe_hto_be32(head & 0xffff);
-	WQE_FENCE_DB();
+	fence_q();
 	ps->rq_pending = 0;
 	ps->rq_flushes += 1;
 }
@@ -277,7 +326,7 @@ cq_flush(struct gpu_io_ctx *c, struct pstate *ps, uint32_t ci)
 		return;
 	}
 	c->cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
-	WQE_FENCE_DB();
+	fence_q();
 	ps->cq_ci_written = ci;
 	ps->cq_db_writes += 1;
 }
@@ -406,7 +455,7 @@ advance_ci(struct gpu_io_ctx *c, struct pstate *ps, uint32_t *ci,
 		return;
 	}
 	c->cq_dbrec[0] = wqe_hto_be32(*ci & 0xffffff);
-	WQE_FENCE_DB();
+	fence_q();
 	ps->cq_db_writes += 1;
 }
 
@@ -481,7 +530,7 @@ poller(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		}
 
 		/* owner 确认之后再读 CQE 其余字段 */
-		__threadfence_system();
+		fence_q();
 		hits++;
 		idle_since = clock64();
 		if (prof) {
@@ -536,7 +585,7 @@ poll_step(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 	uint64_t rc = 0;
 	struct pstate ps;
 
-	__threadfence_system();
+	fence_sh();
 	ci = sh->sp_ci;
 	phase = (uint8_t)sh->sp_phase;
 	seq = sh->sp_seq;
@@ -554,7 +603,7 @@ poll_step(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags)
 		    (op_own >> 4) == MLX5_CQE_INVALID) {
 			break;
 		}
-		__threadfence_system();
+		fence_q();
 		sh->poll_hits++;
 		rc += consume_one(c, sh, &ps, tags, cqe, tail, &seq);
 		advance_ci(c, &ps, &ci, &phase);
@@ -686,10 +735,10 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 			d64[2] = w64[2];
 			d64[3] = w64[3];
 		}
-		WQE_FENCE_QUEUE();
+		fence_q();
 		pf_mark(pf, GIO_PF_WQE, pt);
 		c->qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
-		WQE_FENCE_DB();
+		fence_q();
 		pf_mark(pf, GIO_PF_DBR, pt);
 		if (c->opt & GIO_OPT_BF1) {
 			/* 一次主存读,把前面的 WQE / dbrec 写推到主存 */
@@ -843,7 +892,7 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 					  c->nsid,
 					  lba, nlb, blk, c->data_rkey, c->io_bytes);
 		}
-		__threadfence_system();		/* 胶囊在主存,网卡要读 */
+		fence_cap();		/* 网卡要读胶囊(主存:system;-H 显存:可 device) */
 		t1 = clock64();
 
 		/* 必须在门铃之前置 POSTED,否则 poller 置的 DONE 会被覆盖 */
@@ -865,7 +914,7 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 			pf_mark(pf, GIO_PF_REL, &pt);
 			t2 = clock64();
 			tags[tag].t_post = t2;
-			__threadfence_system();
+			fence_sh();
 			pf_mark(pf, GIO_PF_POST, &pt);
 		}
 
@@ -889,7 +938,7 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 					}
 					continue;
 				}
-				__threadfence_system();
+				fence_q();
 				sh->poll_hits++;
 				sh->resp_cycles += consume_one(c, sh, &sps, tags,
 							       cqe, tl, &my_seq);
@@ -934,7 +983,7 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		if (st >= GIO_ST_DONE) {
 			uint64_t td;
 
-			__threadfence_system();
+			fence_sh();
 			td = tags[tag].t_done;
 			c_det[J] = tags[tag].det;
 			c_hand[J] = t3 - td;
@@ -1197,6 +1246,10 @@ gpu_io_run(struct gpu_io_ctx *ctxs, unsigned int nq,
 		clock_gettime(CLOCK_MONOTONIC, &ts);
 		*wall_us_out = ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
 	}
+	k_set_fence<<<1, 1>>>((opt & GIO_OPT_DEVFENCE) ? 1u : 0u,
+			      ((opt & GIO_OPT_DEVFENCE) && ctxs[0].q_in_gpu) ? 1u : 0u,
+			      ((opt & GIO_OPT_DEVFENCE) && ctxs[0].cap_in_gpu) ? 1u : 0u);
+	mcDeviceSynchronize();
 	k_gpu_io<<<nq * per, 32>>>(d_ctx, d_sh, d_tags, per, start_lba, d_cap,
 				   d_sub, d_wait, d_spin, d_lock, d_stat, d_det,
 				   d_hand, d_tsreq, d_tsresp, d_reqat, d_dw0);

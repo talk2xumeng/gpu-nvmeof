@@ -120,6 +120,10 @@ struct gpu_io_ctx {
 	 * 两块之间轮换)。-O 0x100000 时按 pi 奇偶轮换;映射失败为 NULL。
 	 */
 	volatile uint64_t	*bf_alt;
+
+	/* 队列(SQ/CQ/RQ/dbrec)在显存(-X);胶囊在显存(-H)。配 GIO_OPT_DEVFENCE */
+	uint8_t			q_in_gpu;
+	uint8_t			cap_in_gpu;
 };
 
 /*
@@ -216,6 +220,12 @@ struct gio_shared {
  */
 #define GIO_OPT_BFSEP	0x1000000u
 #define GIO_OPT_BFGAP	0x2000000u
+/*
+ * 0x4000000:fence 降级。共享状态(gio_shared / tag,都在显存)用
+ * __threadfence();队列在显存(q_in_gpu)、胶囊在显存(cap_in_gpu)时,写它们
+ * 之后也用 __threadfence()。写 MMIO 门铃后的 fence 仍是 system。
+ */
+#define GIO_OPT_DEVFENCE	0x4000000u
 #define GIO_PF_TAG	0	/* 写 tag 的 job/state(两次 fence) */
 #define GIO_PF_LOCK	1	/* 抢 SQ 锁 */
 #define GIO_PF_PI	2	/* 读共享 sq_pi(fence) */

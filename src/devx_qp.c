@@ -277,8 +277,15 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 			    IBV_ACCESS_LOCAL_WRITE);
 	conn_mr = ibv_reg_mr(g.pd, conn, 4096, IBV_ACCESS_LOCAL_WRITE |
 			     IBV_ACCESS_REMOTE_READ);
-	cap_mr = ibv_reg_mr(g.pd, cfg->cap_host, cfg->cap_len,
-			    IBV_ACCESS_LOCAL_WRITE);
+	if (cfg->cap_fd >= 0) {
+		/* -H:胶囊区是单独一块可导出的显存,offset 0 就是起点 */
+		cap_mr = ibv_reg_dmabuf_mr(g.pd, 0, cfg->cap_len,
+					   (uint64_t)cfg->cap_host, cfg->cap_fd,
+					   IBV_ACCESS_LOCAL_WRITE);
+	} else {
+		cap_mr = ibv_reg_mr(g.pd, cfg->cap_host, cfg->cap_len,
+				    IBV_ACCESS_LOCAL_WRITE);
+	}
 	data_mr = ibv_reg_dmabuf_mr(g.pd, 0, cfg->data_len,
 				    (uint64_t)cfg->data_gpu, cfg->data_fd,
 				    IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
@@ -519,7 +526,8 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 
 	/* ---- Fabrics Connect:CPU 在这条 QP 上发一条 ---- */
 	{
-		uint8_t *cap = (uint8_t *)cfg->cap_host + cfg->cap_len - 64;
+		uint8_t *cap_slot = (uint8_t *)cfg->cap_host + cfg->cap_len - 64;
+		uint8_t capbuf[64], *cap = capbuf;
 		uint8_t wqe[64], cqe[64];
 		uint32_t ci = 0, got_resp = 0, polls = 0;
 		uint16_t st = 0xffff;
@@ -539,9 +547,15 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 		*(uint16_t *)(cap + 42) = cfg->qid;
 		*(uint16_t *)(cap + 44) = (uint16_t)(cfg->qdepth - 1);
 		*(uint32_t *)(cap + 48) = copts->keep_alive_timeout_ms;
+		if (cfg->cap_fd >= 0) {
+			gpu_copy_to_dev(cap_slot, cap, 64);
+			gpu_sync();
+		} else {
+			memcpy(cap_slot, cap, 64);
+		}
 
 		memset(wqe, 0, sizeof(wqe));
-		(void)mlx5_build_send_wqe(wqe, 0, g.qpn, (uint64_t)cap,
+		(void)mlx5_build_send_wqe(wqe, 0, g.qpn, (uint64_t)cap_slot,
 					  cap_mr->lkey, 64);
 		dev_put(sq_off(0), wqe, 64);
 		{
@@ -623,6 +637,7 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 	ctx->rq_tail	= 1;		/* Connect 的响应用掉 1 个 recv */
 	ctx->rq_head	= g.rq0;
 	ctx->rq_host_buf = rq_host;	/* gpu_io_run 拷成显存影子;init 不释放 */
+	ctx->q_in_gpu	= 1;
 	printf("[接管] SQ pi=%u  CQ ci=%u  RQ head=%u tail=1(挂着 %u 个 recv)"
 	       "  队列在显存\n", g.sq0, g.cq0, g.rq0, g.rq0 - 1);
 	return 0;

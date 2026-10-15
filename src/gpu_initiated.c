@@ -43,6 +43,8 @@
  *                        bit23(=0x800000) 只敲门铃(写 8 字节,不送 BF 数据),配 0x8000/0x40000
  *                        bit24(=0x1000000) BF 每 8 字节后 fence,bit25(=0x2000000) BF 写之间空等,
  *                        配 0x8000/0x40000
+ *                        bit26(=0x4000000) fence 降级:共享状态用 device 级;
+ *                        -X 的队列、-H 的胶囊也用 device 级
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -944,8 +946,8 @@ main(int argc, char **argv)
 		fprintf(stderr, "-O 0x80000 起的 BF 对照位要配 0x8000 或 0x40000\n");
 		return 1;
 	}
-	if (g_devx && (g_nq != 1 || g_cap_in_hbm)) {
-		fprintf(stderr, "-X 目前只支持 -q 1、胶囊在主存(不配 -H)\n");
+	if (g_devx && (g_nq != 1 || (g_cap_in_hbm && !g_cap_flags))) {
+		fprintf(stderr, "-X 目前只支持 -q 1;配 -H 时胶囊区要单独分配(-F 不为 0)\n");
 		return 1;
 	}
 	if (g_nq > 1 && (g_opt & 0x200)) {
@@ -1288,6 +1290,7 @@ main(int argc, char **argv)
 	ctx.capsule_addr = g_cap_in_hbm ? (uint64_t)g_cap_hbm
 					: (uint64_t)g_cap_host;
 	ctx.capsule_lkey = g_cap_mr->lkey;
+	ctx.cap_in_gpu   = g_cap_in_hbm ? 1 : 0;
 	ctx.data_addr    = (uint64_t)g_data_gpu;
 	ctx.data_rkey    = g_data_mr->rkey;
 	ctx.nsid         = spdk_nvme_ns_get_id(g_ns);
@@ -1316,8 +1319,9 @@ main(int argc, char **argv)
 		dc.qid = (uint16_t)(g_nq + 1);
 		dc.qdepth = 128;
 		dc.gpu_flag = CAP_FLAGS_DEFAULT;
-		dc.cap_host = g_cap_host;
+		dc.cap_host = g_cap_in_hbm ? g_cap_hbm : g_cap_host;
 		dc.cap_len = CAP_AREA_LEN;
+		dc.cap_fd = g_cap_in_hbm ? g_cap_fd : -1;
 		dc.data_gpu = g_base_gpu;
 		dc.data_len = g_total_len;
 		dc.data_fd = g_base_fd;

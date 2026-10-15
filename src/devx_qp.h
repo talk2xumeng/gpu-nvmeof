@@ -28,9 +28,10 @@ struct devx_q_cfg {
 	uint16_t	qid;
 	uint32_t	qdepth;		/* hrqsize;SQ/RQ/CQ 按它定大小 */
 	unsigned	gpu_flag;	/* 显存分配 flag(mcExtMallocWithFlags) */
-	/* 已有的胶囊区(主存)和数据区(显存 + dma-buf fd),在 DevX 的 PD 上重注册 */
-	void		*cap_host;
+	/* 已有的胶囊区和数据区(显存 + dma-buf fd),在 DevX 的 PD 上重注册 */
+	void		*cap_host;	/* 胶囊区:主存地址,或 -H 时的显存地址 */
 	size_t		cap_len;
+	int		cap_fd;		/* -H:胶囊区的 dma-buf fd;主存为 -1 */
 	void		*data_gpu;
 	size_t		data_len;
 	int		data_fd;
