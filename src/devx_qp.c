@@ -70,6 +70,10 @@ static struct {
 	uint32_t			pdn, eqn;
 	struct ibv_mr			*cap_mr, *data_mr;
 	struct dq			q[GIO_MAX_QP];
+	/* 已映射给 GPU 的 UAR 页:几条队列的 UAR 可能在同一页(reg 偏移不同),
+	 * 同一页再 mcHostRegister 会报 AlreadyRegistered */
+	void				*uar_page[GIO_MAX_QP], *uar_dev[GIO_MAX_QP];
+	unsigned			n_uar;
 } g;
 
 static int
@@ -187,6 +191,28 @@ sq_off(const struct dq *d, uint32_t pi)
 	return DQ_OFF_WQ + d->rq_cnt * 16 + (pi & (d->sq_cnt - 1)) * 64;
 }
 
+static int
+uar_map(void *page, void **dev)
+{
+	unsigned i;
+
+	for (i = 0; i < g.n_uar; i++) {
+		if (g.uar_page[i] == page) {
+			*dev = g.uar_dev[i];
+			return 0;
+		}
+	}
+	if (g.n_uar >= GIO_MAX_QP ||
+	    gpu_map_host(page, 4096, MC_HOST_REGISTER_IO_MEMORY |
+			 MC_HOST_REGISTER_MAPPED, dev) != 0) {
+		return -1;
+	}
+	g.uar_page[g.n_uar] = page;
+	g.uar_dev[g.n_uar] = *dev;
+	g.n_uar++;
+	return 0;
+}
+
 /* 第一条队列建的时候:DevX 上下文、PD、EQ,胶囊区和数据区的 MR */
 static int
 devx_shared_init(struct ibv_device *dev, const struct devx_q_cfg *cfg)
@@ -297,9 +323,7 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 	if (!d->uar) {
 		d->uar = mlx5dv_devx_alloc_uar(g.ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
 	}
-	if (!d->uar || gpu_map_host(d->uar->base_addr, 4096,
-				   MC_HOST_REGISTER_IO_MEMORY |
-				   MC_HOST_REGISTER_MAPPED, &d_uar) != 0) {
+	if (!d->uar || uar_map(d->uar->base_addr, &d_uar) != 0) {
 		fprintf(stderr, "[DevX] UAR 分配 / 映射失败\n");
 		return -1;
 	}
