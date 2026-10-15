@@ -15,9 +15,8 @@ SRC="$SPDK_DIR/lib/nvmf/ctrlr.c"
 [ -f "$SRC" ] || { echo "找不到 $SRC"; exit 1; }
 
 if grep -q "gpu-nvmeof kv_emu" "$SRC"; then
-    echo "已经打过补丁,跳过。"; exit 0
-fi
-
+    echo "ctrlr.c 已经打过补丁,跳过。"
+else
 cp "$SRC" "$SRC.orig.$(date +%s)"
 
 python3 - "$SRC" <<'PY'
@@ -40,6 +39,28 @@ s = s.replace(anchor, patch + anchor)
 open(path, 'w').write(s)
 print("  ctrlr.c 已加 kv_emu 透传分支")
 PY
+fi
+
+# 单元测试把 ctrlr.c 直接 #include 进来,bdev 函数全靠桩;补丁新用到的
+# spdk_bdev_get_module_name 没有桩,链接会失败。给它们补一个。
+for ut in test/unit/lib/nvmf/ctrlr.c/ctrlr_ut.c test/unit/lib/nvmf/tcp.c/tcp_ut.c; do
+    f="$SPDK_DIR/$ut"
+    [ -f "$f" ] || continue
+    grep -q "spdk_bdev_get_module_name" "$f" && continue
+    python3 - "$f" <<'PY'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+i = s.find("\nDEFINE_STUB(")
+if i < 0:
+    sys.exit(path + ": 找不到 DEFINE_STUB,跳过")
+stub = ("\n/* gpu-nvmeof kv_emu 补丁用到 */\n"
+        "DEFINE_STUB(spdk_bdev_get_module_name, const char *,\n"
+        "\t    (const struct spdk_bdev *bdev), \"\");\n")
+open(path, "w").write(s[:i] + stub + s[i:])
+print("  " + path.split("/test/")[-1] + " 已加桩")
+PY
+done
 
 echo
 echo "接下来: cd $SPDK_DIR && make -j\$(nproc)"

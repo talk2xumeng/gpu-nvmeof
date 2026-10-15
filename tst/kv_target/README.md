@@ -137,6 +137,11 @@ admin 队列上的 keep-alive 发不出去。target 会在 KATO(默认 10 s)后�
 `gpu_initiated` 的 `cpu_kv` 现在会在等待时顺带调用
 `spdk_nvme_ctrlr_process_admin_completions`。
 
+**SPDK 单元测试链接失败**:`ctrlr_ut` / `tcp_ut` 把 `ctrlr.c` 直接 include
+进去、bdev 函数全靠桩,补丁新用的 `spdk_bdev_get_module_name` 没有桩,
+`make` 在 test/unit 报 undefined reference(库和 nvmf_tgt 其实已经编好)。
+`apply_kv_patch.sh` 现在会顺带给这两个测试加桩,两者链接通过、全部用例通过。
+
 **`spdk_event_mempool creation failed`**:DPDK 是 .so 时,
 `librte_mempool_ring` 里只有构造函数。链接时如果开着 `--as-needed`,它会被
 丢掉,mempool 就没有 ring 驱动。解决办法是在 Makefile 里用 `--no-as-needed`
