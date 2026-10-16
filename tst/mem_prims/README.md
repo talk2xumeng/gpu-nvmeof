@@ -69,4 +69,42 @@ make mem-prims MEMS=fh GPU_ID=4
 
 ## 结果
 
-(待上机)
+### 2026-10-16,mx-decode-02,GPU 4,实测时钟 1.11 GHz
+
+单线程，每次平均 ns:
+
+| | n | f | h |
+|---|---|---|---|
+| 读 volatile / nt / plain | 196 / 176 / 201 | 358 / 358 / 358 | 1074 |
+| 读 sys fence+volatile [我们] | 203 | 358 | 1089 |
+| 读 nt+mxc acquire [DeepEP] | 194 | 352 | 1076 |
+| 写 volatile(只发出) | 223 | **348** | 481 |
+| 写 nontemporal(只发出) | 38 | **68** | 38 |
+| 写 volatile+sys fence [我们 st_rel32] | 266 | 340 | 520 |
+| 写 mxc release+nt [DeepEP] | 252 | 360 | 514 |
+| 写 nt+mxc block fence | 48 | 68 | 48 |
+| 单独一个 fence(任何级别) | 0.1 | 0.1 | 0.1 |
+| 锁 CAS+释放 [我们 / DeepEP] | 517 / 302 | **4760 / 4620** | 1572 / 1489 |
+| 提交 WQE+dbrec [我们 / DeepEP] | 1000 / 458 | **1503 / 702** | 2256 / 960 |
+| CQE 命中后读字段 [我们 / mxshmem] | 822 / 829 | 1432 / 1396 | 4354 / 4342 |
+
+跨 block 乒乓，单程 ns:5 种写法之间没有差别。n 约 620,f 约 910,h 约 1840–2000。
+不带 fence 的写法也都看得见对方的写。
+
+**结论**
+
+1. **fence 级别无关紧要。** 单独一个 fence 不花钱，带 fence 的写都等于"一次写完成"的时间。
+   system、device、mxc device 三者一样，和之前"0x4000000 不快"一致。
+   唯一例外是 mxc `"block"` 级，它不等写完成，所以跨 block 的 release 不能用它。
+2. **真正贵的是 volatile 写。** 在 MACA 上，每个 volatile 写都要等写完成
+   (f 上 348 ns),连发 4 个就是 4 倍。nontemporal 写只要 68 ns 就能发出，几个可以叠在一起，
+   最后一次 fence 统一等。"提交"那组差 0.8 µs(f)、1.3 µs(h),全来自这一点。
+3. **读没有捷径。** f 上任何读法都是 358 ns,主存都是 1.07 µs,换原语不省。
+   能省的只有读的次数，或者让几个读并发发出(`T_LD4_*` 两行待测)。
+4. **finegrained 上的原子操作要 4.7 µs。** `gio_shared`、tag 现在在 `mcMalloc` 上
+   (CAS 约 0.3–0.5 µs),不要挪到 finegrained。
+5. **跨 block 交接约 0.6 µs**(n)。换原语没有收益。
+
+**对 `-X` 热路径的含义**:能拿到的是"写"这一侧。改法是把 WQE、dbrec、RQ 补充、tag 等连续写
+都换成 nontemporal,每组只在末尾 fence 一次。提交预计省约 1 µs。
+QD1 的其余部分(网卡取 WQE / 胶囊约 5.8 µs、网络加 target 3.3 µs、串行读)换原语都省不掉。

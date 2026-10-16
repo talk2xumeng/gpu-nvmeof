@@ -66,6 +66,8 @@ enum {
 	T_LD_FSYS_V,
 	T_LD_FDEV_V,
 	T_LD_NT_MXDA,
+	T_LD4_V,
+	T_LD4_NT,
 	T_ST_V,
 	T_ST_NT,
 	T_ST_V_FSYS,
@@ -95,6 +97,8 @@ static const char *t_name[T_NUM] = {
 	"读 sys fence+volatile   [我们 ld_acq32]",
 	"读 dev fence+volatile   [我们 0x4000000]",
 	"读 nt+mxc acquire dev   [DeepEP ld_acquire]",
+	"读 4 个互不依赖 volatile(每组)",
+	"读 4 个互不依赖 nt(每组)",
 	"写 volatile(只发出)",
 	"写 nontemporal(只发出)",
 	"写 volatile+sys fence   [我们 st_rel32]",
@@ -158,6 +162,26 @@ k_single(int t, uint64_t *p, uint32_t *lk, uint64_t mask, uint32_t n,
 		break;
 	case T_LD_NT_MXDA:
 		LOOP(v = LD_NT64(p + (v & mask)); F_MXDA());
+		break;
+	case T_LD4_V:
+		/*
+		 * 一组 4 个读彼此不依赖(只依赖上一组),看硬件能不能并发发出。
+		 * consume_one 读 CQE 各字段就是这种形态。
+		 */
+		LOOP(uint64_t m = v & mask;
+		     uint64_t a0 = LD_V64(p + 8 + m);
+		     uint64_t a1 = LD_V64(p + 9 + m);
+		     uint64_t a2 = LD_V64(p + 10 + m);
+		     uint64_t a3 = LD_V64(p + 11 + m);
+		     v = a0 + a1 + a2 + a3);
+		break;
+	case T_LD4_NT:
+		LOOP(uint64_t m = v & mask;
+		     uint64_t a0 = LD_NT64(p + 8 + m);
+		     uint64_t a1 = LD_NT64(p + 9 + m);
+		     uint64_t a2 = LD_NT64(p + 10 + m);
+		     uint64_t a3 = LD_NT64(p + 11 + m);
+		     v = a0 + a1 + a2 + a3);
 		break;
 	case T_ST_V:
 		LOOP(ST_V64(p + (i & mask), i));
