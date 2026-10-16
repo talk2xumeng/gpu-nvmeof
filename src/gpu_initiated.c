@@ -50,6 +50,8 @@
  *                        bit27(=0x8000000) 热路径读写用 nontemporal,一组写末尾
  *                        fence 一次,门铃后不 fence(同 DeepEP;tst/mem_prims)
  *                        bit28(=0x10000000) 胶囊内联进 SEND WQE(仅 -X,不配 -G/-k)
+ *                        bit29(=0x20000000) kernel 的 ctx 副本放 shared memory
+ *                        (默认在 local memory,fence 后每次 c-> 都是一次显存读)
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -1018,6 +1020,15 @@ main(int argc, char **argv)
 	    (!g_devx || g_bf_gap >= 0 || g_kv)) {
 		fprintf(stderr, "-O 0x10000000(胶囊内联)只支持 -X、不配 -G、"
 			"不配 -k\n");
+		return 1;
+	}
+	/*
+	 * 时间戳按条配对 SEND 完成和响应,要求每条 SEND 都要 CQE;默认的
+	 * 0x4000 每 GIO_SIG_EVERY 条才要一次,其余条配到的是旧时间戳。
+	 */
+	if ((g_opt & 0x80) && (g_opt & 0x4000)) {
+		fprintf(stderr, "-O 128(网卡时间戳)不能配 0x4000(SEND 选择性 signal),"
+			"用 0x10000 去掉默认位,如 -O 0x13080\n");
 		return 1;
 	}
 	if ((g_opt & 0x20) && g_qd != 1) {

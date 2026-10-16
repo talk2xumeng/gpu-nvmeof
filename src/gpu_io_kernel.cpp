@@ -1353,6 +1353,9 @@ k_gpu_io(const struct gpu_io_ctx *ctxs, struct gio_shared *shs,
 	uint32_t q = blockIdx.x / per;
 	uint32_t t = blockIdx.x % per;
 	struct gpu_io_ctx ctx;
+	/* GIO_OPT_SHCTX:本 block 的 ctx 副本放 shared memory(见 gpu_io_ctx.h) */
+	static __shared__ struct gpu_io_ctx s_ctx;
+	struct gpu_io_ctx *cp = &ctx;
 	struct gio_shared *sh;
 	struct gio_tag *tags;
 
@@ -1360,6 +1363,10 @@ k_gpu_io(const struct gpu_io_ctx *ctxs, struct gio_shared *shs,
 		return;
 	}
 	ctx = ctxs[q];
+	if (ctx.opt & GIO_OPT_SHCTX) {
+		s_ctx = ctx;
+		cp = &s_ctx;
+	}
 	sh = shs + q;
 	tags = tags_all + (size_t)q * ctx.qd;
 	{
@@ -1382,14 +1389,20 @@ k_gpu_io(const struct gpu_io_ctx *ctxs, struct gio_shared *shs,
 	}
 	if (t == 0) {
 		if ((ctx.opt & 0x30) == 0) {
-			poller(&ctx, sh, tags);
+			poller(cp, sh, tags);
 		}
 	} else {
-		submitter(&ctx, sh, tags, t - 1, start_lba, c_cap, c_sub,
+		submitter(cp, sh, tags, t - 1, start_lba, c_cap, c_sub,
 			  c_wait, c_spin, c_lock, c_stat, c_det, c_hand,
 			  c_tsreq, c_tsresp, c_reqat, c_dw0);
 	}
-	if (t == (((ctx.opt & 0x30) && !(ctx.opt & 0x40)) ? 1u : 0u)) {
+	/*
+	 * 结束时钟由第一个干活的 block 记:有 poller 时是 poller(t = 0),
+	 * 自轮询 / 串行快路径时是第一个 submitter(t = 1;配 0x40 时上面已经
+	 * t++,第一个 submitter 也是 1)。之前写成 0x40 时取 0,k_end 从没记过,
+	 * 那几种配置打不出实测时钟和 IOPS。
+	 */
+	if (t == ((ctx.opt & 0x30) ? 1u : 0u)) {
 		sh->k_end = clock64();
 	}
 }
