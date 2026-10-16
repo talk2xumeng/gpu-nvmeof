@@ -245,13 +245,6 @@ struct gio_shared {
  * 发包,省掉取胶囊那次 DMA 读(-X 胶囊在主存)。
  */
 #define GIO_OPT_INLCAP		0x10000000u
-/*
- * 0x20000000:ctx 副本放 block 的 shared memory。默认 ctx 是 k_gpu_io 的
- * 局部变量、地址传给 poller / submitter,落在 local memory(显存);每次
- * fence 之后编译器都要重读 c->opt / c->njobs / c->cq_buf …… 剖析里 poller
- * 空转一圈"done 检查"209 ns、"idle_flush"267 ns,各约一次显存读。
- */
-#define GIO_OPT_SHCTX		0x20000000u
 #define GIO_PF_TAG	0	/* 写 tag 的 job/state(两次 fence) */
 #define GIO_PF_LOCK	1	/* 抢 SQ 锁 */
 #define GIO_PF_PI	2	/* 读共享 sq_pi(fence) */

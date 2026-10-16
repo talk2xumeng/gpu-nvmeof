@@ -1352,10 +1352,13 @@ k_gpu_io(const struct gpu_io_ctx *ctxs, struct gio_shared *shs,
 {
 	uint32_t q = blockIdx.x / per;
 	uint32_t t = blockIdx.x % per;
+	/*
+	 * ctx 必须是普通局部变量、只以 &ctx 传下去:poller / submitter 及其
+	 * 调用的函数全部内联后，编译器把它拆进寄存器。0029 试过按 opt 在
+	 * &ctx 和 shared memory 副本之间选指针，编译器就没法这样做了，开不开
+	 * 都全面变慢(QD1 串行快路径 9.5 → 17.8 µs,空转一圈 0.57 → 2.2 µs)。
+	 */
 	struct gpu_io_ctx ctx;
-	/* GIO_OPT_SHCTX:本 block 的 ctx 副本放 shared memory(见 gpu_io_ctx.h) */
-	static __shared__ struct gpu_io_ctx s_ctx;
-	struct gpu_io_ctx *cp = &ctx;
 	struct gio_shared *sh;
 	struct gio_tag *tags;
 
@@ -1363,10 +1366,6 @@ k_gpu_io(const struct gpu_io_ctx *ctxs, struct gio_shared *shs,
 		return;
 	}
 	ctx = ctxs[q];
-	if (ctx.opt & GIO_OPT_SHCTX) {
-		s_ctx = ctx;
-		cp = &s_ctx;
-	}
 	sh = shs + q;
 	tags = tags_all + (size_t)q * ctx.qd;
 	{
@@ -1389,10 +1388,10 @@ k_gpu_io(const struct gpu_io_ctx *ctxs, struct gio_shared *shs,
 	}
 	if (t == 0) {
 		if ((ctx.opt & 0x30) == 0) {
-			poller(cp, sh, tags);
+			poller(&ctx, sh, tags);
 		}
 	} else {
-		submitter(cp, sh, tags, t - 1, start_lba, c_cap, c_sub,
+		submitter(&ctx, sh, tags, t - 1, start_lba, c_cap, c_sub,
 			  c_wait, c_spin, c_lock, c_stat, c_det, c_hand,
 			  c_tsreq, c_tsresp, c_reqat, c_dw0);
 	}
