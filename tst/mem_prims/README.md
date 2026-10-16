@@ -99,12 +99,27 @@ make mem-prims MEMS=fh GPU_ID=4
 2. **真正贵的是 volatile 写。** 在 MACA 上，每个 volatile 写都要等写完成
    (f 上 348 ns),连发 4 个就是 4 倍。nontemporal 写只要 68 ns 就能发出，几个可以叠在一起，
    最后一次 fence 统一等。"提交"那组差 0.8 µs(f)、1.3 µs(h),全来自这一点。
-3. **读没有捷径。** f 上任何读法都是 358 ns,主存都是 1.07 µs,换原语不省。
-   能省的只有读的次数，或者让几个读并发发出(`T_LD4_*` 两行待测)。
+3. **单个读没有捷径，但 nontemporal 读能并发。** f 上单个读，用哪种原语都是 350 ns 左右，主存都是 1.07 µs。
+   一组 4 个互不依赖的读(复测，同一天):
+
+   | | n | f |
+   |---|---|---|
+   | 4 个 volatile | 682 | **1380** |
+   | 4 个 nontemporal | 236 | **415** |
+
+   volatile 读像 volatile 写一样串行，一个接一个等。nontemporal 读能同时在路上，4 个只比 1 个多 60 ns。
+   "CQE 命中后读字段"那组没体现出来，是因为测法里每个读都依赖上一个，实际代码不是这样。
+   consume_one 读 CQE、NVMe CQE、RQ 槽这些字段互不依赖，换成 nontemporal 一起发出，
+   每条响应能省 1 µs 量级。
 4. **finegrained 上的原子操作要 4.7 µs。** `gio_shared`、tag 现在在 `mcMalloc` 上
    (CAS 约 0.3–0.5 µs),不要挪到 finegrained。
 5. **跨 block 交接约 0.6 µs**(n)。换原语没有收益。
 
-**对 `-X` 热路径的含义**:能拿到的是"写"这一侧。改法是把 WQE、dbrec、RQ 补充、tag 等连续写
-都换成 nontemporal,每组只在末尾 fence 一次。提交预计省约 1 µs。
-QD1 的其余部分(网卡取 WQE / 胶囊约 5.8 µs、网络加 target 3.3 µs、串行读)换原语都省不掉。
+**对 `-X` 热路径的含义**:
+
+- **写**:WQE、dbrec、RQ 补充、tag 等连续写都换成 nontemporal,每组只在末尾 fence 一次。
+  提交预计省约 1 µs。
+- **读**:同一条 CQE / 响应要读的字段，换成 nontemporal 一次全发出去，处理一条响应
+  (4.1 µs)预计省 1 µs 以上。
+
+网卡取 WQE / 胶囊(约 5.8 µs)、网络加 target(3.3 µs)两段，换原语都省不掉。

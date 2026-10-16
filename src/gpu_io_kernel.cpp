@@ -98,6 +98,21 @@ st_rel32(uint32_t *p, uint32_t v)
 	fence_sh();
 }
 
+/*
+ * ---- nontemporal 读写(-O 0x8000000,GIO_OPT_NT)----
+ *
+ * 同 DeepEP utils.cuh 的 MACA 分支。tst/mem_prims 实测:volatile 写要等
+ * 写完成、volatile 读串行;nontemporal 写发出即走、读可并发。fence 本身
+ * 不花钱,等的是之前未完成的写 —— 所以一组 NT_ST 之后一个 NT_REL 就够。
+ * "block" 级 fence 不等写完成,跨 block / 给网卡的 release 不能用它。
+ */
+#define NT_LD64(p)	__builtin_nontemporal_load((uint64_t *)(p))
+#define NT_LD32(p)	__builtin_nontemporal_load((uint32_t *)(p))
+#define NT_ST64(p, v)	__builtin_nontemporal_store((uint64_t)(v), (uint64_t *)(p))
+#define NT_ST32(p, v)	__builtin_nontemporal_store((uint32_t)(v), (uint32_t *)(p))
+#define NT_ST16(p, v)	__builtin_nontemporal_store((uint16_t)(v), (uint16_t *)(p))
+#define NT_REL()	__builtin_mxc_fence(__ATOMIC_RELEASE, "device")
+
 __device__ static void
 set_abort(struct gio_shared *sh, int err)
 {
@@ -206,7 +221,9 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct pstate *ps,
 		uint32_t k = wqe_counter & (c->rq_wqe_cnt - 1);
 		volatile uint8_t *seg = c->rq_buf + (size_t)k * c->rq_stride;
 		/* mlx5_wqe_data_seg:byte_count(4) lkey(4) addr(8),大端 */
-		uint64_t addr = wqe_hto_be64(*(volatile uint64_t *)(seg + 8));
+		uint64_t addr = wqe_hto_be64((c->opt & GIO_OPT_NT) ?
+					     NT_LD64(seg + 8) :
+					     *(volatile uint64_t *)(seg + 8));
 
 		if (c->rsp_len == 0 || addr < c->rsp_host_base ||
 		    addr + 16 > c->rsp_host_base + c->rsp_len) {
@@ -216,14 +233,22 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct pstate *ps,
 		}
 		ncqe = c->rsp_dev + (addr - c->rsp_host_base);
 	}
-	w = *(volatile uint64_t *)(ncqe + 8);
 	/*
 	 * DW0 多一次主存读,实测每条响应 +0.65~1.1 us(KV vs NVM 对照)。只有
 	 * Retrieve 的 DW0 有内容(value 长度),Store/Exist/Delete 不读。
 	 * 没有并成一次 16 字节读:recv buffer 按 40 字节间隔排,不保证 16 对齐。
+	 * NT 时两个读一起发出,不再多付一次时延。
 	 */
-	if (c->kv && c->nvme_opc == NVME_KV_OPC_RETRIEVE) {
-		dw0 = *(volatile uint32_t *)ncqe;
+	if (c->opt & GIO_OPT_NT) {
+		w = NT_LD64(ncqe + 8);
+		if (c->kv && c->nvme_opc == NVME_KV_OPC_RETRIEVE) {
+			dw0 = NT_LD32(ncqe);
+		}
+	} else {
+		w = *(volatile uint64_t *)(ncqe + 8);
+		if (c->kv && c->nvme_opc == NVME_KV_OPC_RETRIEVE) {
+			dw0 = *(volatile uint32_t *)ncqe;
+		}
 	}
 	/* NVMe CQE 小端:[8]sqhd [10]sqid [12]cid [14]status */
 	cid = (uint16_t)(w >> 32);
@@ -245,7 +270,35 @@ handle_resp(struct gpu_io_ctx *c, struct gio_shared *sh, struct pstate *ps,
 		return;
 	}
 
-	{
+	if (c->opt & GIO_OPT_NT) {
+		/*
+		 * 字段全用 nontemporal 写(各 ~70 ns,可叠加),一次 release 等它们
+		 * 落地,最后写 state。state 之后不 fence:submitter 轮询自会看到
+		 * (mem_prims 乒乓:不 fence 也可见,单程 ~0.6 µs)。
+		 * t_done 记在 fence 之前,c_hand 因此多含一次 fence。
+		 */
+		struct gio_tag *t = &tags[tag];
+		uint64_t now = clock64();
+		uint64_t tp = NT_LD64(&t->t_post);
+		uint32_t st = GIO_ST_DONE;
+
+		if (c->opt & 0x80) {
+			NT_ST64(&t->ts_resp, cqe64_ts(cqe64));
+		}
+		NT_ST32(&t->dw0, dw0);
+		NT_ST16(&t->status, status);
+		if ((status >> 1) != 0) {
+			if (ps->nvme_err == 0) {
+				ps->first_status = status;
+			}
+			ps->nvme_err++;
+			st = GIO_ST_NVME_ERR;
+		}
+		NT_ST64(&t->det, now - tp);
+		NT_ST64(&t->t_done, clock64());
+		NT_REL();
+		NT_ST32(&t->state, st);
+	} else {
 		volatile struct gio_tag *vt = (volatile struct gio_tag *)&tags[tag];
 		uint64_t now = clock64();
 
@@ -306,9 +359,15 @@ rq_flush(struct gpu_io_ctx *c, struct pstate *ps)
 		return;
 	}
 	head = ps->rq_head;
-	fence_q();
-	c->qp_dbrec[0] = wqe_hto_be32(head & 0xffff);
-	fence_q();
+	if (c->opt & GIO_OPT_NT) {
+		/* 槽内容落地后再推 dbrec;dbrec 是 posted 写,之后不用等 */
+		NT_REL();
+		NT_ST32(&c->qp_dbrec[0], wqe_hto_be32(head & 0xffff));
+	} else {
+		fence_q();
+		c->qp_dbrec[0] = wqe_hto_be32(head & 0xffff);
+		fence_q();
+	}
 	ps->rq_pending = 0;
 	ps->rq_flushes += 1;
 }
@@ -321,8 +380,12 @@ cq_flush(struct gpu_io_ctx *c, struct pstate *ps, uint32_t ci)
 	    ps->cq_ci_written == ci) {
 		return;
 	}
-	c->cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
-	fence_q();
+	if (c->opt & GIO_OPT_NT) {
+		NT_ST32(&c->cq_dbrec[0], wqe_hto_be32(ci & 0xffffff));
+	} else {
+		c->cq_dbrec[0] = wqe_hto_be32(ci & 0xffffff);
+		fence_q();
+	}
 	ps->cq_ci_written = ci;
 	ps->cq_db_writes += 1;
 }
@@ -406,11 +469,28 @@ rq_repost(struct gpu_io_ctx *c, struct pstate *ps, uint16_t wqe_counter)
 	volatile uint64_t *src = c->rq_shadow + (size_t)k * words;
 	volatile uint64_t *shd = c->rq_shadow + (size_t)h * words;
 
-	for (i = 0; i < words; i++) {
-		uint64_t v = src[i];
+	if ((c->opt & GIO_OPT_NT) && words == 2) {
+		/* 两个读一起发出,四个写叠着发;rq_flush 推 dbrec 前统一 fence */
+		uint64_t v0 = NT_LD64(src), v1 = NT_LD64(src + 1);
 
-		dst[i] = v;
-		shd[i] = v;
+		NT_ST64(dst, v0);
+		NT_ST64(dst + 1, v1);
+		NT_ST64(shd, v0);
+		NT_ST64(shd + 1, v1);
+	} else if (c->opt & GIO_OPT_NT) {
+		for (i = 0; i < words; i++) {
+			uint64_t v = NT_LD64(src + i);
+
+			NT_ST64(dst + i, v);
+			NT_ST64(shd + i, v);
+		}
+	} else {
+		for (i = 0; i < words; i++) {
+			uint64_t v = src[i];
+
+			dst[i] = v;
+			shd[i] = v;
+		}
 	}
 	head++;
 	ps->rq_head = head;
@@ -444,10 +524,20 @@ advance_ci(struct gpu_io_ctx *c, struct pstate *ps, uint32_t *ci,
 		 * 溢出余量由 host 压 QD 保证:2*QD + GIO_CQ_BATCH < cq_cnt。
 		 */
 		if ((*ci & (GIO_CQ_BATCH - 1)) == 0) {
-			c->cq_dbrec[0] = wqe_hto_be32(*ci & 0xffffff);
+			if (c->opt & GIO_OPT_NT) {
+				NT_ST32(&c->cq_dbrec[0],
+					wqe_hto_be32(*ci & 0xffffff));
+			} else {
+				c->cq_dbrec[0] = wqe_hto_be32(*ci & 0xffffff);
+			}
 			ps->cq_ci_written = *ci;
 			ps->cq_db_writes += 1;
 		}
+		return;
+	}
+	if (c->opt & GIO_OPT_NT) {
+		NT_ST32(&c->cq_dbrec[0], wqe_hto_be32(*ci & 0xffffff));
+		ps->cq_db_writes += 1;
 		return;
 	}
 	c->cq_dbrec[0] = wqe_hto_be32(*ci & 0xffffff);
@@ -647,9 +737,14 @@ sq_lock(struct gio_shared *sh)
 }
 
 __device__ static void
-sq_unlock(struct gio_shared *sh)
+sq_unlock(struct gpu_io_ctx *c, struct gio_shared *sh)
 {
-	st_rel32(&sh->sq_lock, 0u);
+	if (c->opt & GIO_OPT_NT) {
+		NT_REL();
+		NT_ST32(&sh->sq_lock, 0u);
+	} else {
+		st_rel32(&sh->sq_lock, 0u);
+	}
 }
 
 /*
@@ -680,6 +775,123 @@ pf_mark(uint64_t *pf, int i, uint64_t *t)
 		pf[i] += now - *t;
 		*t = now;
 	}
+}
+
+/* 胶囊内联(GIO_OPT_INLCAP)时直接在寄存器里拼胶囊用的字段 */
+struct cap_args {
+	uint64_t	lba;
+	uint64_t	addr;		/* 数据块(显存)地址 */
+	uint32_t	nsid;
+	uint32_t	nlb;
+	uint32_t	rkey;
+	uint32_t	len;
+	uint16_t	cid;
+	uint8_t		opc;
+};
+
+/* 胶囊内联的 WQE 占几个 WQEBB(pi 每条前进多少) */
+#define GIO_INL_BB		2
+#define GIO_MLX5_INLINE_SEG	0x80000000u
+
+/*
+ * 胶囊内联的 SEND(-O 0x10000000,只走 -X 的 8 字节门铃)。
+ *
+ * WQE 96 字节(ds = 6),按 32 位字排(小端装成 64 位写):
+ *   D0..D3   ctrl:opmod_idx_opcode、qpn_ds、fm_ce_se、imm   —— 大端
+ *   D4       inline 头:byte_count = 64 | MLX5_INLINE_SEG     —— 大端
+ *   D5..D20  NVMe SQE 16 个 dword                           —— 小端
+ *   D21..D23 补 0
+ * 前 64 字节在 WQEBB pi,后 32 字节在 WQEBB pi+1(环尾回绕到槽 0)。
+ *
+ * SQE 字段和 nvme_build_rw_sqe 逐字段对应:
+ *   d0  opc | psdt(1)<<14 | cid<<16      d1  nsid
+ *   d2..d5  0(cdw2/3、mptr)            d6/d7  SGL 地址
+ *   d8  长度 24 位 | key 字节 0 << 24    d9  key 字节 1..3 | SGL 类型 << 24
+ *   d10/d11 slba                          d12 nlb - 1     d13..d15 0
+ */
+__device__ static __forceinline__ void
+post_wqe_inl(struct gpu_io_ctx *c, uint16_t pi, struct cap_args ca,
+	     uint64_t *pf, uint64_t *pt)
+{
+	uint32_t mask = c->sq_wqe_cnt - 1;
+	volatile uint64_t *b0 = (volatile uint64_t *)
+		(c->sq_buf + (size_t)(pi & mask) * 64);
+	volatile uint64_t *b1 = (volatile uint64_t *)
+		(c->sq_buf + (size_t)((pi + 1) & mask) * 64);
+	int nt = (c->opt & GIO_OPT_NT) != 0;
+	/* 跨过 GIO_SIG_EVERY 的整数倍才要 CQE;每条占 1 个 WQEBB 时同原判据 */
+	int unsig = (c->opt & 0x4000) &&
+		    (((pi ^ (pi + GIO_INL_BB)) & ~(GIO_SIG_EVERY - 1)) == 0);
+	uint32_t d0 = (uint32_t)ca.opc |
+		      ((uint32_t)(NVME_PSDT_SGL_MPTR_CONTIG << 6) << 8) |
+		      ((uint32_t)ca.cid << 16);
+	uint32_t d8 = (ca.len & 0xffffffu) | ((ca.rkey & 0xffu) << 24);
+	uint32_t d9 = (ca.rkey >> 8) |
+		      ((uint32_t)((NVME_SGL_TYPE_KEYED_DATA_BLOCK << 4) |
+				  NVME_SGL_SUBTYPE_ADDRESS) << 24);
+	uint64_t q0, q1, q2, q3, q5, q6, q7, q8;
+
+	q0 = (uint64_t)wqe_hto_be32(((uint32_t)pi << 8) | MLX5_OPCODE_SEND) |
+	     ((uint64_t)wqe_hto_be32((c->qpn << 8) | 6) << 32);
+	q1 = unsig ? 0 : (uint64_t)(((uint32_t)MLX5_WQE_CTRL_CQ_UPDATE) << 24);
+	q2 = (uint64_t)wqe_hto_be32(64 | GIO_MLX5_INLINE_SEG) |
+	     ((uint64_t)d0 << 32);
+	q3 = (uint64_t)ca.nsid;				/* D6 = d1,D7 = d2 = 0 */
+							/* q4:D8/D9 = d3/d4 = 0 */
+	q5 = (uint64_t)(uint32_t)ca.addr << 32;		/* D10 = d5 = 0,D11 = d6 */
+	q6 = (ca.addr >> 32) | ((uint64_t)d8 << 32);	/* D12 = d7,D13 = d8 */
+	q7 = (uint64_t)d9 | ((uint64_t)(uint32_t)ca.lba << 32);	/* D14,D15 = d10 */
+	q8 = (ca.lba >> 32) |
+	     ((uint64_t)((ca.nlb - 1) & 0xffff) << 32);	/* D16 = d11,D17 = d12 */
+
+	if (nt) {
+		NT_ST64(b0 + 0, q0);
+		NT_ST64(b0 + 1, q1);
+		NT_ST64(b0 + 2, q2);
+		NT_ST64(b0 + 3, q3);
+		NT_ST64(b0 + 4, 0);
+		NT_ST64(b0 + 5, q5);
+		NT_ST64(b0 + 6, q6);
+		NT_ST64(b0 + 7, q7);
+		NT_ST64(b1 + 0, q8);
+		NT_ST64(b1 + 1, 0);
+		NT_ST64(b1 + 2, 0);
+		NT_ST64(b1 + 3, 0);
+		NT_REL();
+	} else {
+		b0[0] = q0;
+		b0[1] = q1;
+		b0[2] = q2;
+		b0[3] = q3;
+		b0[4] = 0;
+		b0[5] = q5;
+		b0[6] = q6;
+		b0[7] = q7;
+		b1[0] = q8;
+		b1[1] = 0;
+		b1[2] = 0;
+		b1[3] = 0;
+		fence_q();
+	}
+	pf_mark(pf, GIO_PF_WQE, pt);
+	if (nt) {
+		NT_ST32(&c->qp_dbrec[1],
+			wqe_hto_be32((uint32_t)(pi + GIO_INL_BB) & 0xffff));
+		NT_REL();
+	} else {
+		c->qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + GIO_INL_BB) &
+					      0xffff);
+		fence_q();
+	}
+	pf_mark(pf, GIO_PF_DBR, pt);
+	/* 门铃:控制段前 8 字节,网卡从 SQ 取整条 WQE(胶囊已在里面) */
+	if (nt) {
+		NT_ST64(c->bf_reg, q0);
+	} else {
+		c->bf_reg[0] = q0;
+		WQE_FENCE_DB();
+	}
+	pf_mark(pf, GIO_PF_BF, pt);
 }
 
 __device__ static __forceinline__ void
@@ -723,18 +935,33 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 			 ((uint64_t)wqe_hto_be32(c->capsule_lkey) << 32);
 		w64[3] = (uint64_t)wqe_hto_be32((uint32_t)(cap_addr >> 32)) |
 			 ((uint64_t)wqe_hto_be32((uint32_t)cap_addr) << 32);
-		{
+		int nt = (c->opt & GIO_OPT_NT) != 0;
+
+		if (nt) {
+			/* 4 个写叠着发,一次 release 等它们落地 */
+			NT_ST64(sq_slot, w64[0]);
+			NT_ST64(sq_slot + 8, w64[1]);
+			NT_ST64(sq_slot + 16, w64[2]);
+			NT_ST64(sq_slot + 24, w64[3]);
+			NT_REL();
+		} else {
 			volatile uint64_t *d64 = (volatile uint64_t *)sq_slot;
 
 			d64[0] = w64[0];
 			d64[1] = w64[1];
 			d64[2] = w64[2];
 			d64[3] = w64[3];
+			fence_q();
 		}
-		fence_q();
 		pf_mark(pf, GIO_PF_WQE, pt);
-		c->qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
-		fence_q();
+		if (nt) {
+			NT_ST32(&c->qp_dbrec[1],
+				wqe_hto_be32((uint32_t)(pi + 1) & 0xffff));
+			NT_REL();
+		} else {
+			c->qp_dbrec[1] = wqe_hto_be32((uint32_t)(pi + 1) & 0xffff);
+			fence_q();
+		}
 		pf_mark(pf, GIO_PF_DBR, pt);
 		if (c->opt & GIO_OPT_BF1) {
 			/* 一次主存读,把前面的 WQE / dbrec 写推到主存 */
@@ -749,7 +976,12 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 		if ((c->opt & GIO_OPT_BFTOG) && (pi & 1) && c->bf_alt) {
 			bfp = c->bf_alt;
 		}
-		if (c->opt & GIO_OPT_DB8) {
+		if ((c->opt & GIO_OPT_DB8) && nt) {
+			/* 同 DeepEP ibgda_ring_db:门铃也是 nontemporal,之后不 fence */
+			NT_ST64(bfp, w64[0]);
+			pf_mark(pf, GIO_PF_BF, pt);
+			return;
+		} else if (c->opt & GIO_OPT_DB8) {
 			/* 普通门铃:只写控制段前 8 字节,网卡从 SQ 取 WQE */
 			bfp[0] = w64[0];
 		} else if (c->opt & (GIO_OPT_BFSEP | GIO_OPT_BFGAP)) {
@@ -824,15 +1056,34 @@ post_wqe(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
 
 }
 
+/* 胶囊内联走 post_wqe_inl(每条 GIO_INL_BB 个 WQEBB),否则 post_wqe */
+__device__ static __forceinline__ uint32_t
+post_any(struct gpu_io_ctx *c, uint16_t pi, uint64_t cap_addr,
+	 const struct cap_args &ca, uint64_t *pf, uint64_t *pt)
+{
+	if (c->opt & GIO_OPT_INLCAP) {
+		post_wqe_inl(c, pi, ca, pf, pt);
+		return GIO_INL_BB;
+	}
+	post_wqe(c, pi, cap_addr, pf, pt);
+	return 1;
+}
+
 __device__ static __forceinline__ void
 post_locked(struct gpu_io_ctx *c, struct gio_shared *sh, uint64_t cap_addr,
-	    uint64_t *pf, uint64_t *pt)
+	    const struct cap_args &ca, uint64_t *pf, uint64_t *pt)
 {
 	uint16_t pi = (uint16_t)ld_acq32(&sh->sq_pi);
+	uint32_t nbb;
 
 	pf_mark(pf, GIO_PF_PI, pt);
-	post_wqe(c, pi, cap_addr, pf, pt);
-	st_rel32(&sh->sq_pi, (uint32_t)pi + 1);
+	nbb = post_any(c, pi, cap_addr, ca, pf, pt);
+	if (c->opt & GIO_OPT_NT) {
+		/* 解锁前的 release(sq_unlock)保证下一个持锁者读到新值 */
+		NT_ST32(&sh->sq_pi, (uint32_t)pi + nbb);
+	} else {
+		st_rel32(&sh->sq_pi, (uint32_t)pi + nbb);
+	}
 }
 
 __device__ static void
@@ -849,6 +1100,7 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	uint32_t my_ci = c->cq_ci, my_seq = 0;
 	uint8_t my_phase = c->cq_phase;
 	struct pstate sps;		/* 串行快路径的消费者状态,退出时写回 */
+	uint64_t sp_hits = 0, sp_rc = 0;	/* 同上,NT 时的 poll_hits / resp_cycles */
 	/* -O 0x20000 剖析:提交路径分段先本地累计,退出时加进 sh->prof */
 	uint64_t lpf[GIO_PF_POST + 1] = { 0 };
 	uint64_t *pf = (c->opt & GIO_OPT_PROF) ? lpf : NULL;
@@ -873,9 +1125,22 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		uint64_t blk = c->data_addr + (uint64_t)J * c->data_step;
 		uint64_t t0, t1, t2, t3, lspins, spins = 0;
 		uint32_t st;
+		int nt = (c->opt & GIO_OPT_NT) != 0;
+		struct cap_args ca;
+
+		ca.lba = lba;
+		ca.addr = blk;
+		ca.nsid = c->nsid;
+		ca.nlb = nlb;
+		ca.rkey = c->data_rkey;
+		ca.len = c->io_bytes;
+		ca.cid = cid;
+		ca.opc = c->nvme_opc;
 
 		t0 = clock64();
-		if (c->kv) {
+		if (c->opt & GIO_OPT_INLCAP) {
+			/* 胶囊在 post_wqe_inl 里直接拼进 WQE,不写胶囊区 */
+		} else if (c->kv) {
 			/* KV:第 J 条的 key 由 (seed, start + J) 决定,和 host 侧一致 */
 			uint8_t key[NVME_KV_MAX_KEY];
 
@@ -888,29 +1153,52 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 					  c->nsid,
 					  lba, nlb, blk, c->data_rkey, c->io_bytes);
 		}
-		fence_cap();		/* 网卡要读胶囊(主存:system;-H 显存:可 device) */
-		t1 = clock64();
+		if (nt) {
+			/*
+			 * 必须在门铃之前置 POSTED,否则 poller 置的 DONE 会被覆盖。
+			 * NT:tag 和胶囊一起写,一次 release 等两者落地。c_cap 因此
+			 * 含写 tag,剖析的"写 tag"段近似 0。
+			 */
+			NT_ST32(&tags[tag].job, j);
+			NT_ST32(&tags[tag].state, GIO_ST_POSTED);
+			NT_REL();
+			t1 = clock64();
+			pt = t1;
+		} else {
+			if (!(c->opt & GIO_OPT_INLCAP)) {
+				fence_cap();	/* 网卡要读胶囊(主存:system;-H 显存:可 device) */
+			}
+			t1 = clock64();
 
-		/* 必须在门铃之前置 POSTED,否则 poller 置的 DONE 会被覆盖 */
-		st_rel32(&tags[tag].job, j);
-		st_rel32(&tags[tag].state, GIO_ST_POSTED);
-		pt = t1;
-		pf_mark(pf, GIO_PF_TAG, &pt);
+			/* 必须在门铃之前置 POSTED,否则 poller 置的 DONE 会被覆盖 */
+			st_rel32(&tags[tag].job, j);
+			st_rel32(&tags[tag].state, GIO_ST_POSTED);
+			pt = t1;
+			pf_mark(pf, GIO_PF_TAG, &pt);
+		}
 
 		if (c->opt & 0x100) {
 			/* 门铃之后一个带 fence 的写都没有,同旧串行 kernel */
-			post_wqe(c, (uint16_t)(c->sq_pi + j), cap_addr, pf, &pt);
+			uint32_t bb = (c->opt & GIO_OPT_INLCAP) ? GIO_INL_BB : 1;
+
+			(void)post_any(c, (uint16_t)(c->sq_pi + j * bb), cap_addr,
+				       ca, pf, &pt);
 			lspins = 0;
 			t2 = clock64();
 		} else {
 			lspins = sq_lock(sh);
 			pf_mark(pf, GIO_PF_LOCK, &pt);
-			post_locked(c, sh, cap_addr, pf, &pt);
-			sq_unlock(sh);
+			post_locked(c, sh, cap_addr, ca, pf, &pt);
+			sq_unlock(c, sh);
 			pf_mark(pf, GIO_PF_REL, &pt);
 			t2 = clock64();
-			tags[tag].t_post = t2;
-			fence_sh();
+			if (nt) {
+				/* 诊断用,poller 算 det 时读;响应要几 µs 后才到,不必 fence */
+				NT_ST64(&tags[tag].t_post, t2);
+			} else {
+				tags[tag].t_post = t2;
+				fence_sh();
+			}
 			pf_mark(pf, GIO_PF_POST, &pt);
 		}
 
@@ -935,9 +1223,16 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 					continue;
 				}
 				fence_q();
-				sh->poll_hits++;
-				sh->resp_cycles += consume_one(c, sh, &sps, tags,
-							       cqe, tl, &my_seq);
+				if (nt) {
+					/* 计数留在寄存器,退出时写回:不在等待路径上碰显存 */
+					sp_hits++;
+					sp_rc += consume_one(c, sh, &sps, tags, cqe,
+							     tl, &my_seq);
+				} else {
+					sh->poll_hits++;
+					sh->resp_cycles += consume_one(c, sh, &sps, tags,
+								       cqe, tl, &my_seq);
+				}
 				advance_ci(c, &sps, &my_ci, &my_phase);
 				/* handle_resp 在本 block 里已 fence 过,直接读 */
 				st = *(volatile uint32_t *)&tags[tag].state;
@@ -976,7 +1271,19 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 			}
 		}
 		t3 = clock64();
-		if (st >= GIO_ST_DONE) {
+		if (st >= GIO_ST_DONE && nt) {
+			/* 四个读一起发出 */
+			struct gio_tag *t = &tags[tag];
+			uint64_t td = NT_LD64(&t->t_done);
+			uint64_t det = NT_LD64(&t->det);
+			uint32_t dw0 = NT_LD32(&t->dw0);
+			uint32_t stw = NT_LD32(&t->status);
+
+			c_det[J] = det;
+			c_hand[J] = t3 - td;
+			c_dw0[J] = dw0;
+			c_stat[J] = stw & 0xffff;
+		} else if (st >= GIO_ST_DONE) {
 			uint64_t td;
 
 			fence_sh();
@@ -997,11 +1304,17 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 		c_wait[J] = t3 - t2;	/* 网络往返 + target + poller 转交 */
 		c_spin[J] = spins;
 		c_lock[J] = lspins;
-		c_stat[J] = (st >= GIO_ST_DONE) ?
-			    ld_acq32((uint32_t *)&tags[tag].status) & 0xffff :
-			    0xffffffffu;	/* 没等到 */
-
-		st_rel32(&tags[tag].state, GIO_ST_IDLE);
+		if (nt) {
+			if (st < GIO_ST_DONE) {
+				c_stat[J] = 0xffffffffu;	/* 没等到 */
+			}
+			NT_ST32(&tags[tag].state, GIO_ST_IDLE);
+		} else {
+			c_stat[J] = (st >= GIO_ST_DONE) ?
+				    ld_acq32((uint32_t *)&tags[tag].status) & 0xffff :
+				    0xffffffffu;	/* 没等到 */
+			st_rel32(&tags[tag].state, GIO_ST_IDLE);
+		}
 		if (st < GIO_ST_DONE) {
 			break;
 		}
@@ -1010,6 +1323,8 @@ submitter(struct gpu_io_ctx *c, struct gio_shared *sh, struct gio_tag *tags,
 	if (c->opt & 0x20) {
 		idle_flush(c, &sps, my_ci);
 		ps_store(sh, &sps);
+		sh->poll_hits += sp_hits;
+		sh->resp_cycles += sp_rc;
 	}
 	if (pf) {
 		int k;

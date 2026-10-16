@@ -537,6 +537,29 @@ IOPS = 条数 / kernel 时间):
 吞吐随 QP 数近似线性,16 QP 时单条时延只涨 2 µs,target 还没饱和。
 待测:32 QP 以上(GIO_MAX_QP 目前 16)、128K 带宽。
 
+### 访存原语和胶囊内联(C3,DeepEP 对照)
+
+对照 DeepEP / mxshmem 的 IBGDA(`C:\Code\muxi`)后，用 `tst/mem_prims` 量了 MACA 上
+各种原语的单次代价(数据和结论见该目录 README)。要点:
+
+- fence 级别无所谓，单独一个 fence 不花钱;花钱的是等之前的写完成
+- volatile 写每次都要等写完成(finegrained 显存 ~350 ns),nontemporal 写 ~70 ns 发出、可叠加
+- volatile 读串行，nontemporal 读能并发(4 个:1380 → 415 ns)
+
+据此加了两个开关(0028),待实机:
+
+- `-O 0x8000000`(GIO_OPT_NT):热路径读写换成 nontemporal。
+  - **写**:WQE、dbrec、RQ 补充、tag、`sq_pi`、解锁、CQ dbrec,每组末尾一次
+    `mxc_fence(RELEASE, "device")`;敲门铃后不 fence。
+  - **读**:响应的 NVMe CQE / DW0、RQ 影子、submitter 收尾的 tag 字段，一起发出。
+  - QD1 串行快路径(0x20)的 `poll_hits` / `resp_cycles` 留在寄存器，退出时写回。
+- `-O 0x10000000`(GIO_OPT_INLCAP):胶囊在寄存器里构造，内联进 SEND WQE。
+  - WQE 96 字节、2 个 WQEBB,pi 每条 +2;SQ dbrec 核对按 2 倍算。
+  - 网卡收到门铃后取一次 WQE 就能发包，不用再去主存取胶囊。
+  - 只支持 `-X`,不配 `-G` / `-k`;第 0 条队列跑完 dump 第一条 WQE 并解出胶囊字段。
+
+预期:提交 4.8 → ~3 µs,处理一条响应 4.1 → ~2 µs,门铃 → SEND 完成 5.8 → 4 µs 左右。
+
 (历史)原计划:找出"不回读就慢 2.8 µs"的原因(`-O 0x80000/0x100000/0x200000`
 三个对照:BF 写满 64 字节、BF 两块轮换、空等代替读)。找到后去掉回读,
 锁内时间能从 ~9 µs 降到 ~3 µs,QD1 时延和单 QP 吞吐一起受益。

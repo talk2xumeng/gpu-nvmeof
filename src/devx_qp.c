@@ -16,6 +16,7 @@
  */
 
 #define _GNU_SOURCE
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -717,13 +718,51 @@ devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 	return 0;
 }
 
+/*
+ * 胶囊内联(bb = 2)时 dump kernel 写的第一条 WQE(pi = sq0,两个 WQEBB),
+ * 并按 post_wqe_inl 的布局解出胶囊字段,对照 opc / cid / nsid / SGL / LBA。
+ */
+static void
+dump_inl_wqe(const struct dq *d)
+{
+	uint8_t w[128];
+	const uint8_t *cap = w + 20;
+	uint64_t addr, lba;
+	uint32_t len, key;
+	int k;
+
+	dev_get(d, w, sq_off(d, d->sq0), 64);
+	dev_get(d, w + 64, sq_off(d, d->sq0 + 1), 64);
+	printf("[胶囊内联] 第一条 WQE(pi=%u)96 字节:\n  ", d->sq0);
+	for (k = 0; k < 96; k++) {
+		printf("%02x%s", w[k], k % 16 == 15 ? "\n  " : " ");
+	}
+	memcpy(&addr, cap + 24, 8);
+	memcpy(&lba, cap + 40, 8);
+	len = cap[32] | (cap[33] << 8) | ((uint32_t)cap[34] << 16);
+	key = cap[35] | (cap[36] << 8) | ((uint32_t)cap[37] << 16) |
+	      ((uint32_t)cap[38] << 24);
+	printf("\n  opcode 0x%02x ds %u inline 0x%08x | 胶囊 opc 0x%02x psdt 0x%02x"
+	       " cid 0x%04x nsid %u\n  SGL addr 0x%" PRIx64 " len %u key 0x%x"
+	       " type 0x%02x | slba %" PRIu64 " nlb %u\n",
+	       w[3], w[7] & 0x3f, be32toh(*(uint32_t *)(w + 16)), cap[0], cap[1],
+	       cap[2] | (cap[3] << 8), *(uint32_t *)(cap + 4), addr, len, key,
+	       cap[39], lba, (cap[48] | (cap[49] << 8)) + 1);
+}
+
 int
-devx_q_check(unsigned slot, uint32_t njobs, uint32_t cqe_req,
+devx_q_check(unsigned slot, uint32_t njobs, uint32_t bb, uint32_t cqe_req,
 	     uint32_t cqe_resp, int no_repost)
 {
 	const struct dq *d = &g.q[slot];
 	uint32_t qdb[2], cdb, sq, rq, cq;
 	int bad = 0;
+
+	if (bb > 1 && slot == 0) {
+		dump_inl_wqe(d);
+	}
+	/* SQ dbrec 按 WQEBB 计:胶囊内联时每条占 bb 个 */
+	njobs *= bb;
 
 	dev_get(d, qdb, DQ_OFF_QP_DBR, 8);
 	dev_get(d, &cdb, DQ_OFF_CQ_DBR, 4);

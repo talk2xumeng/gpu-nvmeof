@@ -47,6 +47,9 @@
  *                        配 0x8000/0x40000
  *                        bit26(=0x4000000) fence 降级:共享状态用 device 级;
  *                        -X 的队列、-H 的胶囊也用 device 级
+ *                        bit27(=0x8000000) 热路径读写用 nontemporal,一组写末尾
+ *                        fence 一次,门铃后不 fence(同 DeepEP;tst/mem_prims)
+ *                        bit28(=0x10000000) 胶囊内联进 SEND WQE(仅 -X,不配 -G/-k)
  *   -W                   发 WRITE(默认 READ)
  *   -H                   命令胶囊放显存(默认主存),分配 flag 见 -F
  *   -F <flag>            胶囊区 mcExtMallocWithFlags 的 flag(默认 1)
@@ -1007,6 +1010,16 @@ main(int argc, char **argv)
 			g_opt |= GIO_OPT_BFGAP;
 		}
 	}
+	/*
+	 * 胶囊内联:只在 -X 的 8 字节门铃路径上实现(WQE 两个 WQEBB,SQ 在显存,
+	 * BF 写法不适用);KV 胶囊多了 key 字段,没做。
+	 */
+	if ((g_opt & GIO_OPT_INLCAP) &&
+	    (!g_devx || g_bf_gap >= 0 || g_kv)) {
+		fprintf(stderr, "-O 0x10000000(胶囊内联)只支持 -X、不配 -G、"
+			"不配 -k\n");
+		return 1;
+	}
 	if ((g_opt & 0x20) && g_qd != 1) {
 		fprintf(stderr, "-O 32(串行快路径)只能配 -Q 1\n");
 		return 1;
@@ -1782,8 +1795,10 @@ queues_ready:
 	 */
 	if (g_devx) {
 		for (q = 0; q < g_nq; q++) {
-			devx_q_check(q, ctxs[q].njobs, shs[q].cqe_req,
-				     shs[q].cqe_resp, (g_opt & 0x800) != 0);
+			devx_q_check(q, ctxs[q].njobs,
+				     (g_opt & GIO_OPT_INLCAP) ? 2 : 1,
+				     shs[q].cqe_req, shs[q].cqe_resp,
+				     (g_opt & 0x800) != 0);
 		}
 	} else for (q = 0; q < g_nq; q++) {
 		volatile uint32_t *qdb = (volatile uint32_t *)hw[q].dvq.dbrec;

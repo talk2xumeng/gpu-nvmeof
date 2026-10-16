@@ -229,6 +229,22 @@ struct gio_shared {
  * 之后也用 __threadfence()。写 MMIO 门铃后的 fence 仍是 system。
  */
 #define GIO_OPT_DEVFENCE	0x4000000u
+/*
+ * 0x8000000:热路径读写换成 nontemporal(同 DeepEP MACA 分支)。
+ * tst/mem_prims 实测:MACA 上每个 volatile 写都要等写完成(finegrained
+ * 显存 ~350 ns),nontemporal 写 ~70 ns 发出、可叠加;volatile 读串行,
+ * nontemporal 读能并发(4 个 1380 → 415 ns);fence 本身不花钱,花的是
+ * 等之前的写完成。所以:一组写全用 nontemporal,末尾 fence 一次;同一
+ * 处要读的几个字段一起发出;敲门铃之后不再 fence(DeepEP 也不)。
+ */
+#define GIO_OPT_NT		0x8000000u
+/*
+ * 0x10000000:胶囊内联进 SEND WQE(仅 -X、NVM 读写)。胶囊在寄存器里
+ * 构造,不写胶囊区;WQE = ctrl 16 + inline 头 4 + 胶囊 64,补齐到 96 字节
+ * (ds = 6),占 2 个 WQEBB,pi 每条 +2。网卡收到门铃后只取一次 WQE 就能
+ * 发包,省掉取胶囊那次 DMA 读(-X 胶囊在主存)。
+ */
+#define GIO_OPT_INLCAP		0x10000000u
 #define GIO_PF_TAG	0	/* 写 tag 的 job/state(两次 fence) */
 #define GIO_PF_LOCK	1	/* 抢 SQ 锁 */
 #define GIO_PF_PI	2	/* 读共享 sq_pi(fence) */

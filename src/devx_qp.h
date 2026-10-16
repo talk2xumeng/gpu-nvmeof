@@ -60,8 +60,9 @@ int devx_q_create(struct spdk_nvme_ctrlr *ctrlr, const struct devx_q_cfg *cfg,
 		  struct gpu_io_ctx *ctx);
 
 /* kernel 跑完后核对第 slot 条队列的 dbrec 增量(显存里读),打印一行;
+ * bb 是每条命令占的 WQEBB 数(胶囊内联时 2,并 dump 第一条 WQE);
  * 返回不一致的项数 */
-int devx_q_check(unsigned slot, uint32_t njobs,
+int devx_q_check(unsigned slot, uint32_t njobs, uint32_t bb,
 		 uint32_t cqe_req, uint32_t cqe_resp, int no_repost);
 
 #endif /* DEVX_QP_H */
