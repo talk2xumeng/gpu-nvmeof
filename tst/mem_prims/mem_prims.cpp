@@ -87,6 +87,7 @@ enum {
 	T_SUB_EP,
 	T_HIT_OURS,
 	T_HIT_EP,
+	T_CLOCK,
 	T_NUM
 };
 
@@ -118,6 +119,7 @@ static const char *t_name[T_NUM] = {
 	"提交 WQE+dbrec          [DeepEP]",
 	"CQE 命中后读字段        [我们]",
 	"CQE 命中后读字段        [mxshmem]",
+	"clock64() 一次          [剖析每段的开销]",
 };
 
 /*
@@ -264,6 +266,10 @@ k_single(int t, uint64_t *p, uint32_t *lk, uint64_t mask, uint32_t n,
 		     v += LD_NT64(p + 9 + (v & mask));
 		     v += LD_NT64(p + 10 + (v & mask));
 		     v += LD_NT64(p + 11 + (v & mask)));
+		break;
+	case T_CLOCK:
+		/* -O 0x20000 剖析每段都要读一次时钟;读数累加防止被优化掉 */
+		LOOP(v += clock64());
 		break;
 	default:
 		t0 = t1 = 0;

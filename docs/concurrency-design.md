@@ -603,8 +603,17 @@ IOPS = 条数 / kernel 时间):
 poller 模式剖析(`-O 0x18020000`):
 
 - 空转一圈：读 CQE 375 + idle_flush 267 + done/abort 检查 209 ns。
-  后两段在没活干时本应几乎不花钱，各约一次显存读。原因是 ctx 在 local memory,
-  fence 之后 `c->` 字段都要重读。0029 加 `-O 0x20000000`,把 ctx 副本放进 shared memory。
+  后两段在没活干时本应几乎不花钱，各约一次显存读。
+- 0029 猜是 ctx 落在 local memory,加了 `-O 0x20000000`(ctx 副本放 shared memory)。
+  **猜错了，而且起了反作用**:
+  - 开不开这一位都全面变慢:QD1 串行快路径 9.5 → 17.8 µs,空转一圈 0.57 → 2.2 µs;
+    poller 模式 15.5 → 20.2 µs。
+  - 解释：原来 poller / submitter 全部内联进 kernel,局部的 ctx 已经被编译器拆进寄存器。
+    改成运行时在 `&ctx` 和 shared 副本之间二选一的指针后，编译器没法再这样做,
+    每次 `c->` 都成了地址空间不确定的访存。
+  - 0030 撤掉了这一位，只保留 k_end 的修复。
+  - 那些"空段"的 200 ns 更可能是剖析自身的 `clock64()` 开销,mem_prims 加了一行来量。
+  - 教训:**ctx 只能以 `&ctx` 传，不要让它的地址在运行时可变**。
 - 提交(NT + 内联，含剖析开销):抢锁 459 / 读 sq_pi 639 / 写 WQE+fence 989 /
   dbrec+fence 584 / 门铃 308 / 写 sq_pi+解锁 895 / 写 t_post 297 ns。
 
