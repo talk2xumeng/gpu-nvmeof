@@ -31,6 +31,7 @@
 # 实验(tst/,各目录有 README 记录背景和结论):
 #   make pit7-matrix [MATRIX=1|2|3] 坑 7:kernel 写显存对网卡的可见性
 #   make pit7-bench                 坑 7:kernel 填充微基准
+#   make mem-prims [MEMS=nfh]       访存原语 / fence 单次代价(对照 DeepEP 写法)
 #
 # 注意:动态库路径必须先 make ldconfig 注册,否则 sudo 下会找不到
 # librte_*.so —— gcc 生成的是 RUNPATH,sudo 提权后动态链接器进安全
@@ -118,7 +119,7 @@ LDFLAGS    := $(SPDK_LIBS) $(SYS_LIBS) $(GPU_LIBS) $(RDMA_LIBS) $(EXTRA_LIBS)
         run-gpu-initiated run-gpu-read-verify run-gpu-write-verify \
         tst pit7-matrix pit7-bench help kv-tgt kv-smoke run-kv-smoke \
         run-gpu-kv-retrieve run-gpu-kv-store run-gpu-kv-exist run-gpu-kv-delete \
-        kv-vs-nvm qd-sweep devx-probe
+        kv-vs-nvm qd-sweep devx-probe mem-prims
 
 # 实验程序也在 all 里:src/ 改动若让它们编不过,当场就能发现,
 # 而不是等回头复现时才知道(坑 4)。
@@ -368,7 +369,18 @@ devx-probe: $(BIN)/devx_probe
 		     -C $$c -W $$w -n 1000 | grep -E "失败|错误|时延|轮询|校验"; \
 	done; done
 
-tst: $(BIN)/pit7_initiated $(BIN)/devx_probe
+# ---- 实验:tst/mem_prims(访存原语 / fence 代价,纯 GPU,不需要网卡和 target)----
+MEMP := $(TST)/mem_prims
+MEMS ?= nfh
+
+$(BIN)/mem_prims: $(MEMP)/mem_prims.cpp | $(BIN)
+	$(GPUCC) $(GPUCFLAGS) -o $@ $<
+	@echo "OK: $@"
+
+mem-prims: $(BIN)/mem_prims
+	./$(BIN)/mem_prims -g $(GPU_ID) -m $(MEMS)
+
+tst: $(BIN)/pit7_initiated $(BIN)/devx_probe $(BIN)/mem_prims
 
 pit7-matrix: $(BIN)/pit7_initiated
 	sudo BIN=$(BIN) TARGET_IP=$(TARGET_IP) NQN=$(NQN) GPU_ID=$(GPU_ID) \
