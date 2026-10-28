@@ -85,7 +85,9 @@ docs/
   debug-notes.md      GPU-initiated 排查笔记(先读这个)
   concurrency-design.md  并发提交 + RQ 自持设计
   kv-runbook.md       KV 测试操作手册:两台机器上的命令、判据、排查
+  c600-results.md     C600 实测:GPU-initiated 功能、时延、IOPS/带宽,部署要点
 scripts/
+  apply_vtophys_patch.py  SPDK 补丁:无 IOMMU 时注册 GPU VA 不段错误(C600 需要)
 ```
 
 ## 快速开始
